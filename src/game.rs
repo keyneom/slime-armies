@@ -44,23 +44,20 @@ pub enum SoundEvent {
 pub enum MenuSelection {
     Play,
     CreateRoom,
-    JoinRoom,
 }
 
 impl MenuSelection {
     pub fn next(self) -> Self {
         match self {
             MenuSelection::Play => MenuSelection::CreateRoom,
-            MenuSelection::CreateRoom => MenuSelection::JoinRoom,
-            MenuSelection::JoinRoom => MenuSelection::Play,
+            MenuSelection::CreateRoom => MenuSelection::Play,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            MenuSelection::Play => MenuSelection::JoinRoom,
+            MenuSelection::Play => MenuSelection::CreateRoom,
             MenuSelection::CreateRoom => MenuSelection::Play,
-            MenuSelection::JoinRoom => MenuSelection::CreateRoom,
         }
     }
 }
@@ -106,6 +103,16 @@ pub struct Game {
     pub wave_kill_counts: [u32; 3],
     pub wave_kill_targets: [u32; 3],
     spawned_chunks: HashSet<(i32, i32)>,
+    pub player_list_open: bool,
+    pub player_list_scroll: i32,
+    pub player_list_sort: u8,
+    pub player_list_sort_asc: bool,
+    pub player_list_search: String,
+    pub player_list_search_active: bool,
+    pub chat_open: bool,
+    pub chat_input: String,
+    pub chat_log: Vec<ChatLine>,
+    pub last_chat_send_frame: u32,
     rng: Xoshiro256PlusPlus,
     // Menu state
     pub menu_selection: MenuSelection,
@@ -138,6 +145,12 @@ pub struct EnemyRenderSnapshot {
     pub spider_positions: Vec<(Vec2, Vec2, bool)>,  // (pos, dir, alive)
     pub cannon_positions: Vec<(Vec2, Vec2, Vec2, bool)>,  // (pos, dir, look_dir, alive)
     pub snake_positions: Vec<(Vec2, Vec2, f32, bool)>,  // (pos, dir, size, alive)
+}
+
+pub struct ChatLine {
+    pub name: String,
+    pub text: String,
+    pub frame: u32,
 }
 
 struct RemoteSimulation {
@@ -194,6 +207,16 @@ impl Game {
             wave_kill_counts: [0; 3],
             wave_kill_targets: [0; 3],
             spawned_chunks: HashSet::new(),
+            player_list_open: false,
+            player_list_scroll: 0,
+            player_list_sort: 0,
+            player_list_sort_asc: false,
+            player_list_search: String::new(),
+            player_list_search_active: false,
+            chat_open: false,
+            chat_input: String::new(),
+            chat_log: Vec::new(),
+            last_chat_send_frame: u32::MAX,
             rng: Xoshiro256PlusPlus::seed_from_u64(0),
             // Menu state
             menu_selection: MenuSelection::Play,
@@ -338,6 +361,7 @@ impl Game {
         self.frame_count += 1;
         // Clear sound events from previous frame
         self.sound_events.clear();
+        self.prune_chat_log();
 
         match self.scene {
             Scene::Title => self.update_title(input),
@@ -351,6 +375,7 @@ impl Game {
         self.frame_count += 1;
         // Clear sound events from previous frame
         self.sound_events.clear();
+        self.prune_chat_log();
 
         match self.scene {
             Scene::Title => self.update_title(input),
@@ -396,10 +421,6 @@ impl Game {
                     // Will be handled by lib.rs to create room
                     // For now just mark that we want to create
                 }
-                MenuSelection::JoinRoom => {
-                    // Will be handled by lib.rs to join room
-                    // For now just mark that we want to join
-                }
             }
         }
     }
@@ -434,11 +455,6 @@ impl Game {
                 }
                 MenuSelection::CreateRoom => {
                     return (true, false, String::new());
-                }
-                MenuSelection::JoinRoom => {
-                    if self.room_code_input.len() >= 4 {
-                        return (false, true, self.room_code_input.clone());
-                    }
                 }
             }
         }
@@ -906,11 +922,19 @@ impl Game {
                 death_y: self.player.pos.y,
                 killed_by_type,
                 killed_by_id,
+                victim_hash: 0,
             });
             self.explosions.spawn(self.player.pos, 25, 0, 0);
             self.explosions.spawn(self.player.pos, 27, -3, 0);
             self.explosions.spawn(self.player.pos, 18, -8, 1);
             self.sound_events.push(SoundEvent::Death);
+            self.map_open = true;
+            self.map_center = self.player.pos;
+            self.map_target = Some(self.map_center);
+            self.map_text_input_active = false;
+            self.map_active_field = 0;
+            self.update_map_inputs_from_center();
+            self.close_chat();
         }
     }
 
@@ -927,7 +951,7 @@ impl Game {
         }
 
         if input.is_released(BUTTON_ATTACK) || input.is_released(BUTTON_PHASE) {
-            self.scene = Scene::Title;
+            self.map_open = true;
         }
     }
 
@@ -939,7 +963,138 @@ impl Game {
             self.map_text_input_active = false;
             self.map_active_field = 0;
             self.update_map_inputs_from_center();
+            self.close_chat();
         }
+    }
+
+    pub fn toggle_player_list(&mut self) {
+        self.player_list_open = !self.player_list_open;
+        if !self.player_list_open {
+            self.player_list_search_active = false;
+        }
+    }
+
+    pub fn toggle_chat(&mut self) {
+        if self.scene != Scene::Game {
+            return;
+        }
+
+        self.chat_open = !self.chat_open;
+        if !self.chat_open {
+            self.chat_input.clear();
+        }
+    }
+
+    pub fn close_chat(&mut self) {
+        self.chat_open = false;
+        self.chat_input.clear();
+    }
+
+    pub fn is_chat_input_active(&self) -> bool {
+        self.chat_open && self.scene == Scene::Game
+    }
+
+    pub fn handle_chat_char_input(&mut self, c: char) {
+        if !self.is_chat_input_active() {
+            return;
+        }
+
+        if !c.is_ascii() || c.is_ascii_control() {
+            return;
+        }
+
+        if self.chat_input.len() >= 80 {
+            return;
+        }
+
+        self.chat_input.push(c);
+    }
+
+    pub fn handle_chat_backspace(&mut self) {
+        if !self.is_chat_input_active() {
+            return;
+        }
+        self.chat_input.pop();
+    }
+
+    pub fn take_chat_input(&mut self) -> Option<String> {
+        if !self.is_chat_input_active() {
+            return None;
+        }
+
+        let trimmed = self.chat_input.trim_end();
+        if trimmed.is_empty() {
+            self.chat_input.clear();
+            return None;
+        }
+
+        let text = trimmed.to_string();
+        self.chat_input.clear();
+        Some(text)
+    }
+
+    pub fn can_send_chat(&self) -> bool {
+        self.last_chat_send_frame == u32::MAX
+            || self.frame_count.saturating_sub(self.last_chat_send_frame) >= 120
+    }
+
+    pub fn mark_chat_sent(&mut self) {
+        self.last_chat_send_frame = self.frame_count;
+    }
+
+    pub fn push_chat_line(&mut self, name: String, text: String) {
+        self.chat_log.push(ChatLine {
+            name,
+            text,
+            frame: self.frame_count,
+        });
+
+        let max_lines = 8;
+        if self.chat_log.len() > max_lines {
+            let excess = self.chat_log.len() - max_lines;
+            self.chat_log.drain(0..excess);
+        }
+    }
+
+    fn prune_chat_log(&mut self) {
+        let max_age_frames = 1260;
+        let current = self.frame_count;
+        self.chat_log.retain(|line| current.saturating_sub(line.frame) <= max_age_frames);
+    }
+
+    pub fn scroll_player_list(&mut self, delta: i32) {
+        self.player_list_scroll = (self.player_list_scroll + delta).max(0);
+    }
+
+    pub fn cycle_player_list_sort(&mut self) {
+        self.player_list_sort = (self.player_list_sort + 1) % 5;
+    }
+
+    pub fn toggle_player_list_sort_order(&mut self) {
+        self.player_list_sort_asc = !self.player_list_sort_asc;
+    }
+
+    pub fn activate_player_list_search(&mut self) {
+        self.player_list_search_active = true;
+    }
+
+    pub fn clear_player_list_search(&mut self) {
+        self.player_list_search.clear();
+        self.player_list_search_active = false;
+        self.player_list_scroll = 0;
+    }
+
+    pub fn handle_player_list_char_input(&mut self, c: char) {
+        if self.player_list_search.len() >= 16 {
+            return;
+        }
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            self.player_list_search.push(c.to_ascii_lowercase());
+        }
+    }
+
+    pub fn handle_player_list_backspace(&mut self) {
+        self.player_list_search.pop();
     }
 
     fn update_map_controls(&mut self, input: &Input) {
@@ -1220,6 +1375,16 @@ impl Game {
         self.wave_kill_counts = [0; 3];
         self.wave_kill_targets = [0; 3];
         self.spawned_chunks.clear();
+        self.player_list_open = false;
+        self.player_list_scroll = 0;
+        self.player_list_sort = 0;
+        self.player_list_sort_asc = false;
+        self.player_list_search.clear();
+        self.player_list_search_active = false;
+        self.chat_open = false;
+        self.chat_input.clear();
+        self.chat_log.clear();
+        self.last_chat_send_frame = u32::MAX;
         self.spiders.clear();
         self.cannons.clear();
         self.snakes.clear();
@@ -1264,6 +1429,16 @@ impl Game {
         self.wave_kill_counts = [0; 3];
         self.wave_kill_targets = [0; 3];
         self.spawned_chunks.clear();
+        self.player_list_open = false;
+        self.player_list_scroll = 0;
+        self.player_list_sort = 0;
+        self.player_list_sort_asc = false;
+        self.player_list_search.clear();
+        self.player_list_search_active = false;
+        self.chat_open = false;
+        self.chat_input.clear();
+        self.chat_log.clear();
+        self.last_chat_send_frame = u32::MAX;
         self.spiders.clear();
         self.cannons.clear();
         self.snakes.clear();

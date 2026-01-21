@@ -477,20 +477,22 @@ pub struct EnemyKill {
     pub enemy_id: u16,
     pub killer_x: f32,  // Position where kill happened (for verification)
     pub killer_y: f32,
+    pub killer_hash: u64,
 }
 
 impl EnemyKill {
-    pub fn to_bytes(&self) -> [u8; 11] {
-        let mut bytes = [0u8; 11];
+    pub fn to_bytes(&self) -> [u8; 19] {
+        let mut bytes = [0u8; 19];
         bytes[0] = self.enemy_type;
         bytes[1..3].copy_from_slice(&self.enemy_id.to_le_bytes());
         bytes[3..7].copy_from_slice(&self.killer_x.to_le_bytes());
         bytes[7..11].copy_from_slice(&self.killer_y.to_le_bytes());
+        bytes[11..19].copy_from_slice(&self.killer_hash.to_le_bytes());
         bytes
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 11 {
+        if bytes.len() < 19 {
             return None;
         }
         Some(Self {
@@ -498,6 +500,10 @@ impl EnemyKill {
             enemy_id: u16::from_le_bytes([bytes[1], bytes[2]]),
             killer_x: f32::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]),
             killer_y: f32::from_le_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]),
+            killer_hash: u64::from_le_bytes([
+                bytes[11], bytes[12], bytes[13], bytes[14],
+                bytes[15], bytes[16], bytes[17], bytes[18],
+            ]),
         })
     }
 }
@@ -509,20 +515,87 @@ pub struct PlayerDeath {
     pub death_y: f32,
     pub killed_by_type: u8,  // 0=spider, 1=cannon, 2=snake, 3=projectile
     pub killed_by_id: u16,
+    pub victim_hash: u64,
 }
 
-impl PlayerDeath {
-    pub fn to_bytes(&self) -> [u8; 11] {
-        let mut bytes = [0u8; 11];
-        bytes[0..4].copy_from_slice(&self.death_x.to_le_bytes());
-        bytes[4..8].copy_from_slice(&self.death_y.to_le_bytes());
-        bytes[8] = self.killed_by_type;
-        bytes[9..11].copy_from_slice(&self.killed_by_id.to_le_bytes());
+/// Chat message (room-wide)
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub sender_hash: u64,
+    pub text: String,
+}
+
+impl ChatMessage {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&self.sender_hash.to_le_bytes());
+        let len = self.text.len().min(80) as u8;
+        bytes.push(len);
+        bytes.extend_from_slice(&self.text.as_bytes()[..len as usize]);
         bytes
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 11 {
+        if bytes.len() < 9 {
+            return None;
+        }
+        let hash = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        let len = bytes[8] as usize;
+        if bytes.len() < 9 + len {
+            return None;
+        }
+        let text = String::from_utf8(bytes[9..9 + len].to_vec()).ok()?;
+        Some(Self { sender_hash: hash, text })
+    }
+}
+
+/// Vote mute request
+#[derive(Debug, Clone, Copy)]
+pub struct VoteMute {
+    pub target_hash: u64,
+    pub voter_hash: u64,
+}
+
+impl VoteMute {
+    pub fn to_bytes(&self) -> [u8; 16] {
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&self.target_hash.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.voter_hash.to_le_bytes());
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 16 {
+            return None;
+        }
+        Some(Self {
+            target_hash: u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5], bytes[6], bytes[7],
+            ]),
+            voter_hash: u64::from_le_bytes([
+                bytes[8], bytes[9], bytes[10], bytes[11],
+                bytes[12], bytes[13], bytes[14], bytes[15],
+            ]),
+        })
+    }
+}
+impl PlayerDeath {
+    pub fn to_bytes(&self) -> [u8; 19] {
+        let mut bytes = [0u8; 19];
+        bytes[0..4].copy_from_slice(&self.death_x.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.death_y.to_le_bytes());
+        bytes[8] = self.killed_by_type;
+        bytes[9..11].copy_from_slice(&self.killed_by_id.to_le_bytes());
+        bytes[11..19].copy_from_slice(&self.victim_hash.to_le_bytes());
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 19 {
             return None;
         }
         Some(Self {
@@ -530,6 +603,10 @@ impl PlayerDeath {
             death_y: f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
             killed_by_type: bytes[8],
             killed_by_id: u16::from_le_bytes([bytes[9], bytes[10]]),
+            victim_hash: u64::from_le_bytes([
+                bytes[11], bytes[12], bytes[13], bytes[14],
+                bytes[15], bytes[16], bytes[17], bytes[18],
+            ]),
         })
     }
 }
@@ -641,6 +718,10 @@ pub enum NetMessage {
     EnemyKillEvent(EnemyKill),
     /// Player death event - authoritative from victim's machine
     PlayerDeathEvent(PlayerDeath),
+    /// Chat message
+    ChatMessageEvent(ChatMessage),
+    /// Vote mute request
+    VoteMuteEvent(VoteMute),
     /// Paid obstacle placement event
     PaidObstacleEvent(PaidObstacle),
     /// Paid obstacle sync (for late joiners)
@@ -699,6 +780,16 @@ impl NetMessage {
             NetMessage::PlayerDeathEvent(death) => {
                 let mut bytes = vec![7u8]; // Message type 7
                 bytes.extend_from_slice(&death.to_bytes());
+                bytes
+            }
+            NetMessage::ChatMessageEvent(chat) => {
+                let mut bytes = vec![16u8]; // Message type 16
+                bytes.extend_from_slice(&chat.to_bytes());
+                bytes
+            }
+            NetMessage::VoteMuteEvent(vote) => {
+                let mut bytes = vec![17u8]; // Message type 17
+                bytes.extend_from_slice(&vote.to_bytes());
                 bytes
             }
             NetMessage::PaidObstacleEvent(obstacle) => {
@@ -767,6 +858,8 @@ impl NetMessage {
             5 => WaveStart::from_bytes(&bytes[1..]).map(NetMessage::WaveStartEvent),
             6 => EnemyKill::from_bytes(&bytes[1..]).map(NetMessage::EnemyKillEvent),
             7 => PlayerDeath::from_bytes(&bytes[1..]).map(NetMessage::PlayerDeathEvent),
+            16 => ChatMessage::from_bytes(&bytes[1..]).map(NetMessage::ChatMessageEvent),
+            17 => VoteMute::from_bytes(&bytes[1..]).map(NetMessage::VoteMuteEvent),
             8 => PaidObstacle::from_bytes(&bytes[1..]).map(NetMessage::PaidObstacleEvent),
             9 => PaidObstacleSync::from_bytes(&bytes[1..]).map(NetMessage::PaidObstacleSyncEvent),
             10 => CannonShot::from_bytes(&bytes[1..]).map(NetMessage::CannonShotEvent),

@@ -6,7 +6,7 @@ use crate::game::{Game, Scene, MenuSelection, MAP_OVERLAY_SIZE, MAP_OVERLAY_PADD
 use crate::entities::{Player, Spider, Cannon, Snake, Projectile};
 use crate::math::Vec2;
 use crate::world::{Camera, CHUNK_SIZE};
-use crate::net::{NetworkSession, NetworkState, RemotePlayer};
+use crate::net::{NetworkSession, NetworkState, RemotePlayer, PlayerStats};
 
 // Color palette - exact match to original WASM-4 game
 // Palette: [0x000011, 0xdddd99, 0x1166cc, 0xcc1166]
@@ -27,6 +27,15 @@ const COLOR_REMOTE_PLAYER: &str = "#66cc66";  // Green for remote players
 const RENDER_SCALE: f64 = 1.0;
 // Creature render scale (increase to make all creatures larger without zoom)
 const CREATURE_SCALE: f64 = 2.0;
+
+#[derive(Clone)]
+struct PlayerEntry {
+    name: String,
+    kills: u32,
+    deaths: u32,
+    time_seconds: u32,
+    score: u32,
+}
 
 pub struct Renderer {
     ctx: CanvasRenderingContext2d,
@@ -182,25 +191,10 @@ impl Renderer {
 
         self.render_menu_item(center_x, menu_y, "SOLO PLAY", game.menu_selection == MenuSelection::Play, game.frame_count);
         self.render_menu_item(center_x, menu_y + menu_spacing, "CREATE ROOM", game.menu_selection == MenuSelection::CreateRoom, game.frame_count);
-        self.render_menu_item(center_x, menu_y + menu_spacing * 2.0, "JOIN ROOM", game.menu_selection == MenuSelection::JoinRoom, game.frame_count);
 
         // Network status
         self.render_network_status(network);
 
-        // Instructions
-        self.ctx.set_fill_style_str("#666666");
-        self.ctx.set_font("12px monospace");
-        self.ctx.set_text_align("center");
-        let _ = self.ctx.fill_text(
-            "Click text fields to edit | Arrow keys to navigate | SPACE to select",
-            center_x,
-            (self.height - 60) as f64,
-        );
-        let _ = self.ctx.fill_text(
-            "In-game: WASD/Arrows: Move | Z/Space: Attack/Block | X/Shift: Phase",
-            center_x,
-            (self.height - 40) as f64,
-        );
     }
 
     fn render_text_input(&self, x: f64, y: f64, width: f64, text: &str, active: bool, frame_count: u32) {
@@ -1034,7 +1028,7 @@ impl Renderer {
         // Join button next to room code
         let join_x = center_x + 20.0;
         let join_y = code_y - 14.0;
-        let join_active = game.menu_selection == MenuSelection::JoinRoom;
+        let join_active = is_code_active;
         let join_bg = if join_active { "#223344" } else { "#111122" };
         self.display_ctx.set_fill_style_str(join_bg);
         self.display_ctx.fill_rect(join_x, join_y, 70.0, 22.0);
@@ -1063,14 +1057,6 @@ impl Renderer {
             game.menu_selection == MenuSelection::CreateRoom,
             game.frame_count,
         );
-        self.render_menu_item_on(
-            &self.display_ctx,
-            center_x,
-            menu_y + menu_spacing * 2.0,
-            "JOIN ROOM",
-            game.menu_selection == MenuSelection::JoinRoom,
-            game.frame_count,
-        );
 
         self.render_network_status_on(&self.display_ctx, network);
 
@@ -1078,10 +1064,16 @@ impl Renderer {
         self.display_ctx.set_fill_style_str("#666666");
         self.display_ctx.set_font("12px monospace");
         self.display_ctx.set_text_align("center");
+        let base_y = (self.height - 70) as f64;
         let _ = self.display_ctx.fill_text(
-            "Click text fields to edit | Enter joins room | Arrow keys to navigate | SPACE to select",
+            "Click name/room to edit | Enter joins room",
             center_x,
-            (self.height - 60) as f64,
+            base_y,
+        );
+        let _ = self.display_ctx.fill_text(
+            "Arrow keys navigate | SPACE select",
+            center_x,
+            base_y + 18.0,
         );
         let _ = self.display_ctx.fill_text(
             "In-game: WASD/Arrows: Move | Z/Space: Attack/Block | X/Shift: Phase | M: Map",
@@ -1131,6 +1123,20 @@ impl Renderer {
             10.0,
             65.0,
         );
+        if network.room_code.is_empty() {
+            let stats = PlayerStats {
+                kills: game.kills,
+                spider_kills: game.kills,
+                cannon_kills: 0,
+                snake_kills: 0,
+                deaths: game.deaths,
+                time_played_frames: game.frame_count.saturating_sub(game.start_frame),
+            };
+            let score = network.score_for_stats(&stats);
+            let _ = self
+                .display_ctx
+                .fill_text(&format!("Score: {}", score), 10.0, 85.0);
+        }
         let map_size = 120.0;
         let map_padding = 10.0;
         let map_left = (self.width as f64) - map_size - map_padding;
@@ -1140,11 +1146,14 @@ impl Renderer {
         let _ = self.display_ctx.fill_text("M: Map", map_left, map_top - 6.0);
 
         if !network.room_code.is_empty() {
-            self.render_team_stats(network);
+            self.render_team_stats(game, network);
         }
         self.render_minimap(game, network);
         if game.map_open {
             self.render_map_overlay(game, network);
+        }
+        if !game.map_open {
+            self.render_chat_overlay(game);
         }
 
         self.render_network_status_on(&self.display_ctx, network);
@@ -1152,6 +1161,11 @@ impl Renderer {
 
     fn render_gameover_overlay(&self, game: &Game, network: &NetworkSession) {
         self.display_ctx.set_global_alpha(1.0);
+
+        if game.map_open {
+            self.render_map_overlay(game, network);
+            return;
+        }
 
         self.display_ctx.set_fill_style_str(COLOR_ACCENT2);
         self.display_ctx.set_font("bold 48px monospace");
@@ -1184,54 +1198,36 @@ impl Renderer {
 
         self.display_ctx.set_font("16px monospace");
         let _ = self.display_ctx.fill_text(
-            "Press Z or SPACE to continue",
+            "Press Z or SPACE to open map",
             (self.width / 2) as f64,
             (self.height - 80) as f64,
         );
-
-        if game.map_open {
-            self.render_map_overlay(game, network);
-        }
     }
 
-    fn render_team_stats(&self, network: &NetworkSession) {
+    fn render_team_stats(&self, game: &Game, network: &NetworkSession) {
+        let entries = self.collect_player_entries(game, network);
+        let mut top_entries = entries.clone();
+        top_entries.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.kills.cmp(&a.kills)));
+
         let right_x = (self.width - 10) as f64;
-        let mut y = 25.0;
-        let totals = network.room_totals();
+        let mut y = 45.0;
 
         self.display_ctx.set_fill_style_str(COLOR_LIGHT);
         self.display_ctx.set_font("12px monospace");
         self.display_ctx.set_text_align("right");
 
-        let _ = self.display_ctx.fill_text("Team", right_x, y);
+        let _ = self.display_ctx.fill_text("Top Players", right_x, y);
         y += 16.0;
 
-        let local_stats = &network.local_stats;
-        let _ = self.display_ctx.fill_text(
-            &format!(
-                "{} K:{} D:{} T:{}",
-                network.local_player_name,
-                local_stats.kills,
-                local_stats.deaths,
-                Self::format_time(local_stats.time_seconds()),
-            ),
-            right_x,
-            y,
-        );
-        y += 14.0;
-
-        for (peer_id, remote) in network.remote_players.iter() {
-            let (kills, deaths, time_seconds) = match network.remote_stats.get(peer_id) {
-                Some(stats) => (stats.kills, stats.deaths, stats.time_seconds()),
-                None => (0, 0, 0),
-            };
+        for (idx, entry) in top_entries.iter().take(3).enumerate() {
             let _ = self.display_ctx.fill_text(
                 &format!(
-                    "{} K:{} D:{} T:{}",
-                    remote.name,
-                    kills,
-                    deaths,
-                    Self::format_time(time_seconds),
+                    "{}. {} S:{} K:{} D:{}",
+                    idx + 1,
+                    entry.name,
+                    entry.score,
+                    entry.kills,
+                    entry.deaths,
                 ),
                 right_x,
                 y,
@@ -1239,17 +1235,190 @@ impl Renderer {
             y += 14.0;
         }
 
-        y += 6.0;
+        self.display_ctx.set_fill_style_str("#666666");
+        let _ = self.display_ctx.fill_text("P: Players", right_x, y + 4.0);
+
+        if game.player_list_open && !game.map_open {
+            self.render_player_list_overlay(game, network, &entries);
+        }
+    }
+
+    fn render_player_list_overlay(&self, game: &Game, network: &NetworkSession, entries: &[PlayerEntry]) {
+        let overlay_w = 480.0;
+        let overlay_h = 360.0;
+        let left = (self.width as f64 - overlay_w) / 2.0;
+        let top = 70.0;
+
+        self.display_ctx.set_fill_style_str("rgba(0,0,0,0.6)");
+        self.display_ctx.fill_rect(0.0, 0.0, self.width as f64, self.height as f64);
+        self.display_ctx.set_fill_style_str("#0d1214");
+        self.display_ctx.fill_rect(left, top, overlay_w, overlay_h);
+        self.display_ctx.set_stroke_style_str("#3a4a4a");
+        self.display_ctx.set_line_width(2.0);
+        self.display_ctx.stroke_rect(left, top, overlay_w, overlay_h);
+
+        self.display_ctx.set_fill_style_str(COLOR_LIGHT);
+        self.display_ctx.set_font("14px monospace");
+        self.display_ctx.set_text_align("left");
+        let _ = self.display_ctx.fill_text("Players", left + 12.0, top + 24.0);
+        let sort_label = match game.player_list_sort {
+            0 => "score",
+            1 => "name",
+            2 => "kills",
+            3 => "deaths",
+            _ => "time",
+        };
+        let order_label = if game.player_list_sort_asc { "asc" } else { "desc" };
+        let search = if game.player_list_search.is_empty() {
+            "search: /".to_string()
+        } else {
+            format!("search: {}", game.player_list_search)
+        };
+        self.display_ctx.set_font("12px monospace");
         let _ = self.display_ctx.fill_text(
-            &format!(
-                "Room K:{} D:{} T:{}",
-                totals.kills,
-                totals.deaths,
-                Self::format_time(totals.time_seconds()),
-            ),
-            right_x,
-            y,
+            &format!("Sort: {} ({})  {}", sort_label, order_label, search),
+            left + 12.0,
+            top + 40.0,
         );
+
+        let row_height = 18.0;
+        let rows_visible = 14;
+        let max_scroll = entries.len().saturating_sub(rows_visible) as i32;
+        let start = game.player_list_scroll.min(max_scroll).max(0) as usize;
+
+        let header_y = top + 64.0;
+        let name_x = left + 12.0;
+        let score_x = left + 210.0;
+        let kills_x = left + 270.0;
+        let deaths_x = left + 320.0;
+        let time_x = left + 370.0;
+
+        self.display_ctx.set_fill_style_str("#aab3b3");
+        let _ = self.display_ctx.fill_text("Name", name_x, header_y);
+        let _ = self.display_ctx.fill_text("S", score_x, header_y);
+        let _ = self.display_ctx.fill_text("K", kills_x, header_y);
+        let _ = self.display_ctx.fill_text("D", deaths_x, header_y);
+        let _ = self.display_ctx.fill_text("T", time_x, header_y);
+
+        self.display_ctx.set_fill_style_str(COLOR_LIGHT);
+        let mut y = header_y + row_height;
+        for entry in entries.iter().skip(start).take(rows_visible) {
+            let name = if entry.name.len() > 14 {
+                format!("{}…", &entry.name[..13])
+            } else {
+                entry.name.clone()
+            };
+            let _ = self.display_ctx.fill_text(&name, name_x, y);
+            self.display_ctx.set_text_align("right");
+            let _ = self.display_ctx.fill_text(&entry.score.to_string(), score_x + 26.0, y);
+            let _ = self.display_ctx.fill_text(&entry.kills.to_string(), kills_x + 20.0, y);
+            let _ = self.display_ctx.fill_text(&entry.deaths.to_string(), deaths_x + 20.0, y);
+            let _ = self.display_ctx.fill_text(&Self::format_time(entry.time_seconds), time_x + 46.0, y);
+            self.display_ctx.set_text_align("left");
+            y += row_height;
+        }
+
+        self.display_ctx.set_fill_style_str("#e6efef");
+        self.display_ctx.set_font("12px monospace");
+        self.display_ctx.set_text_align("left");
+        let _ = self.display_ctx.fill_text(
+            "Players: Up/Down scroll | S sort | D order | / search | Esc clear | P close",
+            left,
+            top - 12.0,
+        );
+        self.render_network_status_on(&self.display_ctx, network);
+    }
+
+    fn render_chat_overlay(&self, game: &Game) {
+        let log_lines: Vec<_> = game.chat_log.iter().rev().take(6).collect();
+        if log_lines.is_empty() && !game.chat_open {
+            return;
+        }
+
+        let line_height = 16.0;
+        let padding = 6.0;
+        let left = 10.0;
+        let bottom = self.height as f64 - 10.0;
+        let log_height = log_lines.len() as f64 * line_height;
+        let helper_height = if game.chat_open { line_height } else { 0.0 };
+        let input_height = if game.chat_open { line_height + 6.0 } else { 0.0 };
+        let box_height = log_height + helper_height + input_height + padding * 2.0;
+        let box_top = bottom - box_height;
+
+        self.display_ctx.set_fill_style_str("rgba(0,0,0,0.45)");
+        self.display_ctx.fill_rect(left - 4.0, box_top - 4.0, 360.0, box_height + 8.0);
+
+        self.display_ctx.set_font("12px monospace");
+        self.display_ctx.set_text_align("left");
+        self.display_ctx.set_fill_style_str("#e6efef");
+
+        let mut y = box_top + padding + line_height;
+        for line in log_lines.iter().rev() {
+            let text = format!("{}: {}", line.name, line.text);
+            let _ = self.display_ctx.fill_text(&text, left, y);
+            y += line_height;
+        }
+
+        if game.chat_open {
+            let mut input = game.chat_input.clone();
+            if input.len() > 72 {
+                input = format!("...{}", &input[input.len().saturating_sub(69)..]);
+            }
+            let prompt = format!("> {}_", input);
+            let helper_y = bottom - padding - input_height;
+            self.display_ctx.set_fill_style_str("#9aa3a3");
+            let _ = self
+                .display_ctx
+                .fill_text("Use /mute NAME to vote mute", left, helper_y);
+            self.display_ctx.set_fill_style_str("#e6efef");
+            let _ = self.display_ctx.fill_text(&prompt, left, bottom - padding);
+        } else {
+            if log_lines.is_empty() {
+                self.display_ctx.set_fill_style_str("#9aa3a3");
+                let _ = self.display_ctx.fill_text("C: Chat", left, bottom - padding);
+            }
+        }
+    }
+
+    fn collect_player_entries(&self, game: &Game, network: &NetworkSession) -> Vec<PlayerEntry> {
+        let mut entries = Vec::new();
+        let local_stats = &network.local_stats;
+        entries.push(PlayerEntry {
+            name: network.local_player_name.clone(),
+            kills: local_stats.kills,
+            deaths: local_stats.deaths,
+            time_seconds: local_stats.time_seconds(),
+            score: network.score_for_stats(local_stats),
+        });
+
+        for (peer_id, remote) in network.remote_players.iter() {
+            let stats = network.remote_stats.get(peer_id).cloned().unwrap_or_default();
+            entries.push(PlayerEntry {
+                name: remote.name.clone(),
+                kills: stats.kills,
+                deaths: stats.deaths,
+                time_seconds: stats.time_seconds(),
+                score: network.score_for_stats(&stats),
+            });
+        }
+
+        if !game.player_list_search.is_empty() {
+            let query = game.player_list_search.to_ascii_lowercase();
+            entries.retain(|entry| entry.name.to_ascii_lowercase().contains(&query));
+        }
+
+        match game.player_list_sort {
+            1 => entries.sort_by(|a, b| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase())),
+            2 => entries.sort_by(|a, b| a.kills.cmp(&b.kills)),
+            3 => entries.sort_by(|a, b| a.deaths.cmp(&b.deaths)),
+            4 => entries.sort_by(|a, b| a.time_seconds.cmp(&b.time_seconds)),
+            _ => entries.sort_by(|a, b| a.score.cmp(&b.score)),
+        }
+        if !game.player_list_sort_asc {
+            entries.reverse();
+        }
+
+        entries
     }
 
     fn collect_enemy_positions(game: &Game) -> Vec<(Vec2, u8)> {

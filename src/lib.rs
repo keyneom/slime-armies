@@ -375,7 +375,7 @@ fn setup_input(window: &web_sys::Window, _state: Rc<RefCell<GameState>>, canvas:
                     // key.len() == 1 filters out special keys like "Shift", "ArrowUp", etc.
                     if key.len() == 1 {
                         if let Some(c) = key.chars().next() {
-                            if c.is_alphanumeric() || c == '_' || c == '-' {
+                            if c.is_ascii() && !c.is_ascii_control() {
                                 buf.chars.push(c);
                             }
                         }
@@ -511,7 +511,186 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
 
                     buf.keys_down.clear();
                     buf.keys_up.clear();
+                } else if state_ref.game.is_chat_input_active() {
+                    for c in buf.chars.drain(..) {
+                        state_ref.game.handle_chat_char_input(c);
+                    }
+
+                    if buf.backspace {
+                        state_ref.game.handle_chat_backspace();
+                    }
+
+                    if buf.escape {
+                        state_ref.game.close_chat();
+                    }
+
+                    if buf.enter {
+                        if let Some(text) = state_ref.game.take_chat_input() {
+                            if state_ref.game.can_send_chat() {
+                                let local_hash = state_ref.network.local_peer_hash.unwrap_or(0);
+                                let trimmed = text.trim();
+                                if trimmed.to_ascii_lowercase().starts_with("/mute") {
+                                    let target = trimmed.splitn(2, ' ').nth(1).unwrap_or("").trim();
+                                    if local_hash == 0 {
+                                        state_ref.game.push_chat_line(
+                                            "System".to_string(),
+                                            "Chat is still initializing.".to_string(),
+                                        );
+                                    } else if target.is_empty() {
+                                        state_ref.game.push_chat_line(
+                                            "System".to_string(),
+                                            "Usage: /mute NAME".to_string(),
+                                        );
+                                    } else if let Some(target_hash) = state_ref.network.resolve_hash_by_name(target) {
+                                        if target_hash == local_hash {
+                                            state_ref.game.push_chat_line(
+                                                "System".to_string(),
+                                                "You cannot mute yourself.".to_string(),
+                                            );
+                                        } else {
+                                            state_ref.network.mute_locally(target_hash);
+                                            let vote = net::VoteMute {
+                                                target_hash,
+                                                voter_hash: local_hash,
+                                            };
+                                            let muted_now = state_ref.network.register_vote_mute(vote);
+                                            state_ref.network.send_vote_mute(vote);
+                                            let target_name = state_ref.network.display_name_for_hash(target_hash);
+                                            let msg = if muted_now {
+                                                format!("Muted {}.", target_name)
+                                            } else {
+                                                format!("Muted {} locally. Vote sent.", target_name)
+                                            };
+                                            state_ref.game.push_chat_line("System".to_string(), msg);
+                                        }
+                                    } else {
+                                        state_ref.game.push_chat_line(
+                                            "System".to_string(),
+                                            format!("No player named '{}'.", target),
+                                        );
+                                    }
+                                } else if local_hash == 0 && !state_ref.network.room_code.is_empty() {
+                                    state_ref.game.push_chat_line(
+                                        "System".to_string(),
+                                        "Chat is still initializing.".to_string(),
+                                    );
+                                } else {
+                                    let name = state_ref.game.player_name.clone();
+                                    state_ref.game.push_chat_line(name.clone(), trimmed.to_string());
+                                    if !state_ref.network.room_code.is_empty() {
+                                        state_ref.network.send_chat_message(net::ChatMessage {
+                                            sender_hash: local_hash,
+                                            text: trimmed.to_string(),
+                                        });
+                                    }
+                                }
+                                state_ref.game.mark_chat_sent();
+                            } else {
+                                state_ref.game.push_chat_line(
+                                    "System".to_string(),
+                                    "Slow down. Chat has a short cooldown.".to_string(),
+                                );
+                            }
+                        }
+                        state_ref.game.close_chat();
+                    }
+
+                    buf.keys_down.clear();
+                    buf.keys_up.clear();
                 } else {
+                    if state_ref.game.player_list_open
+                        && (state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver)
+                    {
+                        let blocked = ["KeyZ", "KeyX", "ArrowLeft", "ArrowRight"];
+                        buf.keys_down.retain(|code| !blocked.contains(&code.as_str()));
+                        buf.keys_up.retain(|code| !blocked.contains(&code.as_str()));
+                    }
+                    if state_ref.game.map_open
+                        && (state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver)
+                    {
+                        let allowed = [
+                            "KeyW", "KeyA", "KeyS", "KeyD",
+                            "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+                            "KeyZ", "Space", "KeyX", "ShiftLeft", "ShiftRight",
+                            "KeyM",
+                        ];
+                        buf.keys_down.retain(|code| allowed.contains(&code.as_str()));
+                        buf.keys_up.retain(|code| allowed.contains(&code.as_str()));
+                    }
+                    if (state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver)
+                        && !state_ref.game.map_open
+                    {
+                        let mut handled_keys: Vec<String> = Vec::new();
+                        for code in &buf.keys_down {
+                            match code.as_str() {
+                                "KeyP" => {
+                                    state_ref.game.toggle_player_list();
+                                    handled_keys.push(code.clone());
+                                }
+                                "ArrowDown" => {
+                                    if state_ref.game.player_list_open && !state_ref.game.player_list_search_active {
+                                        state_ref.game.scroll_player_list(1);
+                                        handled_keys.push(code.clone());
+                                    }
+                                }
+                                "ArrowUp" => {
+                                    if state_ref.game.player_list_open && !state_ref.game.player_list_search_active {
+                                        state_ref.game.scroll_player_list(-1);
+                                        handled_keys.push(code.clone());
+                                    }
+                                }
+                                "KeyS" => {
+                                    if state_ref.game.player_list_open {
+                                        state_ref.game.cycle_player_list_sort();
+                                        handled_keys.push(code.clone());
+                                    }
+                                }
+                                "KeyD" => {
+                                    if state_ref.game.player_list_open {
+                                        state_ref.game.toggle_player_list_sort_order();
+                                        handled_keys.push(code.clone());
+                                    }
+                                }
+                                "KeyC" => {
+                                    if state_ref.game.scene == Scene::Game {
+                                        state_ref.game.toggle_chat();
+                                        handled_keys.push(code.clone());
+                                    }
+                                }
+                                "Slash" => {
+                                    if state_ref.game.player_list_open {
+                                        state_ref.game.activate_player_list_search();
+                                        handled_keys.push(code.clone());
+                                    }
+                                }
+                                "Escape" => {
+                                    if state_ref.game.player_list_open {
+                                        state_ref.game.clear_player_list_search();
+                                        handled_keys.push(code.clone());
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !handled_keys.is_empty() {
+                            buf.keys_down.retain(|code| !handled_keys.contains(code));
+                        }
+                    }
+
+                    if state_ref.game.player_list_open && state_ref.game.player_list_search_active {
+                        for c in buf.chars.drain(..) {
+                            state_ref.game.handle_player_list_char_input(c);
+                        }
+                        if buf.backspace {
+                            state_ref.game.handle_player_list_backspace();
+                        }
+                        if buf.escape {
+                            state_ref.game.clear_player_list_search();
+                        }
+                        buf.keys_down.clear();
+                        buf.keys_up.clear();
+                    }
+
                     if (state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver)
                         && state_ref.game.map_open
                         && buf.chars.iter().any(|c| c.is_ascii_digit() || *c == '-' || *c == '.')
@@ -752,25 +931,32 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 // Enemy kill events - broadcast kills so all clients see the same deaths
                 // All players broadcast their kills (authoritative from killer's machine)
                 let kills = state_ref.game.take_pending_kills();
-                if !kills.is_empty() {
-                    state_ref.network.record_local_kills(kills.len() as u32);
-                }
                 let player_pos = state_ref.game.player.pos;
                 for (enemy_type, enemy_id) in kills {
+                    state_ref.network.record_local_kill(enemy_type);
+                    let killer_hash = state_ref.network.local_peer_hash.unwrap_or(0);
                     state_ref.network.send_enemy_kill(net::EnemyKill {
                         enemy_type: enemy_type as u8,
                         enemy_id,
                         killer_x: player_pos.x,
                         killer_y: player_pos.y,
+                        killer_hash,
                     });
                 }
 
                 // Process enemy kills from other players
                 let remote_kills = state_ref.network.take_enemy_kills();
-                for (peer_id, kill) in remote_kills {
+                for (_peer_id, kill) in remote_kills {
                     if let Some(enemy_type) = net::EnemyType::from_u8(kill.enemy_type) {
                         state_ref.game.kill_enemy(enemy_type, kill.enemy_id);
-                        state_ref.network.record_remote_kill(&peer_id, 1);
+                        if let Some(local_hash) = state_ref.network.local_peer_hash {
+                            if kill.killer_hash == local_hash {
+                                continue;
+                            }
+                        }
+                        if let Some(remote_id) = state_ref.network.resolve_peer_hash(kill.killer_hash) {
+                            state_ref.network.record_remote_kill(&remote_id, enemy_type);
+                        }
                     }
                 }
 
@@ -779,14 +965,41 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 if !deaths.is_empty() {
                     state_ref.network.record_local_deaths(deaths.len() as u32);
                 }
-                for death in deaths {
+                for mut death in deaths {
+                    let victim_hash = state_ref.network.local_peer_hash.unwrap_or(0);
+                    death.victim_hash = victim_hash;
                     state_ref.network.send_player_death(death);
                 }
 
                 // Process player deaths from other players
                 let remote_deaths = state_ref.network.take_player_deaths();
-                for (peer_id, _death) in remote_deaths {
-                    state_ref.network.record_remote_death(&peer_id, 1);
+                for (_peer_id, death) in remote_deaths {
+                    if let Some(local_hash) = state_ref.network.local_peer_hash {
+                        if death.victim_hash == local_hash {
+                            continue;
+                        }
+                    }
+                    if let Some(remote_id) = state_ref.network.resolve_peer_hash(death.victim_hash) {
+                        state_ref.network.record_remote_death(&remote_id, 1);
+                    }
+                }
+
+                let incoming_chat = state_ref.network.take_chat_messages();
+                for chat in incoming_chat {
+                    let name = state_ref.network.display_name_for_hash(chat.sender_hash);
+                    state_ref.game.push_chat_line(name, chat.text);
+                }
+
+                let incoming_mutes = state_ref.network.take_vote_mutes();
+                for vote in incoming_mutes {
+                    if let Some(local_hash) = state_ref.network.local_peer_hash {
+                        if vote.target_hash == local_hash {
+                            continue;
+                        }
+                    }
+                    let target_name = state_ref.network.display_name_for_hash(vote.target_hash);
+                    state_ref.game
+                        .push_chat_line("System".to_string(), format!("Muted {}.", target_name));
                 }
 
                 // Paid obstacle events - broadcast and apply with verification

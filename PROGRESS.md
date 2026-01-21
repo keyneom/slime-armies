@@ -86,3 +86,6 @@ trunk serve  # Dev server on http://localhost:8080
   - [x] Track kills, deaths, and time played per user.
   - [x] Track room totals for kills, deaths, and time played (time played = sum of all players).
 - [~] Paid ability gating (e.g., pay to drop an obstacle at a chosen location) using x402 or on-chain proofs with host validation.
+- [ ] Define and deploy a generic immutable smart contract to verify paid unlocks and distribute tournament winnings; winner determination likely needs a separate consensus process.
+- [ ] Future upgrades (laser attack, stronger shields) and competitive crypto prizes (last-man-standing, PvP tournaments).
+- [ ] Mobile-friendly UX (touch controls, responsive HUD, safe areas for chat/map/player list).

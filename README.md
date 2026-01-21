@@ -72,6 +72,8 @@ We could offer paid abilities (example: drop an obstacle at a chosen coordinate)
 - **Commit-reveal**: player commits to a placement, reveals after payment confirmation; host confirms before applying.
 If we keep this backendless, the best practical guardrail is host-side verification plus on-chain proofs (e.g., tx hash or signed receipt in the event payload), but it is not cheat-proof without an authoritative server.
 
+We’ll need a generic, immutable smart contract that can verify paid unlocks for any feature (e.g., obstacle drops) without adding new methods per feature. It should also support prize payouts for tournaments and other competitive modes; winner determination likely needs its own consensus process, so contract hooks should expect externally agreed results.
+
 ### Crypto-Based Backend (Lightweight)
 
 For features requiring persistence without dedicated servers, consider:
@@ -82,6 +84,13 @@ For features requiring persistence without dedicated servers, consider:
 - **Rewards/achievements**: NFTs or on-chain badges
 
 This would maintain the P2P philosophy while enabling persistent features. Implementation deferred until core gameplay is solid.
+
+### Future Upgrades + Competitive Prizes
+- Paid upgrades could include a forward laser attack, stronger shields (e.g., 3/4 coverage), or other ability enhancements.
+- Competitive modes could award crypto prizes (e.g., last-slime-standing vs. environment, or PvP tournaments/gladiator fights).
+
+### Mobile-Friendly UX
+- Add touch controls (virtual stick + action buttons), responsive HUD layout, and safe areas for chat/map/player list.
 
 ## License
 

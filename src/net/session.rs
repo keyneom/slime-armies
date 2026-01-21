@@ -1,5 +1,5 @@
 use matchbox_socket::{PeerState, WebRtcSocket};
-use crate::net::{NetMessage, PlayerState, RemotePlayer, EnemySync, EnemyDamage, WaveStart, EnemyKill, PlayerDeath, PaidObstacle, PaidObstacleSync, PaidObstacleAck, CannonShot, InputFrame, Ping, Pong, SupernodeScore};
+use crate::net::{NetMessage, PlayerState, RemotePlayer, EnemySync, EnemyDamage, WaveStart, EnemyKill, PlayerDeath, PaidObstacle, PaidObstacleSync, PaidObstacleAck, CannonShot, InputFrame, Ping, Pong, SupernodeScore, ChatMessage, VoteMute};
 use std::collections::{HashMap, HashSet};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -25,6 +25,9 @@ pub enum NetworkState {
 #[derive(Debug, Clone, Default)]
 pub struct PlayerStats {
     pub kills: u32,
+    pub spider_kills: u32,
+    pub cannon_kills: u32,
+    pub snake_kills: u32,
     pub deaths: u32,
     pub time_played_frames: u32,
 }
@@ -44,11 +47,13 @@ pub struct NetworkSession {
     pub local_player_name: String,
     pub remote_players: HashMap<PeerId, RemotePlayer>,
     pub local_peer_id: Option<matchbox_socket::PeerId>,
+    pub local_peer_hash: Option<u64>,
     pub supernode_id: Option<matchbox_socket::PeerId>,
     pub local_stats: PlayerStats,
     pub remote_stats: HashMap<PeerId, PlayerStats>,
     pending_player_names: HashMap<PeerId, String>,
     peer_id_lookup: HashMap<PeerId, matchbox_socket::PeerId>,
+    peer_hash_lookup: HashMap<u64, PeerId>,
     pending_messages: Vec<(PeerId, NetMessage)>,
     /// Whether this client is the host (room creator) - host controls enemy spawning
     pub is_host: bool,
@@ -68,6 +73,14 @@ pub struct NetworkSession {
     pub pending_paid_obstacle_acks: Vec<(PeerId, PaidObstacleAck)>,
     /// Received cannon shot events from host
     pub pending_cannon_shots: Vec<CannonShot>,
+    /// Received chat messages
+    pending_chat_messages: Vec<ChatMessage>,
+    /// Received vote mute events that reached threshold
+    pending_vote_mutes: Vec<VoteMute>,
+    /// Muted sender hashes
+    muted_hashes: HashSet<u64>,
+    /// Vote mute tracking (target -> voters)
+    vote_mutes: HashMap<u64, HashSet<u64>>,
     /// Received input frames (future rollback netcode)
     pub pending_input_frames: Vec<(PeerId, InputFrame)>,
     /// Latency samples to peers (ms)
@@ -95,11 +108,13 @@ impl NetworkSession {
             local_player_name: Self::generate_default_name(),
             remote_players: HashMap::new(),
             local_peer_id: None,
+            local_peer_hash: None,
             supernode_id: None,
             local_stats: PlayerStats::default(),
             remote_stats: HashMap::new(),
             pending_player_names: HashMap::new(),
             peer_id_lookup: HashMap::new(),
+            peer_hash_lookup: HashMap::new(),
             pending_messages: Vec::new(),
             is_host: false,
             pending_enemy_sync: None,
@@ -110,6 +125,10 @@ impl NetworkSession {
             pending_paid_obstacles: Vec::new(),
             pending_paid_obstacle_acks: Vec::new(),
             pending_cannon_shots: Vec::new(),
+            pending_chat_messages: Vec::new(),
+            pending_vote_mutes: Vec::new(),
+            muted_hashes: HashSet::new(),
+            vote_mutes: HashMap::new(),
             pending_input_frames: Vec::new(),
             latency_ms: HashMap::new(),
             latency_samples: HashMap::new(),
@@ -173,7 +192,7 @@ impl NetworkSession {
     fn connect(&mut self, signaling_server: &str, room_code: &str) {
         // Use game-specific room prefix to avoid conflicts with other matchbox games
         // ?next=2 tells matchbox to start handshake when 2 peers connect
-        let room_url = format!("{}/slime_armies_{}?next=2", signaling_server, room_code);
+        let room_url = format!("{}/slime_armies_{}", signaling_server, room_code);
 
         web_sys::console::log_1(&format!("Connecting to room: {}", room_url).into());
 
@@ -204,15 +223,21 @@ impl NetworkSession {
         self.room_code.clear();
         self.remote_players.clear();
         self.local_peer_id = None;
+        self.local_peer_hash = None;
         self.supernode_id = None;
         self.pending_player_names.clear();
         self.peer_id_lookup.clear();
+        self.peer_hash_lookup.clear();
         self.bad_supernodes.clear();
         self.last_enemy_sync_frame = 0;
         self.paid_obstacle_confirmations.clear();
         self.latency_ms.clear();
         self.latency_samples.clear();
         self.supernode_scores.clear();
+        self.pending_chat_messages.clear();
+        self.pending_vote_mutes.clear();
+        self.muted_hashes.clear();
+        self.vote_mutes.clear();
     }
 
     /// Poll for network events and update state
@@ -244,6 +269,8 @@ impl NetworkSession {
                     web_sys::console::log_1(&format!("Peer connected: {}", peer_id_str).into());
                     self.state = NetworkState::Connected;
                     self.peer_id_lookup.insert(peer_id_str.clone(), peer_id);
+                    let hash = Self::hash_peer_id(&peer_id_str);
+                    self.peer_hash_lookup.insert(hash, peer_id_str.clone());
                     // Send join message with our name
                     let msg = NetMessage::PlayerJoined(local_name.clone()).to_bytes();
                     socket.send(msg.into_boxed_slice(), peer_id);
@@ -255,6 +282,8 @@ impl NetworkSession {
                     self.remote_players.remove(&peer_id_str);
                     self.pending_player_names.remove(&peer_id_str);
                     let removed_peer = self.peer_id_lookup.remove(&peer_id_str);
+                    let removed_hash = Self::hash_peer_id(&peer_id_str);
+                    self.peer_hash_lookup.remove(&removed_hash);
                     if let Some(peer_id) = removed_peer {
                         self.bad_supernodes.remove(&peer_id);
                         self.supernode_scores.remove(&peer_id);
@@ -274,12 +303,20 @@ impl NetworkSession {
             for (peer_id, data) in messages {
                 let peer_id_str = format!("{:?}", peer_id);
                 self.peer_id_lookup.insert(peer_id_str.clone(), peer_id);
+                let hash = Self::hash_peer_id(&peer_id_str);
+                self.peer_hash_lookup.insert(hash, peer_id_str.clone());
                 if let Some(msg) = NetMessage::from_bytes(&data) {
                     self.pending_messages.push((peer_id_str, msg));
                 }
             }
 
             let local_id = socket.id();
+            if let Some(local_id) = local_id {
+                let local_id_str = format!("{:?}", local_id);
+                let hash = Self::hash_peer_id(&local_id_str);
+                self.local_peer_hash = Some(hash);
+                self.peer_hash_lookup.insert(hash, local_id_str);
+            }
             let connected_peers: Vec<_> = socket.connected_peers().collect();
             (local_id, connected_peers)
         };
@@ -293,6 +330,8 @@ impl NetworkSession {
         let mut enemy_kills: Vec<(PeerId, EnemyKill)> = Vec::new();
         let mut player_deaths: Vec<(PeerId, PlayerDeath)> = Vec::new();
         let mut paid_obstacles: Vec<(PeerId, PaidObstacle)> = Vec::new();
+        let mut chat_messages: Vec<ChatMessage> = Vec::new();
+        let mut vote_mutes: Vec<VoteMute> = Vec::new();
 
         for (peer_id, msg) in self.pending_messages.drain(..) {
             match msg {
@@ -349,6 +388,12 @@ impl NetworkSession {
                 }
                 NetMessage::CannonShotEvent(shot) => {
                     self.pending_cannon_shots.push(shot);
+                }
+                NetMessage::ChatMessageEvent(chat) => {
+                    chat_messages.push(chat);
+                }
+                NetMessage::VoteMuteEvent(vote) => {
+                    vote_mutes.push(vote);
                 }
                 NetMessage::InputFrameEvent(frame) => {
                     self.pending_input_frames.push((peer_id, frame));
@@ -412,6 +457,16 @@ impl NetworkSession {
                 self.relay_paid_obstacle(obstacle);
             } else if self.is_authoritative_sender(&peer_id) {
                 self.pending_paid_obstacles.push((peer_id, obstacle));
+            }
+        }
+        for chat in chat_messages {
+            if !self.is_muted(chat.sender_hash) {
+                self.pending_chat_messages.push(chat);
+            }
+        }
+        for vote in vote_mutes {
+            if self.register_vote_mute(vote) {
+                self.pending_vote_mutes.push(vote);
             }
         }
 
@@ -573,6 +628,19 @@ impl NetworkSession {
         self.peer_id_lookup.get(peer_id).copied()
     }
 
+    pub fn resolve_peer_hash(&self, hash: u64) -> Option<PeerId> {
+        self.peer_hash_lookup.get(&hash).cloned()
+    }
+
+    fn hash_peer_id(peer_id: &str) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for b in peer_id.as_bytes() {
+            hash ^= *b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
     fn tick_latency(&mut self, current_frame: u32, connected_peers: &[matchbox_socket::PeerId]) {
         let socket = match &mut self.socket {
             Some(s) => s,
@@ -630,6 +698,106 @@ impl NetworkSession {
         }
     }
 
+    pub fn send_chat_message(&mut self, chat: ChatMessage) {
+        let socket = match &mut self.socket {
+            Some(s) => s,
+            None => return,
+        };
+
+        let msg = NetMessage::ChatMessageEvent(chat).to_bytes();
+        let peers: Vec<_> = socket.connected_peers().collect();
+
+        for peer_id in peers {
+            socket.send(msg.clone().into_boxed_slice(), peer_id);
+        }
+    }
+
+    pub fn send_vote_mute(&mut self, vote: VoteMute) {
+        let socket = match &mut self.socket {
+            Some(s) => s,
+            None => return,
+        };
+
+        let msg = NetMessage::VoteMuteEvent(vote).to_bytes();
+        let peers: Vec<_> = socket.connected_peers().collect();
+
+        for peer_id in peers {
+            socket.send(msg.clone().into_boxed_slice(), peer_id);
+        }
+    }
+
+    pub fn take_chat_messages(&mut self) -> Vec<ChatMessage> {
+        std::mem::take(&mut self.pending_chat_messages)
+    }
+
+    pub fn take_vote_mutes(&mut self) -> Vec<VoteMute> {
+        std::mem::take(&mut self.pending_vote_mutes)
+    }
+
+    pub fn is_muted(&self, hash: u64) -> bool {
+        self.muted_hashes.contains(&hash)
+    }
+
+    pub fn register_vote_mute(&mut self, vote: VoteMute) -> bool {
+        if vote.target_hash == 0
+            || vote.voter_hash == 0
+            || vote.target_hash == vote.voter_hash
+        {
+            return false;
+        }
+
+        let entry = self.vote_mutes.entry(vote.target_hash).or_default();
+        entry.insert(vote.voter_hash);
+        let total_players = self.remote_players.len() + 1;
+        let required = total_players / 2 + 1;
+        if entry.len() >= required {
+            self.muted_hashes.insert(vote.target_hash);
+            return true;
+        }
+        false
+    }
+
+    pub fn mute_locally(&mut self, hash: u64) {
+        if hash != 0 {
+            self.muted_hashes.insert(hash);
+        }
+    }
+
+    pub fn resolve_hash_by_name(&self, name: &str) -> Option<u64> {
+        let query = name.trim().to_ascii_lowercase();
+        if query.is_empty() {
+            return None;
+        }
+
+        if self.local_player_name.to_ascii_lowercase() == query {
+            return self.local_peer_hash;
+        }
+
+        for (peer_id, remote) in &self.remote_players {
+            if remote.name.to_ascii_lowercase() == query {
+                return Some(Self::hash_peer_id(peer_id));
+            }
+        }
+
+        None
+    }
+
+    pub fn display_name_for_hash(&self, hash: u64) -> String {
+        if let Some(local_hash) = self.local_peer_hash {
+            if local_hash == hash {
+                return self.local_player_name.clone();
+            }
+        }
+
+        if let Some(peer_id) = self.peer_hash_lookup.get(&hash) {
+            if let Some(remote) = self.remote_players.get(peer_id) {
+                return remote.name.clone();
+            }
+        }
+
+        "Player".to_string()
+    }
+
     pub fn reset_stats(&mut self) {
         self.local_stats = PlayerStats::default();
         self.remote_stats.clear();
@@ -647,17 +815,39 @@ impl NetworkSession {
         }
     }
 
-    pub fn record_local_kills(&mut self, count: u32) {
-        self.local_stats.kills = self.local_stats.kills.saturating_add(count);
+    pub fn record_local_kill(&mut self, enemy_type: crate::net::EnemyType) {
+        self.local_stats.kills = self.local_stats.kills.saturating_add(1);
+        match enemy_type {
+            crate::net::EnemyType::Spider => {
+                self.local_stats.spider_kills = self.local_stats.spider_kills.saturating_add(1);
+            }
+            crate::net::EnemyType::Cannon => {
+                self.local_stats.cannon_kills = self.local_stats.cannon_kills.saturating_add(1);
+            }
+            crate::net::EnemyType::Snake => {
+                self.local_stats.snake_kills = self.local_stats.snake_kills.saturating_add(1);
+            }
+        }
     }
 
     pub fn record_local_deaths(&mut self, count: u32) {
         self.local_stats.deaths = self.local_stats.deaths.saturating_add(count);
     }
 
-    pub fn record_remote_kill(&mut self, peer_id: &PeerId, count: u32) {
+    pub fn record_remote_kill(&mut self, peer_id: &PeerId, enemy_type: crate::net::EnemyType) {
         let stats = self.remote_stats.entry(peer_id.clone()).or_default();
-        stats.kills = stats.kills.saturating_add(count);
+        stats.kills = stats.kills.saturating_add(1);
+        match enemy_type {
+            crate::net::EnemyType::Spider => {
+                stats.spider_kills = stats.spider_kills.saturating_add(1);
+            }
+            crate::net::EnemyType::Cannon => {
+                stats.cannon_kills = stats.cannon_kills.saturating_add(1);
+            }
+            crate::net::EnemyType::Snake => {
+                stats.snake_kills = stats.snake_kills.saturating_add(1);
+            }
+        }
     }
 
     pub fn record_remote_death(&mut self, peer_id: &PeerId, count: u32) {
@@ -673,6 +863,27 @@ impl NetworkSession {
             totals.time_played_frames = totals.time_played_frames.saturating_add(stats.time_played_frames);
         }
         totals
+    }
+
+    pub fn score_for_stats(&self, stats: &PlayerStats) -> u32 {
+        let spider = stats.spider_kills as f32;
+        let cannon = stats.cannon_kills as f32;
+        let snake = stats.snake_kills as f32;
+        let weighted_kills = spider * 1.0 + cannon * 2.5 + snake * 4.0;
+        let deaths = stats.deaths as f32;
+        let time_seconds = stats.time_seconds() as f32;
+        let time_minutes = time_seconds / 60.0;
+
+        let activity = weighted_kills / (time_minutes + 1.0);
+        let survival = 1.0 / (1.0 + deaths * 0.5);
+        let stability = survival * 20.0 * (weighted_kills / (weighted_kills + 5.0));
+        let base = weighted_kills * 25.0;
+        let tempo = activity * 10.0;
+        let penalty = deaths * 120.0;
+        let time_decay = 1.0 / (1.0 + time_minutes * 0.4);
+
+        let raw = (base + tempo + stability - penalty).max(0.0) * time_decay;
+        raw.round().max(0.0) as u32
     }
 
     /// Send local player state to all peers
