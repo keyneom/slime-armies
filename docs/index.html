@@ -29,8 +29,8 @@
     </style>
     
 <script type="module">
-import init, * as bindings from '/slime-armies/slime-armies-3855a523f5862488.js';
-const wasm = await init({ module_or_path: '/slime-armies/slime-armies-3855a523f5862488_bg.wasm' });
+import init, * as bindings from '/slime-armies/slime-armies-ae43c62c51132bf5.js';
+const wasm = await init({ module_or_path: '/slime-armies/slime-armies-ae43c62c51132bf5_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -39,7 +39,7 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-<link rel="modulepreload" href="/slime-armies/slime-armies-3855a523f5862488.js" crossorigin="anonymous" integrity="sha384-hiPbiGOiX5vx7NEHnFsfQep6LA4KBcPQGzYvkGZags77cJllwtM57SeIp3yqoFwJ"><link rel="preload" href="/slime-armies/slime-armies-3855a523f5862488_bg.wasm" crossorigin="anonymous" integrity="sha384-G706dIzu60kvOWsJtI+h8hdqgsUvyhJ6lPVktdrC4vJ25TwXyIK3Kv+kq1JA8DuL" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/slime-armies/slime-armies-ae43c62c51132bf5.js" crossorigin="anonymous" integrity="sha384-/I4zvzDaUQnAwFl1z68FCYUFSwQ9NBitm3KQFpG+WxnqmcDWCkg5J/B4L6NWJt3i"><link rel="preload" href="/slime-armies/slime-armies-ae43c62c51132bf5_bg.wasm" crossorigin="anonymous" integrity="sha384-0avPeOOs5x5wDE2kLQHcC9V1II7uZjm+lqRIqsBP6TXnw/Q9Phj4Eha3h88YFsTt" as="fetch" type="application/wasm"></head>
 <body>
     <canvas id="canvas"></canvas>
     <script type="module">
