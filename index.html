@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Slime Armies</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        html, body {
+            background: #000011;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+        }
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        canvas {
+            image-rendering: pixelated;
+            image-rendering: crisp-edges;
+            cursor: default;
+        }
+    </style>
+    <link data-trunk rel="rust" data-wasm-opt="z" />
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <script type="module">
+        import init, * as wasm from './pkg/slime_armies.js';
+        init().then(() => {
+            // Expose debug helpers for console/testing.
+            window.slime = wasm;
+            window.slimeDebug = {
+                send: (cmd) => wasm.send_debug_command(cmd),
+                help: () => wasm.send_debug_command("help"),
+            };
+        });
+    </script>
+</body>
+</html>

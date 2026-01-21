@@ -1,0 +1,9 @@
+[package]
+name = "slime-armies-matchbox-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+matchbox_server = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+clap = { version = "4", features = ["derive"] }

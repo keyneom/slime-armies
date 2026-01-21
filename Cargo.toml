@@ -1,0 +1,53 @@
+[package]
+name = "slime-armies"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.2", features = ["js"] }
+rand = "0.8"
+rand_xoshiro = "0.6"
+matchbox_socket = "0.10"
+futures = "0.3"
+futures-timer = "3.0"
+sha2 = "0.10"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "KeyboardEvent",
+    "MouseEvent",
+    "DomRect",
+    "EventTarget",
+    "Performance",
+    "console",
+    "CssStyleDeclaration",
+    "HtmlElement",
+    "Storage",
+    # Web Audio API for sound effects
+    "AudioContext",
+    "AudioDestinationNode",
+    "AudioNode",
+    "AudioParam",
+    "OscillatorNode",
+    "OscillatorType",
+    "GainNode",
+    "BiquadFilterNode",
+    "BiquadFilterType",
+]
+
+[profile.release]
+lto = true
+opt-level = "z"

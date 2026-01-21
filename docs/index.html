@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Slime Armies</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        html, body {
+            background: #000011;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+        }
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        canvas {
+            image-rendering: pixelated;
+            image-rendering: crisp-edges;
+            cursor: default;
+        }
+    </style>
+    
+<script type="module">
+import init, * as bindings from '/slime-armies-3855a523f5862488.js';
+const wasm = await init({ module_or_path: '/slime-armies-3855a523f5862488_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+<link rel="modulepreload" href="/slime-armies-3855a523f5862488.js" crossorigin="anonymous" integrity="sha384-hiPbiGOiX5vx7NEHnFsfQep6LA4KBcPQGzYvkGZags77cJllwtM57SeIp3yqoFwJ"><link rel="preload" href="/slime-armies-3855a523f5862488_bg.wasm" crossorigin="anonymous" integrity="sha384-G706dIzu60kvOWsJtI+h8hdqgsUvyhJ6lPVktdrC4vJ25TwXyIK3Kv+kq1JA8DuL" as="fetch" type="application/wasm"></head>
+<body>
+    <canvas id="canvas"></canvas>
+    <script type="module">
+        import init, * as wasm from './pkg/slime_armies.js';
+        init().then(() => {
+            // Expose debug helpers for console/testing.
+            window.slime = wasm;
+            window.slimeDebug = {
+                send: (cmd) => wasm.send_debug_command(cmd),
+                help: () => wasm.send_debug_command("help"),
+            };
+        });
+    </script>
+</body>
+</html>
