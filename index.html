@@ -32,13 +32,14 @@
 <body>
     <canvas id="canvas"></canvas>
     <script type="module">
-        import init, * as wasm from './pkg/slime_armies.js';
-        init().then(() => {
-            // Expose debug helpers for console/testing.
-            window.slime = wasm;
+        // Debug helpers will be exposed by Trunk-generated script
+        // Access via window.slime and window.slimeDebug after TrunkApplicationStarted event
+        addEventListener("TrunkApplicationStarted", (e) => {
+            const bindings = e.detail.wasm;
+            window.slime = bindings;
             window.slimeDebug = {
-                send: (cmd) => wasm.send_debug_command(cmd),
-                help: () => wasm.send_debug_command("help"),
+                send: (cmd) => bindings.send_debug_command(cmd),
+                help: () => bindings.send_debug_command("help"),
             };
         });
     </script>

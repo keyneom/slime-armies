@@ -29,23 +29,30 @@
     </style>
     
 <script type="module">
-import init, * as bindings from './slime-armies-3855a523f5862488.js';
-const wasm = await init({ module_or_path: './slime-armies-3855a523f5862488_bg.wasm' });
+import init, * as bindings from '/slime-armies/slime-armies-3855a523f5862488.js';
+const wasm = await init({ module_or_path: '/slime-armies/slime-armies-3855a523f5862488_bg.wasm' });
 
 
 window.wasmBindings = bindings;
-window.slime = bindings;
-window.slimeDebug = {
-    send: (cmd) => bindings.send_debug_command(cmd),
-    help: () => bindings.send_debug_command("help"),
-};
 
 
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-<link rel="modulepreload" href="./slime-armies-3855a523f5862488.js" crossorigin="anonymous" integrity="sha384-hiPbiGOiX5vx7NEHnFsfQep6LA4KBcPQGzYvkGZags77cJllwtM57SeIp3yqoFwJ"><link rel="preload" href="./slime-armies-3855a523f5862488_bg.wasm" crossorigin="anonymous" integrity="sha384-G706dIzu60kvOWsJtI+h8hdqgsUvyhJ6lPVktdrC4vJ25TwXyIK3Kv+kq1JA8DuL" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/slime-armies/slime-armies-3855a523f5862488.js" crossorigin="anonymous" integrity="sha384-hiPbiGOiX5vx7NEHnFsfQep6LA4KBcPQGzYvkGZags77cJllwtM57SeIp3yqoFwJ"><link rel="preload" href="/slime-armies/slime-armies-3855a523f5862488_bg.wasm" crossorigin="anonymous" integrity="sha384-G706dIzu60kvOWsJtI+h8hdqgsUvyhJ6lPVktdrC4vJ25TwXyIK3Kv+kq1JA8DuL" as="fetch" type="application/wasm"></head>
 <body>
     <canvas id="canvas"></canvas>
+    <script type="module">
+        // Debug helpers will be exposed by Trunk-generated script
+        // Access via window.slime and window.slimeDebug after TrunkApplicationStarted event
+        addEventListener("TrunkApplicationStarted", (e) => {
+            const bindings = e.detail.wasm;
+            window.slime = bindings;
+            window.slimeDebug = {
+                send: (cmd) => bindings.send_debug_command(cmd),
+                help: () => bindings.send_debug_command("help"),
+            };
+        });
+    </script>
 </body>
 </html>
