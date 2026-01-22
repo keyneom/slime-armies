@@ -2,7 +2,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
 
-use crate::game::{Game, Scene, MenuSelection, MAP_OVERLAY_SIZE, MAP_OVERLAY_PADDING};
+use crate::game::{Game, Scene, MenuSelection};
 use crate::entities::{Player, Spider, Cannon, Snake, Projectile};
 use crate::math::Vec2;
 use crate::world::{Camera, CHUNK_SIZE};
@@ -1140,7 +1140,8 @@ impl Renderer {
         let map_size = 120.0;
         let map_padding = 10.0;
         let map_left = (self.width as f64) - map_size - map_padding;
-        let map_top = if game.mobile_mode { 130.0 } else { (self.height as f64) - map_size - map_padding };
+        let portrait = game.viewport_height > game.viewport_width;
+        let map_top = if game.mobile_mode || portrait { 130.0 } else { (self.height as f64) - map_size - map_padding };
         if !game.mobile_mode {
             self.display_ctx.set_font("12px monospace");
             self.display_ctx.set_text_align("left");
@@ -1202,8 +1203,13 @@ impl Renderer {
         );
 
         self.display_ctx.set_font("16px monospace");
+        let help_text = if game.mobile_mode {
+            "Tap screen to open map"
+        } else {
+            "Press Z or SPACE to open map"
+        };
         let _ = self.display_ctx.fill_text(
-            "Press Z or SPACE to open map",
+            help_text,
             (self.width / 2) as f64,
             (self.height - 80) as f64,
         );
@@ -1400,13 +1406,16 @@ impl Renderer {
     }
 
     fn render_mobile_controls(&self, game: &Game) {
+        if game.map_open || game.player_list_open {
+            return;
+        }
         let width = self.width as f64;
         let height = self.height as f64;
         let stick_center = Vec2::new(90.0, height as f32 - 90.0);
         let stick_radius = 60.0;
-        let action_radius = 32.0;
-        let attack_center = Vec2::new(width as f32 - 90.0, height as f32 - 120.0);
-        let phase_center = Vec2::new(width as f32 - 160.0, height as f32 - 60.0);
+        let action_radius = 36.0;
+        let attack_center = Vec2::new(width as f32 - 80.0, height as f32 - 130.0);
+        let phase_center = Vec2::new(width as f32 - 200.0, height as f32 - 60.0);
         let top_radius = 26.0;
         let chat_center = Vec2::new(width as f32 * 0.5, 32.0);
         let zoom_in_center = Vec2::new(width as f32 - 50.0, height as f32 - 220.0);
@@ -1540,7 +1549,8 @@ impl Renderer {
         let map_size = 120.0;
         let map_padding = 10.0;
         let map_left = (self.width as f64) - map_size - map_padding;
-        let map_top = (self.height as f64) - map_size - map_padding;
+        let portrait = game.viewport_height > game.viewport_width;
+        let map_top = if game.mobile_mode || portrait { 130.0 } else { (self.height as f64) - map_size - map_padding };
 
         let mut min_x = i32::MAX;
         let mut max_x = i32::MIN;
@@ -1612,9 +1622,7 @@ impl Renderer {
     }
 
     fn render_map_overlay(&self, game: &Game, network: &NetworkSession) {
-        let map_left = MAP_OVERLAY_PADDING as f64;
-        let map_top = MAP_OVERLAY_PADDING as f64;
-        let map_size = MAP_OVERLAY_SIZE as f64;
+        let (map_left, map_top, map_size) = game.map_overlay_rect();
         let map_center = game.map_center;
 
         self.display_ctx.set_fill_style_str("rgba(0,0,0,0.6)");
@@ -1943,8 +1951,13 @@ impl Renderer {
 
         // Instructions
         self.ctx.set_font("16px monospace");
+        let help_text = if game.mobile_mode {
+            "Tap screen to open map"
+        } else {
+            "Press Z or SPACE to continue"
+        };
         let _ = self.ctx.fill_text(
-            "Press Z or SPACE to continue",
+            help_text,
             (self.width / 2) as f64,
             (self.height - 80) as f64,
         );

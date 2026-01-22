@@ -116,6 +116,8 @@ pub struct Game {
     pub chat_log: Vec<ChatLine>,
     pub last_chat_send_frame: u32,
     pub mobile_mode: bool,
+    pub viewport_width: f64,
+    pub viewport_height: f64,
     spawn_progress: f32,
     last_spawn_positions: Vec<Vec2>,
     rng: Xoshiro256PlusPlus,
@@ -223,6 +225,8 @@ impl Game {
             chat_log: Vec::new(),
             last_chat_send_frame: u32::MAX,
             mobile_mode: false,
+            viewport_width: width as f64,
+            viewport_height: height as f64,
             spawn_progress: 0.0,
             last_spawn_positions: Vec::new(),
             rng: Xoshiro256PlusPlus::seed_from_u64(0),
@@ -254,6 +258,11 @@ impl Game {
 
     pub fn set_mobile_mode(&mut self, enabled: bool) {
         self.mobile_mode = enabled;
+    }
+
+    pub fn set_viewport_size(&mut self, width: f64, height: f64) {
+        self.viewport_width = width;
+        self.viewport_height = height;
     }
 
     pub fn update_remote_predictions(&mut self, remote_players: &HashMap<String, crate::net::RemotePlayer>) {
@@ -978,6 +987,9 @@ impl Game {
         if input.is_released(BUTTON_ATTACK) || input.is_released(BUTTON_PHASE) {
             self.map_open = true;
         }
+        if self.mobile_mode && input.is_pressed(BUTTON_MAP) {
+            self.map_open = true;
+        }
     }
 
     pub fn toggle_map(&mut self) {
@@ -1122,6 +1134,27 @@ impl Game {
         self.player_list_search.pop();
     }
 
+    pub fn map_overlay_rect(&self) -> (f64, f64, f64) {
+        let portrait = self.viewport_height > self.viewport_width;
+        let dynamic_map = self.mobile_mode || portrait;
+        let map_size = if dynamic_map {
+            (self.width.min(self.height) as f64 * 0.9).min(560.0).max(360.0)
+        } else {
+            MAP_OVERLAY_SIZE as f64
+        };
+        let map_left = if dynamic_map {
+            (self.width as f64 - map_size) * 0.5
+        } else {
+            MAP_OVERLAY_PADDING as f64
+        };
+        let map_top = if dynamic_map {
+            (self.height as f64 - map_size) * 0.5
+        } else {
+            MAP_OVERLAY_PADDING as f64
+        };
+        (map_left, map_top, map_size)
+    }
+
     fn update_map_controls(&mut self, input: &Input) {
         use crate::input::{BUTTON_ATTACK, BUTTON_PHASE};
         use crate::world::CHUNK_SIZE;
@@ -1137,7 +1170,8 @@ impl Game {
             self.map_zoom = (self.map_zoom / MAP_ZOOM_STEP).max(MAP_ZOOM_MIN);
         }
 
-        let map_size = MAP_OVERLAY_SIZE;
+        let (_, _, map_size) = self.map_overlay_rect();
+        let map_size = map_size as f32;
         let base_world_span = CHUNK_SIZE as f32 * 8.0;
         let pixels_per_world = map_size / base_world_span * self.map_zoom;
         let world_per_pixel = if pixels_per_world > 0.0 { 1.0 / pixels_per_world } else { 1.0 };
@@ -1156,7 +1190,8 @@ impl Game {
     pub fn pan_map_by_screen_delta(&mut self, dx: f32, dy: f32) {
         use crate::world::CHUNK_SIZE;
         let base_world_span = CHUNK_SIZE as f32 * 8.0;
-        let pixels_per_world = MAP_OVERLAY_SIZE / base_world_span * self.map_zoom;
+        let (_, _, map_size) = self.map_overlay_rect();
+        let pixels_per_world = map_size as f32 / base_world_span * self.map_zoom;
         if pixels_per_world <= 0.0 {
             return;
         }
@@ -1185,9 +1220,7 @@ impl Game {
             return;
         }
 
-        let map_left = MAP_OVERLAY_PADDING as f64;
-        let map_top = MAP_OVERLAY_PADDING as f64;
-        let map_size = MAP_OVERLAY_SIZE as f64;
+        let (map_left, map_top, map_size) = self.map_overlay_rect();
         if screen_x < map_left || screen_x > map_left + map_size || screen_y < map_top || screen_y > map_top + map_size {
             return;
         }

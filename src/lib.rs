@@ -73,9 +73,9 @@ struct TouchLayout {
 fn touch_layout(width: f64, height: f64) -> TouchLayout {
     let stick_center = crate::math::Vec2::new(90.0, (height - 90.0) as f32);
     let stick_radius = 60.0;
-    let button_radius = 32.0;
-    let attack_center = crate::math::Vec2::new((width - 90.0) as f32, (height - 120.0) as f32);
-    let phase_center = crate::math::Vec2::new((width - 160.0) as f32, (height - 60.0) as f32);
+    let button_radius = 36.0;
+    let attack_center = crate::math::Vec2::new((width - 80.0) as f32, (height - 130.0) as f32);
+    let phase_center = crate::math::Vec2::new((width - 200.0) as f32, (height - 60.0) as f32);
     let top_button_radius = 26.0;
     let map_center = crate::math::Vec2::new((width - 50.0) as f32, 40.0);
     let list_center = crate::math::Vec2::new((width - 100.0) as f32, 40.0);
@@ -629,10 +629,17 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                 let mut handled_ui = false;
                 let mut focus_input = false;
                 let mut start_list_drag = false;
+                let mut allow_controls = true;
+                let mut map_margin = 0.0;
 
+                let mut map_rect: Option<(f64, f64, f64)> = None;
                 {
                     let mut state_ref = touch_state.borrow_mut();
                     if state_ref.game.mobile_mode {
+                        if state_ref.game.scene == Scene::GameOver && !state_ref.game.map_open {
+                            state_ref.game.map_open = true;
+                            handled_ui = true;
+                        }
                         if state_ref.game.scene == Scene::Title {
                             let center_x = state_ref.game.width as f64 / 2.0;
                             let name_box_x = center_x - 90.0;
@@ -658,10 +665,27 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                         } else if (state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver)
                             && state_ref.game.map_open
                         {
-                            let map_left = crate::game::MAP_OVERLAY_PADDING as f64;
-                            let map_top = crate::game::MAP_OVERLAY_PADDING as f64;
-                            let map_size = crate::game::MAP_OVERLAY_SIZE as f64;
-                            if x < map_left || x > map_left + map_size || y < map_top || y > map_top + map_size {
+                            let in_circle = |center: crate::math::Vec2, radius: f64| {
+                                let dx = pos.x as f64 - center.x as f64;
+                                let dy = pos.y as f64 - center.y as f64;
+                                dx * dx + dy * dy <= radius * radius
+                            };
+                            let (map_left, map_top, map_size) = state_ref.game.map_overlay_rect();
+                            map_margin = 60.0;
+                            allow_controls = false;
+                            map_rect = Some((map_left, map_top, map_size));
+                            let layout = touch_layout(canvas_width, canvas_height);
+                            if in_circle(layout.zoom_in_center, layout.top_button_radius) {
+                                state_ref.game.zoom_map_in();
+                                handled_ui = true;
+                            } else if in_circle(layout.zoom_out_center, layout.top_button_radius) {
+                                state_ref.game.zoom_map_out();
+                                handled_ui = true;
+                            } else if x < map_left - map_margin
+                                || x > map_left + map_size + map_margin
+                                || y < map_top - map_margin
+                                || y > map_top + map_size + map_margin
+                            {
                                 state_ref.game.map_open = false;
                                 handled_ui = true;
                             } else {
@@ -673,9 +697,6 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                                 let button_y = input_y - 28.0;
                                 if x >= button_x && x <= button_x + button_w && y >= button_y && y <= button_y + button_h {
                                     state_ref.game.confirm_map_teleport();
-                                    handled_ui = true;
-                                } else if x >= map_left && x <= map_left + map_size && y >= map_top && y <= map_top + map_size {
-                                    state_ref.game.handle_map_click(x, y);
                                     handled_ui = true;
                                 } else if x >= input_x && x <= input_x + 140.0 && y >= input_y - 14.0 && y <= input_y + 8.0 {
                                     state_ref.game.activate_map_input(0);
@@ -695,6 +716,9 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                                 let dy = pos.y as f64 - center.y as f64;
                                 dx * dx + dy * dy <= radius * radius
                             };
+                            if state_ref.game.player_list_open {
+                                allow_controls = false;
+                            }
                             if in_circle(layout.chat_center, layout.top_button_radius) {
                                 state_ref.game.toggle_chat();
                                 handled_ui = true;
@@ -703,7 +727,8 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                             let map_size = 120.0;
                             let map_padding = 10.0;
                             let map_left = (state_ref.game.width as f64) - map_size - map_padding;
-                            let map_top = if state_ref.game.mobile_mode { 130.0 } else { (state_ref.game.height as f64) - map_size - map_padding };
+                            let portrait = state_ref.game.viewport_height > state_ref.game.viewport_width;
+                            let map_top = if state_ref.game.mobile_mode || portrait { 130.0 } else { (state_ref.game.height as f64) - map_size - map_padding };
                             if x >= map_left && x <= map_left + map_size && y >= map_top && y <= map_top + map_size {
                                 state_ref.game.toggle_map();
                                 handled_ui = true;
@@ -730,6 +755,9 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                                 } else if x >= left && x <= left + overlay_w && y >= top && y <= top + 360.0 {
                                     handled_ui = true;
                                     start_list_drag = true;
+                                } else {
+                                    state_ref.game.toggle_player_list();
+                                    handled_ui = true;
                                 }
                             }
                         }
@@ -763,50 +791,70 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                         dx * dx + dy * dy <= radius * radius
                     };
 
-                    if state.joystick_id.is_none() && in_circle(layout.stick_center, layout.stick_radius * 1.3) {
-                        state.joystick_id = Some(id);
-                        state.joystick_center = pos;
-                        state.joystick_axis = crate::math::Vec2::ZERO;
-                        return;
-                    }
-                    if state.attack_id.is_none() && in_circle(layout.attack_center, layout.button_radius) {
-                        state.attack_id = Some(id);
-                        return;
-                    }
-                    if state.phase_id.is_none() && in_circle(layout.phase_center, layout.button_radius) {
-                        state.phase_id = Some(id);
-                        return;
-                    }
-                    if in_circle(layout.map_center, layout.top_button_radius) {
-                        state.map_tap_frames = 2;
-                        return;
-                    }
-                    if in_circle(layout.list_center, layout.top_button_radius) {
-                        state.list_tap_frames = 2;
-                        return;
-                    }
-                    if in_circle(layout.chat_center, layout.top_button_radius) {
-                        state.chat_tap_frames = 2;
-                        return;
-                    }
-                    if in_circle(layout.zoom_in_center, layout.top_button_radius) {
-                        state.zoom_in_tap_frames = 2;
-                        return;
-                    }
-                    if in_circle(layout.zoom_out_center, layout.top_button_radius) {
-                        state.zoom_out_tap_frames = 2;
-                        return;
+                    if allow_controls {
+                        if state.joystick_id.is_none() && in_circle(layout.stick_center, layout.stick_radius * 1.3) {
+                            state.joystick_id = Some(id);
+                            state.joystick_center = pos;
+                            state.joystick_axis = crate::math::Vec2::ZERO;
+                            return;
+                        }
+                        if state.attack_id.is_none() && in_circle(layout.attack_center, layout.button_radius) {
+                            state.attack_id = Some(id);
+                            return;
+                        }
+                        if state.phase_id.is_none() && in_circle(layout.phase_center, layout.button_radius) {
+                            state.phase_id = Some(id);
+                            return;
+                        }
+                        if in_circle(layout.map_center, layout.top_button_radius) {
+                            state.map_tap_frames = 2;
+                            return;
+                        }
+                        if in_circle(layout.list_center, layout.top_button_radius) {
+                            state.list_tap_frames = 2;
+                            return;
+                        }
+                        if in_circle(layout.chat_center, layout.top_button_radius) {
+                            state.chat_tap_frames = 2;
+                            return;
+                        }
+                        if in_circle(layout.zoom_in_center, layout.top_button_radius) {
+                            state.zoom_in_tap_frames = 2;
+                            return;
+                        }
+                        if in_circle(layout.zoom_out_center, layout.top_button_radius) {
+                            state.zoom_out_tap_frames = 2;
+                            return;
+                        }
                     }
 
-                    let map_left = crate::game::MAP_OVERLAY_PADDING as f64;
-                    let map_top = crate::game::MAP_OVERLAY_PADDING as f64;
-                    let map_size = crate::game::MAP_OVERLAY_SIZE as f64;
-                    if x >= map_left && x <= map_left + map_size && y >= map_top && y <= map_top + map_size {
-                        state.map_drag_id = Some(id);
-                        state.map_drag_last = pos;
-                        state.map_drag_distance = 0.0;
-                        state.map_tap_candidate = true;
-                        state.map_tap_pos = pos;
+                    if let Some((map_left, map_top, map_size)) = map_rect {
+                        let within = x >= map_left && x <= map_left + map_size && y >= map_top && y <= map_top + map_size;
+                        let within_margin = x >= map_left - map_margin
+                            && x <= map_left + map_size + map_margin
+                            && y >= map_top - map_margin
+                            && y <= map_top + map_size + map_margin;
+                        if within || within_margin {
+                            state.map_drag_id = Some(id);
+                            state.map_drag_last = pos;
+                            state.map_drag_distance = 0.0;
+                            state.map_tap_candidate = true;
+                            let clamped_x = if x < map_left {
+                                map_left
+                            } else if x > map_left + map_size {
+                                map_left + map_size
+                            } else {
+                                x
+                            };
+                            let clamped_y = if y < map_top {
+                                map_top
+                            } else if y > map_top + map_size {
+                                map_top + map_size
+                            } else {
+                                y
+                            };
+                            state.map_tap_pos = crate::math::Vec2::new(clamped_x as f32, clamped_y as f32);
+                        }
                     }
                 });
             }
@@ -942,6 +990,15 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
     *g.borrow_mut() = Some(Closure::new(move || {
         {
             let mut state_ref = state.borrow_mut();
+            let is_mobile = window_clone
+                .inner_width()
+                .ok()
+                .and_then(|w| w.as_f64())
+                .unwrap_or(0.0) <= 900.0;
+            state_ref.game.set_mobile_mode(is_mobile);
+            let viewport_w = window_clone.inner_width().ok().and_then(|w| w.as_f64()).unwrap_or(state_ref.game.width as f64);
+            let viewport_h = window_clone.inner_height().ok().and_then(|h| h.as_f64()).unwrap_or(state_ref.game.height as f64);
+            state_ref.game.set_viewport_size(viewport_w, viewport_h);
 
             // Process input buffer - transfer events from buffer to game state
             INPUT_BUFFER.with(|buf| {
@@ -1263,15 +1320,36 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                         }
                     } else if state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver {
                         if state_ref.game.map_open {
-                            let map_left = crate::game::MAP_OVERLAY_PADDING as f64;
-                            let map_top = crate::game::MAP_OVERLAY_PADDING as f64;
-                            let map_size = crate::game::MAP_OVERLAY_SIZE as f64;
+                            let (map_left, map_top, map_size) = state_ref.game.map_overlay_rect();
+                            let map_margin = 60.0;
                             let close_x = map_left + map_size - 26.0;
                             let close_y = map_top + 8.0;
                             if x >= close_x && x <= close_x + 18.0 && y >= close_y && y <= close_y + 18.0 {
                                 state_ref.game.map_open = false;
                                 return;
                             }
+                            if x < map_left - map_margin
+                                || x > map_left + map_size + map_margin
+                                || y < map_top - map_margin
+                                || y > map_top + map_size + map_margin
+                            {
+                                state_ref.game.map_open = false;
+                                return;
+                            }
+                            let clamped_x = if x < map_left {
+                                map_left
+                            } else if x > map_left + map_size {
+                                map_left + map_size
+                            } else {
+                                x
+                            };
+                            let clamped_y = if y < map_top {
+                                map_top
+                            } else if y > map_top + map_size {
+                                map_top + map_size
+                            } else {
+                                y
+                            };
                             let input_x = map_left + 10.0;
                             let input_y = map_top + map_size - 6.0;
                             let button_w = 100.0;
@@ -1287,7 +1365,7 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                             } else if x >= input_x + 170.0 && x <= input_x + 310.0 && y >= input_y - 14.0 && y <= input_y + 8.0 {
                                 state_ref.game.activate_map_input(1);
                             } else {
-                                state_ref.game.handle_map_click(x, y);
+                                state_ref.game.handle_map_click(clamped_x, clamped_y);
                             }
                         } else if state_ref.game.player_list_open {
                             let overlay_w = 480.0;
@@ -1301,7 +1379,8 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                             let map_size = 120.0;
                             let map_padding = 10.0;
                             let map_left = (state_ref.game.width as f64) - map_size - map_padding;
-                            let map_top = if state_ref.game.mobile_mode { 130.0 } else { (state_ref.game.height as f64) - map_size - map_padding };
+                            let portrait = state_ref.game.viewport_height > state_ref.game.viewport_width;
+                            let map_top = if state_ref.game.mobile_mode || portrait { 130.0 } else { (state_ref.game.height as f64) - map_size - map_padding };
                             if x >= map_left && x <= map_left + map_size && y >= map_top && y <= map_top + map_size {
                                 state_ref.game.toggle_map();
                             } else {
