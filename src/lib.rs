@@ -65,6 +65,10 @@ struct TouchLayout {
     map_center: crate::math::Vec2,
     list_center: crate::math::Vec2,
     chat_center: crate::math::Vec2,
+    chat_button_left: f64,
+    chat_button_top: f64,
+    chat_button_w: f64,
+    chat_button_h: f64,
     zoom_in_center: crate::math::Vec2,
     zoom_out_center: crate::math::Vec2,
     top_button_radius: f64,
@@ -76,10 +80,14 @@ fn touch_layout(width: f64, height: f64) -> TouchLayout {
     let button_radius = 32.0;
     let attack_center = crate::math::Vec2::new((width - 90.0) as f32, (height - 120.0) as f32);
     let phase_center = crate::math::Vec2::new((width - 160.0) as f32, (height - 60.0) as f32);
-    let top_button_radius = 20.0;
+    let top_button_radius = 22.0;
     let map_center = crate::math::Vec2::new((width - 50.0) as f32, 40.0);
     let list_center = crate::math::Vec2::new((width - 100.0) as f32, 40.0);
     let chat_center = crate::math::Vec2::new((width - 150.0) as f32, 40.0);
+    let chat_button_left = 18.0;
+    let chat_button_top = height - 170.0;
+    let chat_button_w = 84.0;
+    let chat_button_h = 26.0;
     let zoom_in_center = crate::math::Vec2::new((width - 50.0) as f32, (height - 220.0) as f32);
     let zoom_out_center = crate::math::Vec2::new((width - 110.0) as f32, (height - 220.0) as f32);
 
@@ -92,6 +100,10 @@ fn touch_layout(width: f64, height: f64) -> TouchLayout {
         map_center,
         list_center,
         chat_center,
+        chat_button_left,
+        chat_button_top,
+        chat_button_w,
+        chat_button_h,
         zoom_in_center,
         zoom_out_center,
         top_button_radius,
@@ -458,7 +470,7 @@ struct GameState {
     last_supernode_id: Option<matchbox_socket::PeerId>,
 }
 
-fn setup_input(window: &web_sys::Window, _state: Rc<RefCell<GameState>>, canvas: &web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
+fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: &web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
     // Keydown handler - writes to INPUT_BUFFER instead of directly to state
     let keydown = Closure::<dyn FnMut(_)>::new(move |event: web_sys::KeyboardEvent| {
         let code = event.code();
@@ -590,6 +602,7 @@ fn setup_input(window: &web_sys::Window, _state: Rc<RefCell<GameState>>, canvas:
 
     // Touch handlers for mobile controls
     let touch_canvas = canvas.clone();
+    let touch_state = Rc::clone(&state);
     let touchstart = Closure::<dyn FnMut(_)>::new(move |event: web_sys::TouchEvent| {
         event.prevent_default();
         let rect = touch_canvas.get_bounding_client_rect();
@@ -604,6 +617,128 @@ fn setup_input(window: &web_sys::Window, _state: Rc<RefCell<GameState>>, canvas:
                 let y = (touch.client_y() as f64 - rect.top()) * scale_y;
                 let pos = crate::math::Vec2::new(x as f32, y as f32);
                 let id = touch.identifier();
+                let mut handled_ui = false;
+                let mut focus_input = false;
+
+                {
+                    let mut state_ref = touch_state.borrow_mut();
+                    if state_ref.game.mobile_mode {
+                        if state_ref.game.scene == Scene::Title {
+                            let center_x = state_ref.game.width as f64 / 2.0;
+                            let name_box_x = center_x - 90.0;
+                            let name_box_y = 220.0 - 14.0;
+                            let code_box_x = center_x - 90.0;
+                            let code_box_y = 260.0 - 14.0;
+                            let join_x = center_x + 20.0;
+                            let join_y = 260.0 - 14.0;
+
+                            if x >= name_box_x && x <= name_box_x + 180.0 && y >= name_box_y && y <= name_box_y + 22.0 {
+                                state_ref.game.activate_text_input(0);
+                                handled_ui = true;
+                                focus_input = true;
+                            } else if x >= code_box_x && x <= code_box_x + 100.0 && y >= code_box_y && y <= code_box_y + 22.0 {
+                                state_ref.game.activate_text_input(1);
+                                handled_ui = true;
+                                focus_input = true;
+                            } else if x >= join_x && x <= join_x + 70.0 && y >= join_y && y <= join_y + 22.0 {
+                                state_ref.game.queued_join_room = true;
+                                state_ref.game.text_input_active = false;
+                                handled_ui = true;
+                            }
+                        } else if (state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver)
+                            && state_ref.game.map_open
+                        {
+                            let map_left = crate::game::MAP_OVERLAY_PADDING as f64;
+                            let map_top = crate::game::MAP_OVERLAY_PADDING as f64;
+                            let map_size = crate::game::MAP_OVERLAY_SIZE as f64;
+                            let close_x = map_left + map_size - 26.0;
+                            let close_y = map_top + 8.0;
+                            if x >= close_x && x <= close_x + 18.0 && y >= close_y && y <= close_y + 18.0 {
+                                state_ref.game.map_open = false;
+                                handled_ui = true;
+                            } else {
+                                let input_x = map_left + 10.0;
+                                let input_y = map_top + map_size - 6.0;
+                                if x >= input_x && x <= input_x + 140.0 && y >= input_y - 14.0 && y <= input_y + 8.0 {
+                                    state_ref.game.activate_map_input(0);
+                                    handled_ui = true;
+                                    focus_input = true;
+                                } else if x >= input_x + 170.0 && x <= input_x + 310.0 && y >= input_y - 14.0 && y <= input_y + 8.0 {
+                                    state_ref.game.activate_map_input(1);
+                                    handled_ui = true;
+                                    focus_input = true;
+                                }
+                            }
+                        } else if state_ref.game.mobile_mode
+                            && (state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver)
+                        {
+                            let in_circle = |center: crate::math::Vec2, radius: f64| {
+                                let dx = pos.x as f64 - center.x as f64;
+                                let dy = pos.y as f64 - center.y as f64;
+                                dx * dx + dy * dy <= radius * radius
+                            };
+                            if in_circle(layout.map_center, layout.top_button_radius) {
+                                state_ref.game.toggle_map();
+                                handled_ui = true;
+                            } else if in_circle(layout.list_center, layout.top_button_radius) {
+                                state_ref.game.toggle_player_list();
+                                handled_ui = true;
+                            } else if in_circle(layout.chat_center, layout.top_button_radius) {
+                                state_ref.game.toggle_chat();
+                                handled_ui = true;
+                                focus_input = state_ref.game.chat_open;
+                            } else if x >= layout.chat_button_left
+                                && x <= layout.chat_button_left + layout.chat_button_w
+                                && y >= layout.chat_button_top
+                                && y <= layout.chat_button_top + layout.chat_button_h
+                            {
+                                state_ref.game.toggle_chat();
+                                handled_ui = true;
+                                focus_input = state_ref.game.chat_open;
+                            } else if !state_ref.game.map_open && !state_ref.game.player_list_open {
+                                let map_size = 120.0;
+                                let map_padding = 10.0;
+                                let map_left = (state_ref.game.width as f64) - map_size - map_padding;
+                                let map_top = (state_ref.game.height as f64) - map_size - map_padding;
+                                if x >= map_left && x <= map_left + map_size && y >= map_top && y <= map_top + map_size {
+                                    state_ref.game.toggle_map();
+                                    handled_ui = true;
+                                } else {
+                                    let right = state_ref.game.width as f64 - 10.0;
+                                    let left = right - 240.0;
+                                    let top = 35.0;
+                                    let bottom = 110.0;
+                                    if x >= left && x <= right && y >= top && y <= bottom {
+                                        state_ref.game.toggle_player_list();
+                                        handled_ui = true;
+                                    }
+                                }
+                            } else if state_ref.game.player_list_open {
+                                let overlay_w = 480.0;
+                                let _overlay_h = 360.0;
+                                let left = (state_ref.game.width as f64 - overlay_w) / 2.0;
+                                let top = 70.0;
+                                let close_x = left + overlay_w - 26.0;
+                                let close_y = top + 8.0;
+                                if x >= close_x && x <= close_x + 18.0 && y >= close_y && y <= close_y + 18.0 {
+                                    state_ref.game.toggle_player_list();
+                                    handled_ui = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if focus_input {
+                    MOBILE_INPUT.with(|cell| {
+                        if let Some(input_el) = cell.borrow().as_ref() {
+                            let _ = input_el.focus();
+                        }
+                    });
+                }
+                if handled_ui {
+                    continue;
+                }
 
                 TOUCH_STATE.with(|state| {
                     let mut state = state.borrow_mut();
@@ -1061,17 +1196,52 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                                 }
                             }
                         }
-                    } else if (state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver)
-                        && state_ref.game.map_open
-                    {
-                        let map_left = crate::game::MAP_OVERLAY_PADDING as f64 + 10.0;
-                        let map_top = crate::game::MAP_OVERLAY_PADDING as f64 + crate::game::MAP_OVERLAY_SIZE as f64 + 20.0;
-                        if x >= map_left && x <= map_left + 140.0 && y >= map_top - 14.0 && y <= map_top + 8.0 {
-                            state_ref.game.activate_map_input(0);
-                        } else if x >= map_left + 170.0 && x <= map_left + 310.0 && y >= map_top - 14.0 && y <= map_top + 8.0 {
-                            state_ref.game.activate_map_input(1);
+                    } else if state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver {
+                        if state_ref.game.map_open {
+                            let map_left = crate::game::MAP_OVERLAY_PADDING as f64;
+                            let map_top = crate::game::MAP_OVERLAY_PADDING as f64;
+                            let map_size = crate::game::MAP_OVERLAY_SIZE as f64;
+                            let close_x = map_left + map_size - 26.0;
+                            let close_y = map_top + 8.0;
+                            if x >= close_x && x <= close_x + 18.0 && y >= close_y && y <= close_y + 18.0 {
+                                state_ref.game.map_open = false;
+                                return;
+                            }
+                            let input_x = map_left + 10.0;
+                            let input_y = map_top + map_size - 6.0;
+                            if x >= input_x && x <= input_x + 140.0 && y >= input_y - 14.0 && y <= input_y + 8.0 {
+                                state_ref.game.activate_map_input(0);
+                            } else if x >= input_x + 170.0 && x <= input_x + 310.0 && y >= input_y - 14.0 && y <= input_y + 8.0 {
+                                state_ref.game.activate_map_input(1);
+                            } else {
+                                state_ref.game.handle_map_click(x, y);
+                            }
+                        } else if state_ref.game.player_list_open {
+                            let overlay_w = 480.0;
+                            let _overlay_h = 360.0;
+                            let left = (state_ref.game.width as f64 - overlay_w) / 2.0;
+                            let top = 70.0;
+                            let close_x = left + overlay_w - 26.0;
+                            let close_y = top + 8.0;
+                            if x >= close_x && x <= close_x + 18.0 && y >= close_y && y <= close_y + 18.0 {
+                                state_ref.game.toggle_player_list();
+                            }
                         } else {
-                            state_ref.game.handle_map_click(x, y);
+                            let map_size = 120.0;
+                            let map_padding = 10.0;
+                            let map_left = (state_ref.game.width as f64) - map_size - map_padding;
+                            let map_top = (state_ref.game.height as f64) - map_size - map_padding;
+                            if x >= map_left && x <= map_left + map_size && y >= map_top && y <= map_top + map_size {
+                                state_ref.game.toggle_map();
+                            } else {
+                                let right = state_ref.game.width as f64 - 10.0;
+                                let left = right - 240.0;
+                                let top = 35.0;
+                                let bottom = 110.0;
+                                if x >= left && x <= right && y >= top && y <= bottom {
+                                    state_ref.game.toggle_player_list();
+                                }
+                            }
                         }
                     }
                 }
@@ -1121,6 +1291,13 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     if state.chat_tap_frames > 0 {
                         state_ref.game.toggle_chat();
                         state.chat_tap_frames = 0;
+                        if state_ref.game.mobile_mode && state_ref.game.chat_open {
+                            MOBILE_INPUT.with(|cell| {
+                                if let Some(input_el) = cell.borrow().as_ref() {
+                                    let _ = input_el.focus();
+                                }
+                            });
+                        }
                     }
 
                     if state_ref.game.map_open {

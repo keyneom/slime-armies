@@ -1264,6 +1264,7 @@ impl Renderer {
         self.display_ctx.set_font("14px monospace");
         self.display_ctx.set_text_align("left");
         let _ = self.display_ctx.fill_text("Players", left + 12.0, top + 24.0);
+        self.draw_overlay_close_button(left + overlay_w - 26.0, top + 8.0);
         let sort_label = match game.player_list_sort {
             0 => "score",
             1 => "name",
@@ -1332,6 +1333,19 @@ impl Renderer {
         self.render_network_status_on(&self.display_ctx, network);
     }
 
+    fn draw_overlay_close_button(&self, x: f64, y: f64) {
+        let size = 18.0;
+        self.display_ctx.set_fill_style_str("#1b1f24");
+        self.display_ctx.fill_rect(x, y, size, size);
+        self.display_ctx.set_stroke_style_str("#5a6a6a");
+        self.display_ctx.set_line_width(1.0);
+        self.display_ctx.stroke_rect(x, y, size, size);
+        self.display_ctx.set_fill_style_str("#e6efef");
+        self.display_ctx.set_font("12px monospace");
+        self.display_ctx.set_text_align("center");
+        let _ = self.display_ctx.fill_text("X", x + size / 2.0, y + 13.0);
+    }
+
     fn render_chat_overlay(&self, game: &Game) {
         let log_lines: Vec<_> = game.chat_log.iter().rev().take(6).collect();
         if log_lines.is_empty() && !game.chat_open {
@@ -1391,10 +1405,14 @@ impl Renderer {
         let action_radius = 32.0;
         let attack_center = Vec2::new(width as f32 - 90.0, height as f32 - 120.0);
         let phase_center = Vec2::new(width as f32 - 160.0, height as f32 - 60.0);
-        let top_radius = 20.0;
+        let top_radius = 22.0;
         let map_center = Vec2::new(width as f32 - 50.0, 40.0);
         let list_center = Vec2::new(width as f32 - 100.0, 40.0);
         let chat_center = Vec2::new(width as f32 - 150.0, 40.0);
+        let chat_button_left = 18.0;
+        let chat_button_top = height - 170.0;
+        let chat_button_w = 84.0;
+        let chat_button_h = 26.0;
         let zoom_in_center = Vec2::new(width as f32 - 50.0, height as f32 - 220.0);
         let zoom_out_center = Vec2::new(width as f32 - 110.0, height as f32 - 220.0);
 
@@ -1420,6 +1438,7 @@ impl Renderer {
             let _ = self.display_ctx.arc(center.x as f64, center.y as f64, top_radius, 0.0, std::f64::consts::PI * 2.0);
             self.display_ctx.fill();
         }
+        self.display_ctx.fill_rect(chat_button_left, chat_button_top, chat_button_w, chat_button_h);
 
         if game.map_open {
             for center in [zoom_in_center, zoom_out_center] {
@@ -1437,6 +1456,8 @@ impl Renderer {
         let _ = self.display_ctx.fill_text("M", map_center.x as f64, map_center.y as f64 + 4.0);
         let _ = self.display_ctx.fill_text("P", list_center.x as f64, list_center.y as f64 + 4.0);
         let _ = self.display_ctx.fill_text("C", chat_center.x as f64, chat_center.y as f64 + 4.0);
+        self.display_ctx.set_text_align("left");
+        let _ = self.display_ctx.fill_text("CHAT", chat_button_left + 12.0, chat_button_top + 18.0);
         if game.map_open {
             let _ = self.display_ctx.fill_text("+", zoom_in_center.x as f64, zoom_in_center.y as f64 + 4.0);
             let _ = self.display_ctx.fill_text("-", zoom_out_center.x as f64, zoom_out_center.y as f64 + 4.0);
@@ -1615,6 +1636,7 @@ impl Renderer {
         self.display_ctx.set_stroke_style_str("#3a4a4a");
         self.display_ctx.set_line_width(2.0);
         self.display_ctx.stroke_rect(map_left, map_top, map_size, map_size);
+        self.draw_overlay_close_button(map_left + map_size - 26.0, map_top + 8.0);
 
         let base_world_span = CHUNK_SIZE as f64 * 8.0;
         let pixels_per_world = map_size / base_world_span * game.map_zoom as f64;
