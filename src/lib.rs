@@ -110,6 +110,11 @@ struct TouchState {
     map_drag_id: Option<i32>,
     map_drag_last: crate::math::Vec2,
     map_drag_delta: crate::math::Vec2,
+    map_drag_distance: f32,
+    map_tap_candidate: bool,
+    map_tap_pos: crate::math::Vec2,
+    pinch_ids: Option<(i32, i32)>,
+    pinch_start_distance: f32,
     list_drag_id: Option<i32>,
     list_drag_last: crate::math::Vec2,
     list_scroll_delta: f32,
@@ -131,6 +136,11 @@ impl TouchState {
             map_drag_id: None,
             map_drag_last: crate::math::Vec2::ZERO,
             map_drag_delta: crate::math::Vec2::ZERO,
+            map_drag_distance: 0.0,
+            map_tap_candidate: false,
+            map_tap_pos: crate::math::Vec2::ZERO,
+            pinch_ids: None,
+            pinch_start_distance: 0.0,
             list_drag_id: None,
             list_drag_last: crate::math::Vec2::ZERO,
             list_scroll_delta: 0.0,
@@ -651,9 +661,7 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                             let map_left = crate::game::MAP_OVERLAY_PADDING as f64;
                             let map_top = crate::game::MAP_OVERLAY_PADDING as f64;
                             let map_size = crate::game::MAP_OVERLAY_SIZE as f64;
-                            let close_x = map_left + map_size - 26.0;
-                            let close_y = map_top + 8.0;
-                            if x >= close_x && x <= close_x + 18.0 && y >= close_y && y <= close_y + 18.0 {
+                            if x < map_left || x > map_left + map_size || y < map_top || y > map_top + map_size {
                                 state_ref.game.map_open = false;
                                 handled_ui = true;
                             } else {
@@ -692,23 +700,23 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                                 handled_ui = true;
                                 focus_input = state_ref.game.chat_open;
                             } else if !state_ref.game.map_open && !state_ref.game.player_list_open {
-                                let map_size = 120.0;
-                                let map_padding = 10.0;
-                                let map_left = (state_ref.game.width as f64) - map_size - map_padding;
-                                let map_top = if state_ref.game.mobile_mode { 130.0 } else { (state_ref.game.height as f64) - map_size - map_padding };
-                                if x >= map_left && x <= map_left + map_size && y >= map_top && y <= map_top + map_size {
-                                    state_ref.game.toggle_map();
+                            let map_size = 120.0;
+                            let map_padding = 10.0;
+                            let map_left = (state_ref.game.width as f64) - map_size - map_padding;
+                            let map_top = if state_ref.game.mobile_mode { 130.0 } else { (state_ref.game.height as f64) - map_size - map_padding };
+                            if x >= map_left && x <= map_left + map_size && y >= map_top && y <= map_top + map_size {
+                                state_ref.game.toggle_map();
+                                handled_ui = true;
+                            } else {
+                                let right = state_ref.game.width as f64 - 10.0;
+                                let left = right - 240.0;
+                                let top = 35.0;
+                                let bottom = 110.0;
+                                if x >= left && x <= right && y >= top && y <= bottom {
+                                    state_ref.game.toggle_player_list();
                                     handled_ui = true;
-                                } else {
-                                    let right = state_ref.game.width as f64 - 10.0;
-                                    let left = right - 240.0;
-                                    let top = 35.0;
-                                    let bottom = 110.0;
-                                    if x >= left && x <= right && y >= top && y <= bottom {
-                                        state_ref.game.toggle_player_list();
-                                        handled_ui = true;
-                                    }
                                 }
+                            }
                             } else if state_ref.game.player_list_open {
                                 let overlay_w = 480.0;
                                 let _overlay_h = 360.0;
@@ -796,6 +804,9 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                     if x >= map_left && x <= map_left + map_size && y >= map_top && y <= map_top + map_size {
                         state.map_drag_id = Some(id);
                         state.map_drag_last = pos;
+                        state.map_drag_distance = 0.0;
+                        state.map_tap_candidate = true;
+                        state.map_tap_pos = pos;
                     }
                 });
             }
@@ -833,13 +844,43 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                         state.joystick_axis = if max > 0.0 { axis / max } else { crate::math::Vec2::ZERO };
                     }
                     if state.map_drag_id == Some(id) {
-                        state.map_drag_delta = pos - state.map_drag_last;
+                        let delta = pos - state.map_drag_last;
+                        state.map_drag_delta = delta;
+                        state.map_drag_distance += delta.length();
                         state.map_drag_last = pos;
                     }
                     if state.list_drag_id == Some(id) {
                         let delta = pos.y - state.list_drag_last.y;
                         state.list_scroll_delta += delta;
                         state.list_drag_last = pos;
+                    }
+                });
+            }
+        }
+
+        let all_touches = event.touches();
+        if all_touches.length() >= 2 {
+            if let (Some(t1), Some(t2)) = (all_touches.item(0), all_touches.item(1)) {
+                let x1 = (t1.client_x() as f64 - rect.left()) * scale_x;
+                let y1 = (t1.client_y() as f64 - rect.top()) * scale_y;
+                let x2 = (t2.client_x() as f64 - rect.left()) * scale_x;
+                let y2 = (t2.client_y() as f64 - rect.top()) * scale_y;
+                let p1 = crate::math::Vec2::new(x1 as f32, y1 as f32);
+                let p2 = crate::math::Vec2::new(x2 as f32, y2 as f32);
+                let dist = (p1 - p2).length();
+                let id1 = t1.identifier();
+                let id2 = t2.identifier();
+
+                TOUCH_STATE.with(|state| {
+                    let mut state = state.borrow_mut();
+                    if state.pinch_ids.is_none() {
+                        state.pinch_ids = Some((id1, id2));
+                        state.pinch_start_distance = dist.max(1.0);
+                    } else if let Some((a, b)) = state.pinch_ids {
+                        if (a == id1 && b == id2) || (a == id2 && b == id1) {
+                            let delta = dist - state.pinch_start_distance;
+                            state.map_drag_delta = crate::math::Vec2::new(0.0, delta);
+                        }
                     }
                 });
             }
@@ -869,10 +910,18 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                     if state.map_drag_id == Some(id) {
                         state.map_drag_id = None;
                         state.map_drag_delta = crate::math::Vec2::ZERO;
+                        state.map_drag_distance = 0.0;
+                        state.map_tap_candidate = false;
                     }
                     if state.list_drag_id == Some(id) {
                         state.list_drag_id = None;
                         state.list_scroll_delta = 0.0;
+                    }
+                    if let Some((a, b)) = state.pinch_ids {
+                        if a == id || b == id {
+                            state.pinch_ids = None;
+                            state.pinch_start_distance = 0.0;
+                        }
                     }
                 });
             }
@@ -1242,12 +1291,10 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                             }
                         } else if state_ref.game.player_list_open {
                             let overlay_w = 480.0;
-                            let _overlay_h = 360.0;
+                            let overlay_h = 360.0;
                             let left = (state_ref.game.width as f64 - overlay_w) / 2.0;
                             let top = 70.0;
-                            let close_x = left + overlay_w - 26.0;
-                            let close_y = top + 8.0;
-                            if x >= close_x && x <= close_x + 18.0 && y >= close_y && y <= close_y + 18.0 {
+                            if !(x >= left && x <= left + overlay_w && y >= top && y <= top + overlay_h) {
                                 state_ref.game.toggle_player_list();
                             }
                         } else {
@@ -1333,6 +1380,14 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                             state_ref.game.zoom_map_out();
                             state.zoom_out_tap_frames = 0;
                         }
+                        if state.pinch_ids.is_some() && state.map_drag_delta.y.abs() > 0.0 {
+                            if state.map_drag_delta.y > 0.0 {
+                                state_ref.game.zoom_map_in();
+                            } else {
+                                state_ref.game.zoom_map_out();
+                            }
+                            state.map_drag_delta = crate::math::Vec2::ZERO;
+                        }
                         if state.map_drag_delta.x != 0.0 || state.map_drag_delta.y != 0.0 {
                             let pan_dx = if state_ref.game.mobile_mode { -state.map_drag_delta.x } else { state.map_drag_delta.x };
                             let pan_dy = if state_ref.game.mobile_mode { -state.map_drag_delta.y } else { state.map_drag_delta.y };
@@ -1341,6 +1396,10 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                                 pan_dy,
                             );
                             state.map_drag_delta = crate::math::Vec2::ZERO;
+                        }
+                        if state.map_tap_candidate && state.map_drag_distance < 8.0 {
+                            state_ref.game.handle_map_click(state.map_tap_pos.x as f64, state.map_tap_pos.y as f64);
+                            state.map_tap_candidate = false;
                         }
                     } else if state_ref.game.player_list_open {
                         if state.list_scroll_delta.abs() >= 1.0 {
