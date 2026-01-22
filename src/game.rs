@@ -18,6 +18,8 @@ const MAP_ZOOM_MIN: f32 = 0.25;
 const MAP_ZOOM_MAX: f32 = 4.0;
 const MAP_ZOOM_STEP: f32 = 1.25;
 const ROLLBACK_WINDOW_FRAMES: u32 = 6;
+const SPAWN_SAFE_DISTANCE: f32 = 90.0;
+const SPAWN_CHUNK_COOLDOWN_FRAMES: u32 = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Scene {
@@ -102,7 +104,7 @@ pub struct Game {
     remote_predictions: HashMap<String, PlayerState>,
     pub wave_kill_counts: [u32; 3],
     pub wave_kill_targets: [u32; 3],
-    spawned_chunks: HashSet<(i32, i32)>,
+    spawn_chunk_last_frame: HashMap<(i32, i32), u32>,
     pub player_list_open: bool,
     pub player_list_scroll: i32,
     pub player_list_sort: u8,
@@ -113,6 +115,9 @@ pub struct Game {
     pub chat_input: String,
     pub chat_log: Vec<ChatLine>,
     pub last_chat_send_frame: u32,
+    pub mobile_mode: bool,
+    spawn_progress: f32,
+    last_spawn_positions: Vec<Vec2>,
     rng: Xoshiro256PlusPlus,
     // Menu state
     pub menu_selection: MenuSelection,
@@ -206,7 +211,7 @@ impl Game {
             remote_predictions: HashMap::new(),
             wave_kill_counts: [0; 3],
             wave_kill_targets: [0; 3],
-            spawned_chunks: HashSet::new(),
+            spawn_chunk_last_frame: HashMap::new(),
             player_list_open: false,
             player_list_scroll: 0,
             player_list_sort: 0,
@@ -217,6 +222,9 @@ impl Game {
             chat_input: String::new(),
             chat_log: Vec::new(),
             last_chat_send_frame: u32::MAX,
+            mobile_mode: false,
+            spawn_progress: 0.0,
+            last_spawn_positions: Vec::new(),
             rng: Xoshiro256PlusPlus::seed_from_u64(0),
             // Menu state
             menu_selection: MenuSelection::Play,
@@ -242,6 +250,10 @@ impl Game {
             });
             sim.queue_input(input_frame.frame, input_frame.input);
         }
+    }
+
+    pub fn set_mobile_mode(&mut self, enabled: bool) {
+        self.mobile_mode = enabled;
     }
 
     pub fn update_remote_predictions(&mut self, remote_players: &HashMap<String, crate::net::RemotePlayer>) {
@@ -475,7 +487,10 @@ impl Game {
     pub fn update_game_multiplayer(&mut self, input: &Input, remote_players: &std::collections::HashMap<String, crate::net::RemotePlayer>, is_host: bool) {
         // Build list of all player positions for enemy targeting (host uses this for AI)
         let mut target_positions = vec![self.player.pos];
-        for (peer_id, remote) in remote_players {
+        let mut remote_ids: Vec<_> = remote_players.keys().collect();
+        remote_ids.sort();
+        for peer_id in remote_ids {
+            let remote = &remote_players[peer_id];
             if remote.alive {
                 let pos = self
                     .remote_predictions
@@ -518,28 +533,29 @@ impl Game {
             self.spawn_wave_for_players(player_count);
         }
 
-        let mut newly_explored: Vec<(i32, i32)> = Vec::new();
         for pos in target_positions {
             let cx = (pos.x / crate::world::CHUNK_SIZE as f32).floor() as i32;
             let cy = (pos.y / crate::world::CHUNK_SIZE as f32).floor() as i32;
-            if self.explored_chunks.insert((cx, cy)) {
-                newly_explored.push((cx, cy));
-            }
+            self.explored_chunks.insert((cx, cy));
         }
 
-        if run_enemy_ai {
-            if self.spawned_chunks.is_empty() {
-                let start_chunks: Vec<(i32, i32)> = target_positions
-                    .iter()
-                    .map(|pos| {
-                        let cx = (pos.x / crate::world::CHUNK_SIZE as f32).floor() as i32;
-                        let cy = (pos.y / crate::world::CHUNK_SIZE as f32).floor() as i32;
-                        (cx, cy)
-                    })
-                    .collect();
-                self.spawn_enemies_for_chunks(&start_chunks, player_count);
-            } else if !newly_explored.is_empty() {
-                self.spawn_enemies_for_chunks(&newly_explored, player_count);
+        if run_enemy_ai && self.wave > 0 {
+            if self.last_spawn_positions.len() != target_positions.len() {
+                self.last_spawn_positions = target_positions.to_vec();
+            }
+            let mut moved_total = 0.0;
+            for (idx, pos) in target_positions.iter().enumerate() {
+                if let Some(prev) = self.last_spawn_positions.get(idx) {
+                    moved_total += pos.distance(*prev);
+                }
+            }
+            self.last_spawn_positions = target_positions.to_vec();
+            self.spawn_progress += moved_total;
+
+            let spawn_stride = self.width as f32;
+            while self.spawn_progress >= spawn_stride {
+                self.spawn_enemies_for_movement(target_positions, player_count, frame_count);
+                self.spawn_progress -= spawn_stride;
             }
         }
 
@@ -839,7 +855,14 @@ impl Game {
             cannon_count as u32,
             snake_count as u32,
         ];
-        self.spawned_chunks.clear();
+        self.spawn_chunk_last_frame.clear();
+        self.spawn_progress = 0.0;
+        self.last_spawn_positions.clear();
+        self.last_spawn_positions.push(self.player.pos);
+
+        // Initial spawn so wave starts with enemies.
+        let target_positions = [self.player.pos];
+        self.spawn_enemies_for_movement(&target_positions, player_count, self.frame_count);
 
         // Create wave start event for network broadcast
         let wave_start = crate::net::WaveStart {
@@ -903,7 +926,9 @@ impl Game {
             wave_start.cannon_count as u32,
             wave_start.snake_count as u32,
         ];
-        self.spawned_chunks.clear();
+        self.spawn_chunk_last_frame.clear();
+        self.spawn_progress = 0.0;
+        self.last_spawn_positions.clear();
     }
 
     /// Take pending wave start event (for network broadcast)
@@ -1126,6 +1151,31 @@ impl Game {
             self.map_target = Some(self.map_center);
             self.update_map_inputs_from_center();
         }
+    }
+
+    pub fn pan_map_by_screen_delta(&mut self, dx: f32, dy: f32) {
+        use crate::world::CHUNK_SIZE;
+        let base_world_span = CHUNK_SIZE as f32 * 8.0;
+        let pixels_per_world = MAP_OVERLAY_SIZE / base_world_span * self.map_zoom;
+        if pixels_per_world <= 0.0 {
+            return;
+        }
+        self.map_center.x += dx / pixels_per_world;
+        self.map_center.y += dy / pixels_per_world;
+        self.map_target = Some(self.map_center);
+        self.update_map_inputs_from_center();
+    }
+
+    pub fn zoom_map_in(&mut self) {
+        self.map_zoom = (self.map_zoom * MAP_ZOOM_STEP).min(MAP_ZOOM_MAX);
+        self.map_target = Some(self.map_center);
+        self.update_map_inputs_from_center();
+    }
+
+    pub fn zoom_map_out(&mut self) {
+        self.map_zoom = (self.map_zoom / MAP_ZOOM_STEP).max(MAP_ZOOM_MIN);
+        self.map_target = Some(self.map_center);
+        self.update_map_inputs_from_center();
     }
 
     pub fn handle_map_click(&mut self, screen_x: f64, screen_y: f64) {
@@ -1374,7 +1424,9 @@ impl Game {
         self.remote_predictions.clear();
         self.wave_kill_counts = [0; 3];
         self.wave_kill_targets = [0; 3];
-        self.spawned_chunks.clear();
+        self.spawn_chunk_last_frame.clear();
+        self.spawn_progress = 0.0;
+        self.last_spawn_positions.clear();
         self.player_list_open = false;
         self.player_list_scroll = 0;
         self.player_list_sort = 0;
@@ -1428,7 +1480,9 @@ impl Game {
         self.remote_predictions.clear();
         self.wave_kill_counts = [0; 3];
         self.wave_kill_targets = [0; 3];
-        self.spawned_chunks.clear();
+        self.spawn_chunk_last_frame.clear();
+        self.spawn_progress = 0.0;
+        self.last_spawn_positions.clear();
         self.player_list_open = false;
         self.player_list_scroll = 0;
         self.player_list_sort = 0;
@@ -1520,7 +1574,7 @@ impl Game {
         true
     }
 
-    fn spawn_enemies_for_chunks(&mut self, chunks: &[(i32, i32)], player_count: usize) {
+    fn spawn_enemies_for_chunks(&mut self, chunks: &[(i32, i32)], player_count: usize, avoid_positions: &[Vec2], current_frame: u32) {
         use crate::world::CHUNK_SIZE;
         if self.wave == 0 {
             return;
@@ -1532,10 +1586,11 @@ impl Game {
         let chunk_area = (CHUNK_SIZE as f32) * (CHUNK_SIZE as f32);
 
         for &(cx, cy) in chunks {
-            if self.spawned_chunks.contains(&(cx, cy)) {
-                continue;
+            if let Some(last_frame) = self.spawn_chunk_last_frame.get(&(cx, cy)) {
+                if current_frame.saturating_sub(*last_frame) < SPAWN_CHUNK_COOLDOWN_FRAMES {
+                    continue;
+                }
             }
-            self.spawned_chunks.insert((cx, cy));
 
             let chunk = match self.chunks.chunks.get(&(cx, cy)) {
                 Some(c) => c,
@@ -1557,14 +1612,14 @@ impl Game {
             let max_offset = CHUNK_SIZE as f32;
 
             for _ in 0..spider_count {
-                if let Some(pos) = Self::random_point_in_chunk(&mut rng, origin, max_offset, &self.chunks, 8.0) {
+                if let Some(pos) = Self::random_point_in_chunk(&mut rng, origin, max_offset, &self.chunks, 8.0, avoid_positions, SPAWN_SAFE_DISTANCE) {
                     let id = self.spiders.len();
                     self.spiders.push(Spider::new_at_position(id, pos, &mut rng));
                 }
             }
 
             for _ in 0..cannon_count {
-                if let Some(pos) = Self::random_point_in_chunk(&mut rng, origin, max_offset, &self.chunks, 10.0) {
+                if let Some(pos) = Self::random_point_in_chunk(&mut rng, origin, max_offset, &self.chunks, 10.0, avoid_positions, SPAWN_SAFE_DISTANCE) {
                     let id = self.cannons.len();
                     self.cannons.push(Cannon::new_at_position(id, pos, &mut rng));
                 }
@@ -1573,7 +1628,7 @@ impl Game {
             if snake_count > 0 {
                 let mut previous: Option<Snake> = None;
                 for _ in 0..snake_count {
-                    let pos = if let Some(spawn) = Self::random_point_in_chunk(&mut rng, origin, max_offset, &self.chunks, 12.0) {
+                    let pos = if let Some(spawn) = Self::random_point_in_chunk(&mut rng, origin, max_offset, &self.chunks, 12.0, avoid_positions, SPAWN_SAFE_DISTANCE) {
                         spawn
                     } else {
                         origin + Vec2::new(max_offset * 0.5, max_offset * 0.5)
@@ -1584,7 +1639,114 @@ impl Game {
                     self.snakes.push(snake);
                 }
             }
+
+            self.spawn_chunk_last_frame.insert((cx, cy), current_frame);
         }
+    }
+
+    fn spawn_enemies_for_movement(&mut self, target_positions: &[Vec2], player_count: usize, current_frame: u32) {
+        if self.wave == 0 {
+            return;
+        }
+        let (base_spiders, base_cannons, base_snakes) = Self::wave_base_counts(self.wave);
+        let weights = [
+            base_spiders.max(1),
+            base_cannons,
+            base_snakes,
+        ];
+        let total: u32 = weights.iter().sum();
+        if total == 0 {
+            return;
+        }
+
+        let spawn_count = player_count.max(1);
+        for _ in 0..spawn_count {
+            let roll = self.rng.gen_range(0..total);
+            let enemy_type = if roll < weights[0] {
+                crate::net::EnemyType::Spider
+            } else if roll < weights[0] + weights[1] {
+                crate::net::EnemyType::Cannon
+            } else {
+                crate::net::EnemyType::Snake
+            };
+            self.spawn_enemy_near_players(enemy_type, target_positions, current_frame);
+        }
+    }
+
+    fn spawn_enemy_near_players(&mut self, enemy_type: crate::net::EnemyType, target_positions: &[Vec2], current_frame: u32) -> bool {
+        use crate::world::CHUNK_SIZE;
+
+        if target_positions.is_empty() {
+            return false;
+        }
+
+        let mut candidates: Vec<(i32, i32)> = Vec::new();
+        for pos in target_positions {
+            let cx = (pos.x / CHUNK_SIZE as f32).floor() as i32;
+            let cy = (pos.y / CHUNK_SIZE as f32).floor() as i32;
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    candidates.push((cx + dx, cy + dy));
+                }
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+
+        if candidates.is_empty() {
+            return false;
+        }
+
+        let max_attempts = candidates.len().min(12);
+        for _ in 0..max_attempts {
+            let idx = self.rng.gen_range(0..candidates.len());
+            let chunk = candidates[idx];
+            if !self.chunks.chunks.contains_key(&chunk) {
+                continue;
+            }
+            if let Some(last_frame) = self.spawn_chunk_last_frame.get(&chunk) {
+                if current_frame.saturating_sub(*last_frame) < SPAWN_CHUNK_COOLDOWN_FRAMES {
+                    continue;
+                }
+            }
+            let origin = Vec2::new((chunk.0 * CHUNK_SIZE) as f32, (chunk.1 * CHUNK_SIZE) as f32);
+            let max_offset = CHUNK_SIZE as f32;
+            let radius = match enemy_type {
+                crate::net::EnemyType::Spider => 8.0,
+                crate::net::EnemyType::Cannon => 10.0,
+                crate::net::EnemyType::Snake => 12.0,
+            };
+
+            if let Some(pos) = Self::random_point_in_chunk(
+                &mut self.rng,
+                origin,
+                max_offset,
+                &self.chunks,
+                radius,
+                target_positions,
+                SPAWN_SAFE_DISTANCE,
+            ) {
+                match enemy_type {
+                    crate::net::EnemyType::Spider => {
+                        let id = self.spiders.len();
+                        self.spiders.push(Spider::new_at_position(id, pos, &mut self.rng));
+                    }
+                    crate::net::EnemyType::Cannon => {
+                        let id = self.cannons.len();
+                        self.cannons.push(Cannon::new_at_position(id, pos, &mut self.rng));
+                    }
+                    crate::net::EnemyType::Snake => {
+                        let id = self.snakes.len();
+                        let snake = Snake::new_at_position(id, None, pos);
+                        self.snakes.push(snake);
+                    }
+                }
+                self.spawn_chunk_last_frame.insert(chunk, current_frame);
+                return true;
+            }
+        }
+
+        false
     }
 
     fn random_point_in_chunk(
@@ -1593,12 +1755,24 @@ impl Game {
         size: f32,
         chunks: &ChunkManager,
         radius: f32,
+        avoid_positions: &[Vec2],
+        min_distance: f32,
     ) -> Option<Vec2> {
         for _ in 0..10 {
             let x = origin.x + rng.gen::<f32>() * size;
             let y = origin.y + rng.gen::<f32>() * size;
             let pos = Vec2::new(x, y);
-            if !chunks.collides_with_obstacle(pos, radius) {
+            if chunks.collides_with_obstacle(pos, radius) {
+                continue;
+            }
+            let mut too_close = false;
+            for avoid in avoid_positions {
+                if pos.distance(*avoid) < min_distance {
+                    too_close = true;
+                    break;
+                }
+            }
+            if !too_close {
                 return Some(pos);
             }
         }

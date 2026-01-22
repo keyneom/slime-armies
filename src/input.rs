@@ -15,6 +15,8 @@ pub struct Input {
     pub pressed: u8,
     pub released: u8,
     pub axis: Vec2,
+    touch_down: u8,
+    touch_axis: Option<Vec2>,
 }
 
 impl Input {
@@ -29,6 +31,8 @@ impl Input {
             pressed: 0,
             released: 0,
             axis: Vec2::ZERO,
+            touch_down: 0,
+            touch_axis: None,
         };
         input.end_frame();
         input
@@ -45,21 +49,26 @@ impl Input {
     }
 
     pub fn end_frame(&mut self) {
-        self.pressed = self.down & (self.down ^ self.prev);
-        self.released = self.prev & (self.down ^ self.prev);
-        self.prev = self.down;
+        let effective_down = self.down | self.touch_down;
+        self.pressed = effective_down & (effective_down ^ self.prev);
+        self.released = self.prev & (effective_down ^ self.prev);
+        self.prev = effective_down;
 
         // Update axis from directional buttons
         self.axis = Vec2::ZERO;
-        if self.is_down(BUTTON_LEFT) {
-            self.axis.x = -1.0;
-        } else if self.is_down(BUTTON_RIGHT) {
-            self.axis.x = 1.0;
-        }
-        if self.is_down(BUTTON_UP) {
-            self.axis.y = -1.0;
-        } else if self.is_down(BUTTON_DOWN) {
-            self.axis.y = 1.0;
+        if let Some(axis) = self.touch_axis {
+            self.axis = axis;
+        } else {
+            if effective_down & BUTTON_LEFT != 0 {
+                self.axis.x = -1.0;
+            } else if effective_down & BUTTON_RIGHT != 0 {
+                self.axis.x = 1.0;
+            }
+            if effective_down & BUTTON_UP != 0 {
+                self.axis.y = -1.0;
+            } else if effective_down & BUTTON_DOWN != 0 {
+                self.axis.y = 1.0;
+            }
         }
 
         // Normalize diagonal movement
@@ -81,7 +90,12 @@ impl Input {
     }
 
     pub fn get_raw(&self) -> u8 {
-        self.down
+        self.down | self.touch_down
+    }
+
+    pub fn set_touch_state(&mut self, axis: Option<Vec2>, down_mask: u8) {
+        self.touch_axis = axis;
+        self.touch_down = down_mask;
     }
 }
 

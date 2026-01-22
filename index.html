@@ -15,6 +15,7 @@
             width: 100%;
             height: 100%;
             overflow: hidden;
+            touch-action: none;
         }
         body {
             display: flex;
@@ -25,12 +26,24 @@
             image-rendering: pixelated;
             image-rendering: crisp-edges;
             cursor: default;
+            touch-action: none;
+        }
+        #mobile-input {
+            position: absolute;
+            opacity: 0;
+            width: 1px;
+            height: 1px;
+            left: -1000px;
+            top: -1000px;
+            border: 0;
+            padding: 0;
         }
     </style>
     <link data-trunk rel="rust" data-wasm-opt="z" />
 </head>
 <body>
-    <canvas id="canvas"></canvas>
+    <canvas id="canvas" tabindex="0"></canvas>
+    <input id="mobile-input" type="text" tabindex="-1" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-hidden="true" />
     <script type="module">
         // Debug helpers will be exposed by Trunk-generated script
         // Access via window.slime and window.slimeDebug after TrunkApplicationStarted event

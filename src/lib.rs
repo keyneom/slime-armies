@@ -38,6 +38,8 @@ thread_local! {
     static INPUT_BUFFER: RefCell<InputBuffer> = RefCell::new(InputBuffer::new());
     // Debug command queue (fed via JS console or tooling)
     static DEBUG_COMMANDS: RefCell<Vec<String>> = RefCell::new(Vec::new());
+    static TOUCH_STATE: RefCell<TouchState> = RefCell::new(TouchState::new());
+    static MOBILE_INPUT: RefCell<Option<web_sys::HtmlInputElement>> = RefCell::new(None);
 }
 
 /// Buffer for input events that event handlers can write to without conflicting
@@ -52,6 +54,84 @@ struct InputBuffer {
     tab: bool,
     mute_toggle: bool,  // M key to toggle audio mute
     click: Option<(f64, f64)>,
+}
+
+struct TouchLayout {
+    stick_center: crate::math::Vec2,
+    stick_radius: f64,
+    attack_center: crate::math::Vec2,
+    phase_center: crate::math::Vec2,
+    button_radius: f64,
+    map_center: crate::math::Vec2,
+    list_center: crate::math::Vec2,
+    chat_center: crate::math::Vec2,
+    zoom_in_center: crate::math::Vec2,
+    zoom_out_center: crate::math::Vec2,
+    top_button_radius: f64,
+}
+
+fn touch_layout(width: f64, height: f64) -> TouchLayout {
+    let stick_center = crate::math::Vec2::new(90.0, (height - 90.0) as f32);
+    let stick_radius = 60.0;
+    let button_radius = 32.0;
+    let attack_center = crate::math::Vec2::new((width - 90.0) as f32, (height - 120.0) as f32);
+    let phase_center = crate::math::Vec2::new((width - 160.0) as f32, (height - 60.0) as f32);
+    let top_button_radius = 20.0;
+    let map_center = crate::math::Vec2::new((width - 50.0) as f32, 40.0);
+    let list_center = crate::math::Vec2::new((width - 100.0) as f32, 40.0);
+    let chat_center = crate::math::Vec2::new((width - 150.0) as f32, 40.0);
+    let zoom_in_center = crate::math::Vec2::new((width - 50.0) as f32, (height - 220.0) as f32);
+    let zoom_out_center = crate::math::Vec2::new((width - 110.0) as f32, (height - 220.0) as f32);
+
+    TouchLayout {
+        stick_center,
+        stick_radius,
+        attack_center,
+        phase_center,
+        button_radius,
+        map_center,
+        list_center,
+        chat_center,
+        zoom_in_center,
+        zoom_out_center,
+        top_button_radius,
+    }
+}
+
+struct TouchState {
+    joystick_id: Option<i32>,
+    joystick_center: crate::math::Vec2,
+    joystick_axis: crate::math::Vec2,
+    attack_id: Option<i32>,
+    phase_id: Option<i32>,
+    map_tap_frames: u8,
+    list_tap_frames: u8,
+    chat_tap_frames: u8,
+    map_drag_id: Option<i32>,
+    map_drag_last: crate::math::Vec2,
+    map_drag_delta: crate::math::Vec2,
+    zoom_in_tap_frames: u8,
+    zoom_out_tap_frames: u8,
+}
+
+impl TouchState {
+    fn new() -> Self {
+        Self {
+            joystick_id: None,
+            joystick_center: crate::math::Vec2::ZERO,
+            joystick_axis: crate::math::Vec2::ZERO,
+            attack_id: None,
+            phase_id: None,
+            map_tap_frames: 0,
+            list_tap_frames: 0,
+            chat_tap_frames: 0,
+            map_drag_id: None,
+            map_drag_last: crate::math::Vec2::ZERO,
+            map_drag_delta: crate::math::Vec2::ZERO,
+            zoom_in_tap_frames: 0,
+            zoom_out_tap_frames: 0,
+        }
+    }
 }
 
 impl InputBuffer {
@@ -88,10 +168,24 @@ fn load_saved_player_name() -> Option<String> {
     storage.get_item("slime_player_name").ok().flatten()
 }
 
+fn load_saved_room_code() -> Option<String> {
+    let window = web_sys::window()?;
+    let storage = window.local_storage().ok()??;
+    storage.get_item("slime_room_code").ok().flatten()
+}
+
 fn save_player_name(name: &str) {
     if let Some(window) = web_sys::window() {
         if let Ok(Some(storage)) = window.local_storage() {
             let _ = storage.set_item("slime_player_name", name);
+        }
+    }
+}
+
+fn save_room_code(code: &str) {
+    if let Some(window) = web_sys::window() {
+        if let Ok(Some(storage)) = window.local_storage() {
+            let _ = storage.set_item("slime_room_code", code);
         }
     }
 }
@@ -122,7 +216,27 @@ pub fn main() -> Result<(), JsValue> {
         game.player_name = saved_name.clone();
         network.set_player_name(&saved_name);
     }
+    if let Some(saved_room) = load_saved_room_code() {
+        game.room_code_input = saved_room;
+    }
     let audio = Audio::new();
+
+    // Viewport width <= 768: show mobile controls (touch joystick, etc.). Unknown width → desktop.
+    let is_mobile = window
+        .inner_width()
+        .ok()
+        .and_then(|w| w.as_f64())
+        .map(|w| w <= 768.0)
+        .unwrap_or(false);
+    game.set_mobile_mode(is_mobile);
+
+    if let Some(input_el) = document.get_element_by_id("mobile-input") {
+        if let Ok(input_el) = input_el.dyn_into::<web_sys::HtmlInputElement>() {
+            MOBILE_INPUT.with(|cell| {
+                *cell.borrow_mut() = Some(input_el);
+            });
+        }
+    }
 
     let state = Rc::new(RefCell::new(GameState {
         game,
@@ -417,6 +531,206 @@ fn setup_input(window: &web_sys::Window, _state: Rc<RefCell<GameState>>, canvas:
     canvas.add_event_listener_with_callback("click", click.as_ref().unchecked_ref())?;
     click.forget();
 
+    if let Some(doc) = window.document() {
+        if let Some(input_el) = doc.get_element_by_id("mobile-input") {
+            if let Ok(input_el) = input_el.dyn_into::<web_sys::HtmlInputElement>() {
+                let input_listener = Closure::<dyn FnMut(_)>::new(move |event: web_sys::InputEvent| {
+                    event.prevent_default();
+                    let target = event.target().unwrap();
+                    let input_el: web_sys::HtmlInputElement = target.dyn_into().unwrap();
+                    let value = input_el.value();
+                    if !value.is_empty() {
+                        INPUT_BUFFER.with(|buf| {
+                            let mut buf = buf.borrow_mut();
+                            for c in value.chars() {
+                                if c.is_ascii() && !c.is_ascii_control() {
+                                    buf.chars.push(c);
+                                }
+                            }
+                        });
+                        input_el.set_value("");
+                    }
+                });
+                input_el.add_event_listener_with_callback("input", input_listener.as_ref().unchecked_ref())?;
+                input_listener.forget();
+
+                let key_listener = Closure::<dyn FnMut(_)>::new(move |event: web_sys::KeyboardEvent| {
+                    let handled = INPUT_BUFFER.with(|buf| {
+                        let mut buf = buf.borrow_mut();
+                        match event.code().as_str() {
+                            "Backspace" => {
+                                buf.backspace = true;
+                                true
+                            }
+                            "Enter" => {
+                                buf.enter = true;
+                                true
+                            }
+                            "Escape" => {
+                                buf.escape = true;
+                                true
+                            }
+                            "Tab" => {
+                                buf.tab = true;
+                                true
+                            }
+                            _ => false,
+                        }
+                    });
+                    if handled {
+                        event.prevent_default();
+                        event.stop_propagation();
+                    }
+                });
+                input_el.add_event_listener_with_callback("keydown", key_listener.as_ref().unchecked_ref())?;
+                key_listener.forget();
+            }
+        }
+    }
+
+    // Touch handlers for mobile controls
+    let touch_canvas = canvas.clone();
+    let touchstart = Closure::<dyn FnMut(_)>::new(move |event: web_sys::TouchEvent| {
+        event.prevent_default();
+        let rect = touch_canvas.get_bounding_client_rect();
+        let scale_x = canvas_width / rect.width();
+        let scale_y = canvas_height / rect.height();
+        let layout = touch_layout(canvas_width, canvas_height);
+
+        let touches = event.changed_touches();
+        for i in 0..touches.length() {
+            if let Some(touch) = touches.item(i) {
+                let x = (touch.client_x() as f64 - rect.left()) * scale_x;
+                let y = (touch.client_y() as f64 - rect.top()) * scale_y;
+                let pos = crate::math::Vec2::new(x as f32, y as f32);
+                let id = touch.identifier();
+
+                TOUCH_STATE.with(|state| {
+                    let mut state = state.borrow_mut();
+                    let in_circle = |center: crate::math::Vec2, radius: f64| {
+                        let dx = pos.x as f64 - center.x as f64;
+                        let dy = pos.y as f64 - center.y as f64;
+                        dx * dx + dy * dy <= radius * radius
+                    };
+
+                    if state.joystick_id.is_none() && in_circle(layout.stick_center, layout.stick_radius * 1.3) {
+                        state.joystick_id = Some(id);
+                        state.joystick_center = pos;
+                        state.joystick_axis = crate::math::Vec2::ZERO;
+                        return;
+                    }
+                    if state.attack_id.is_none() && in_circle(layout.attack_center, layout.button_radius) {
+                        state.attack_id = Some(id);
+                        return;
+                    }
+                    if state.phase_id.is_none() && in_circle(layout.phase_center, layout.button_radius) {
+                        state.phase_id = Some(id);
+                        return;
+                    }
+                    if in_circle(layout.map_center, layout.top_button_radius) {
+                        state.map_tap_frames = 2;
+                        return;
+                    }
+                    if in_circle(layout.list_center, layout.top_button_radius) {
+                        state.list_tap_frames = 2;
+                        return;
+                    }
+                    if in_circle(layout.chat_center, layout.top_button_radius) {
+                        state.chat_tap_frames = 2;
+                        return;
+                    }
+                    if in_circle(layout.zoom_in_center, layout.top_button_radius) {
+                        state.zoom_in_tap_frames = 2;
+                        return;
+                    }
+                    if in_circle(layout.zoom_out_center, layout.top_button_radius) {
+                        state.zoom_out_tap_frames = 2;
+                        return;
+                    }
+
+                    let map_left = crate::game::MAP_OVERLAY_PADDING as f64;
+                    let map_top = crate::game::MAP_OVERLAY_PADDING as f64;
+                    let map_size = crate::game::MAP_OVERLAY_SIZE as f64;
+                    if x >= map_left && x <= map_left + map_size && y >= map_top && y <= map_top + map_size {
+                        state.map_drag_id = Some(id);
+                        state.map_drag_last = pos;
+                    }
+                });
+            }
+        }
+    });
+    canvas.add_event_listener_with_callback("touchstart", touchstart.as_ref().unchecked_ref())?;
+    touchstart.forget();
+
+    let touch_canvas = canvas.clone();
+    let touchmove = Closure::<dyn FnMut(_)>::new(move |event: web_sys::TouchEvent| {
+        event.prevent_default();
+        let rect = touch_canvas.get_bounding_client_rect();
+        let scale_x = canvas_width / rect.width();
+        let scale_y = canvas_height / rect.height();
+        let layout = touch_layout(canvas_width, canvas_height);
+
+        let touches = event.changed_touches();
+        for i in 0..touches.length() {
+            if let Some(touch) = touches.item(i) {
+                let x = (touch.client_x() as f64 - rect.left()) * scale_x;
+                let y = (touch.client_y() as f64 - rect.top()) * scale_y;
+                let pos = crate::math::Vec2::new(x as f32, y as f32);
+                let id = touch.identifier();
+
+                TOUCH_STATE.with(|state| {
+                    let mut state = state.borrow_mut();
+                    if state.joystick_id == Some(id) {
+                        let delta = pos - state.joystick_center;
+                        let mut axis = delta;
+                        let max = layout.stick_radius as f32;
+                        let len = axis.length();
+                        if len > max && len > 0.0 {
+                            axis = axis * (max / len);
+                        }
+                        state.joystick_axis = if max > 0.0 { axis / max } else { crate::math::Vec2::ZERO };
+                    }
+                    if state.map_drag_id == Some(id) {
+                        state.map_drag_delta = pos - state.map_drag_last;
+                        state.map_drag_last = pos;
+                    }
+                });
+            }
+        }
+    });
+    canvas.add_event_listener_with_callback("touchmove", touchmove.as_ref().unchecked_ref())?;
+    touchmove.forget();
+
+    let touchend = Closure::<dyn FnMut(_)>::new(move |event: web_sys::TouchEvent| {
+        event.prevent_default();
+        let touches = event.changed_touches();
+        for i in 0..touches.length() {
+            if let Some(touch) = touches.item(i) {
+                let id = touch.identifier();
+                TOUCH_STATE.with(|state| {
+                    let mut state = state.borrow_mut();
+                    if state.joystick_id == Some(id) {
+                        state.joystick_id = None;
+                        state.joystick_axis = crate::math::Vec2::ZERO;
+                    }
+                    if state.attack_id == Some(id) {
+                        state.attack_id = None;
+                    }
+                    if state.phase_id == Some(id) {
+                        state.phase_id = None;
+                    }
+                    if state.map_drag_id == Some(id) {
+                        state.map_drag_id = None;
+                        state.map_drag_delta = crate::math::Vec2::ZERO;
+                    }
+                });
+            }
+        }
+    });
+    canvas.add_event_listener_with_callback("touchend", touchend.as_ref().unchecked_ref())?;
+    canvas.add_event_listener_with_callback("touchcancel", touchend.as_ref().unchecked_ref())?;
+    touchend.forget();
+
     Ok(())
 }
 
@@ -471,6 +785,8 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
 
                     if state_ref.game.active_input_field == 0 {
                         save_player_name(&state_ref.game.player_name);
+                    } else if state_ref.game.active_input_field == 1 {
+                        save_room_code(&state_ref.game.room_code_input);
                     }
 
                     // Handle escape - exit text input to menu
@@ -483,6 +799,7 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                         if state_ref.game.active_input_field == 0 {
                             save_player_name(&state_ref.game.player_name);
                         } else if state_ref.game.active_input_field == 1 {
+                            save_room_code(&state_ref.game.room_code_input);
                             state_ref.game.queued_join_room = true;
                         }
                         state_ref.game.text_input_active = false;
@@ -770,6 +1087,77 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
 
                 // Clear the buffer
                 buf.clear();
+            });
+
+            if state_ref.game.mobile_mode {
+                TOUCH_STATE.with(|state| {
+                    let mut state = state.borrow_mut();
+                    let mut down_mask = 0u8;
+                    let mut axis = None;
+                    if !state_ref.game.map_open && !state_ref.game.player_list_open {
+                        if state.attack_id.is_some() {
+                            down_mask |= crate::input::BUTTON_ATTACK;
+                        }
+                        if state.phase_id.is_some() {
+                            down_mask |= crate::input::BUTTON_PHASE;
+                        }
+                        if state.joystick_id.is_some() {
+                            axis = Some(state.joystick_axis);
+                        }
+                    }
+
+                    state_ref.input.set_touch_state(axis, down_mask);
+
+                    if state.map_tap_frames > 0 {
+                        if state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver {
+                            state_ref.game.toggle_map();
+                        }
+                        state.map_tap_frames = 0;
+                    }
+                    if state.list_tap_frames > 0 {
+                        state_ref.game.toggle_player_list();
+                        state.list_tap_frames = 0;
+                    }
+                    if state.chat_tap_frames > 0 {
+                        state_ref.game.toggle_chat();
+                        state.chat_tap_frames = 0;
+                    }
+
+                    if state_ref.game.map_open {
+                        if state.zoom_in_tap_frames > 0 {
+                            state_ref.game.zoom_map_in();
+                            state.zoom_in_tap_frames = 0;
+                        }
+                        if state.zoom_out_tap_frames > 0 {
+                            state_ref.game.zoom_map_out();
+                            state.zoom_out_tap_frames = 0;
+                        }
+                        if state.map_drag_delta.x != 0.0 || state.map_drag_delta.y != 0.0 {
+                            state_ref.game.pan_map_by_screen_delta(
+                                state.map_drag_delta.x,
+                                state.map_drag_delta.y,
+                            );
+                            state.map_drag_delta = crate::math::Vec2::ZERO;
+                        }
+                    } else {
+                        state.map_drag_delta = crate::math::Vec2::ZERO;
+                    }
+                });
+            } else {
+                state_ref.input.set_touch_state(None, 0);
+            }
+
+            MOBILE_INPUT.with(|cell| {
+                if let Some(input_el) = cell.borrow().as_ref() {
+                    let wants_text = state_ref.game.scene == Scene::Title && state_ref.game.text_input_active
+                        || state_ref.game.is_chat_input_active()
+                        || state_ref.game.is_map_input_active();
+                    if wants_text {
+                        let _ = input_el.focus();
+                    } else {
+                        let _ = input_el.blur();
+                    }
+                }
             });
 
             // Clone input to avoid borrow conflict

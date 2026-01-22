@@ -12,6 +12,23 @@ const PHASE_SPEED: f32 = 5.0;
 // Creature scale for collision/interaction sizes
 const CREATURE_SCALE: f32 = 2.0;
 
+fn distance_point_to_segment(p: Vec2, a: Vec2, b: Vec2) -> f32 {
+    let ab = b - a;
+    let ap = p - a;
+    let ab_len_sq = ab.length_squared();
+    if ab_len_sq <= f32::EPSILON {
+        return ap.length();
+    }
+    let mut t = ap.dot(ab) / ab_len_sq;
+    if t < 0.0 {
+        t = 0.0;
+    } else if t > 1.0 {
+        t = 1.0;
+    }
+    let closest = a + ab * t;
+    (p - closest).length()
+}
+
 #[derive(Debug, Clone)]
 pub struct Player {
     pub alive: bool,
@@ -176,9 +193,24 @@ impl Player {
         if !self.alive || !self.blocking {
             return false;
         }
-        let block_pos = self.pos + self.look_dir * (2.0 * CREATURE_SCALE);
-        let diff = block_pos - target;
-        diff.length() < 7.5 * CREATURE_SCALE + radius && diff.dot(self.look_dir) <= 0.0
+        let look = self.look_dir.normalize();
+        if look.length_squared() == 0.0 {
+            return false;
+        }
+
+        let perp = Vec2::new(look.y, -look.x);
+        let scale = CREATURE_SCALE;
+
+        let s1 = self.pos + (look * (5.0 * scale) - perp * (7.0 * scale));
+        let e1 = self.pos + (look * (5.0 * scale) + perp * (7.0 * scale));
+        let s2 = self.pos + (look * (6.0 * scale) - perp * (4.0 * scale));
+        let e2 = self.pos + (look * (6.0 * scale) + perp * (4.0 * scale));
+
+        let thickness = 1.2 * scale + radius;
+        let d1 = distance_point_to_segment(target, s1, e1);
+        let d2 = distance_point_to_segment(target, s2, e2);
+
+        d1 <= thickness || d2 <= thickness
     }
 
     /// Attack collision - attack_pos at look_dir * 5, check 8.5 + radius

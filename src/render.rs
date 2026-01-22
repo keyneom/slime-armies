@@ -1155,6 +1155,9 @@ impl Renderer {
         if !game.map_open {
             self.render_chat_overlay(game);
         }
+        if game.mobile_mode {
+            self.render_mobile_controls(game);
+        }
 
         self.render_network_status_on(&self.display_ctx, network);
     }
@@ -1377,6 +1380,66 @@ impl Renderer {
                 self.display_ctx.set_fill_style_str("#9aa3a3");
                 let _ = self.display_ctx.fill_text("C: Chat", left, bottom - padding);
             }
+        }
+    }
+
+    fn render_mobile_controls(&self, game: &Game) {
+        let width = self.width as f64;
+        let height = self.height as f64;
+        let stick_center = Vec2::new(90.0, height as f32 - 90.0);
+        let stick_radius = 60.0;
+        let action_radius = 32.0;
+        let attack_center = Vec2::new(width as f32 - 90.0, height as f32 - 120.0);
+        let phase_center = Vec2::new(width as f32 - 160.0, height as f32 - 60.0);
+        let top_radius = 20.0;
+        let map_center = Vec2::new(width as f32 - 50.0, 40.0);
+        let list_center = Vec2::new(width as f32 - 100.0, 40.0);
+        let chat_center = Vec2::new(width as f32 - 150.0, 40.0);
+        let zoom_in_center = Vec2::new(width as f32 - 50.0, height as f32 - 220.0);
+        let zoom_out_center = Vec2::new(width as f32 - 110.0, height as f32 - 220.0);
+
+        // Joystick area - blue with transparency for better visibility
+        self.display_ctx.set_fill_style_str("rgba(17,102,204,0.4)");
+        self.display_ctx.begin_path();
+        let _ = self.display_ctx.arc(stick_center.x as f64, stick_center.y as f64, stick_radius, 0.0, std::f64::consts::PI * 2.0);
+        self.display_ctx.fill();
+
+        // Attack and Phase buttons - blue with transparency for better visibility
+        self.display_ctx.set_fill_style_str("rgba(17,102,204,0.5)");
+        self.display_ctx.begin_path();
+        let _ = self.display_ctx.arc(attack_center.x as f64, attack_center.y as f64, action_radius, 0.0, std::f64::consts::PI * 2.0);
+        self.display_ctx.fill();
+        self.display_ctx.begin_path();
+        let _ = self.display_ctx.arc(phase_center.x as f64, phase_center.y as f64, action_radius, 0.0, std::f64::consts::PI * 2.0);
+        self.display_ctx.fill();
+
+        // Top buttons - blue with transparency
+        self.display_ctx.set_fill_style_str("rgba(17,102,204,0.4)");
+        for center in [map_center, list_center, chat_center] {
+            self.display_ctx.begin_path();
+            let _ = self.display_ctx.arc(center.x as f64, center.y as f64, top_radius, 0.0, std::f64::consts::PI * 2.0);
+            self.display_ctx.fill();
+        }
+
+        if game.map_open {
+            for center in [zoom_in_center, zoom_out_center] {
+                self.display_ctx.begin_path();
+                let _ = self.display_ctx.arc(center.x as f64, center.y as f64, top_radius, 0.0, std::f64::consts::PI * 2.0);
+                self.display_ctx.fill();
+            }
+        }
+
+        self.display_ctx.set_font("12px monospace");
+        self.display_ctx.set_text_align("center");
+        self.display_ctx.set_fill_style_str("#dfe7e7");
+        let _ = self.display_ctx.fill_text("ATT", attack_center.x as f64, attack_center.y as f64 + 4.0);
+        let _ = self.display_ctx.fill_text("PH", phase_center.x as f64, phase_center.y as f64 + 4.0);
+        let _ = self.display_ctx.fill_text("M", map_center.x as f64, map_center.y as f64 + 4.0);
+        let _ = self.display_ctx.fill_text("P", list_center.x as f64, list_center.y as f64 + 4.0);
+        let _ = self.display_ctx.fill_text("C", chat_center.x as f64, chat_center.y as f64 + 4.0);
+        if game.map_open {
+            let _ = self.display_ctx.fill_text("+", zoom_in_center.x as f64, zoom_in_center.y as f64 + 4.0);
+            let _ = self.display_ctx.fill_text("-", zoom_out_center.x as f64, zoom_out_center.y as f64 + 4.0);
         }
     }
 

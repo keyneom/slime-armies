@@ -22,11 +22,13 @@ cargo install trunk
 ./scripts/build-docs.sh
 
 # Run dev server
-trunk serve
+./scripts/serve.sh
 
 # Build for production
-trunk build --release
+./scripts/build.sh
 ```
+
+**Note:** Use the `scripts/` wrappers for trunk; they unset `NO_COLOR` / `FORCE_COLOR`, which otherwise can cause `invalid value '1' for '--no-color'` when running `trunk` directly (e.g. in Cursor's terminal or CI).
 
 ## Architecture
 
