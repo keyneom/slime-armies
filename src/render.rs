@@ -1140,10 +1140,12 @@ impl Renderer {
         let map_size = 120.0;
         let map_padding = 10.0;
         let map_left = (self.width as f64) - map_size - map_padding;
-        let map_top = (self.height as f64) - map_size - map_padding;
-        self.display_ctx.set_font("12px monospace");
-        self.display_ctx.set_text_align("left");
-        let _ = self.display_ctx.fill_text("M: Map", map_left, map_top - 6.0);
+        let map_top = if game.mobile_mode { 130.0 } else { (self.height as f64) - map_size - map_padding };
+        if !game.mobile_mode {
+            self.display_ctx.set_font("12px monospace");
+            self.display_ctx.set_text_align("left");
+            let _ = self.display_ctx.fill_text("M: Map", map_left, map_top - 6.0);
+        }
 
         if !network.room_code.is_empty() {
             self.render_team_stats(game, network);
@@ -1405,14 +1407,8 @@ impl Renderer {
         let action_radius = 32.0;
         let attack_center = Vec2::new(width as f32 - 90.0, height as f32 - 120.0);
         let phase_center = Vec2::new(width as f32 - 160.0, height as f32 - 60.0);
-        let top_radius = 22.0;
-        let map_center = Vec2::new(width as f32 - 50.0, 40.0);
-        let list_center = Vec2::new(width as f32 - 100.0, 40.0);
-        let chat_center = Vec2::new(width as f32 - 150.0, 40.0);
-        let chat_button_left = 18.0;
-        let chat_button_top = height - 170.0;
-        let chat_button_w = 84.0;
-        let chat_button_h = 26.0;
+        let top_radius = 26.0;
+        let chat_center = Vec2::new(width as f32 * 0.5, 32.0);
         let zoom_in_center = Vec2::new(width as f32 - 50.0, height as f32 - 220.0);
         let zoom_out_center = Vec2::new(width as f32 - 110.0, height as f32 - 220.0);
 
@@ -1432,13 +1428,10 @@ impl Renderer {
         self.display_ctx.fill();
 
         // Top buttons - blue with transparency
-        self.display_ctx.set_fill_style_str("rgba(17,102,204,0.4)");
-        for center in [map_center, list_center, chat_center] {
-            self.display_ctx.begin_path();
-            let _ = self.display_ctx.arc(center.x as f64, center.y as f64, top_radius, 0.0, std::f64::consts::PI * 2.0);
-            self.display_ctx.fill();
-        }
-        self.display_ctx.fill_rect(chat_button_left, chat_button_top, chat_button_w, chat_button_h);
+        self.display_ctx.set_fill_style_str("rgba(17,102,204,0.45)");
+        self.display_ctx.begin_path();
+        let _ = self.display_ctx.arc(chat_center.x as f64, chat_center.y as f64, top_radius, 0.0, std::f64::consts::PI * 2.0);
+        self.display_ctx.fill();
 
         if game.map_open {
             for center in [zoom_in_center, zoom_out_center] {
@@ -1453,11 +1446,7 @@ impl Renderer {
         self.display_ctx.set_fill_style_str("#dfe7e7");
         let _ = self.display_ctx.fill_text("ATT", attack_center.x as f64, attack_center.y as f64 + 4.0);
         let _ = self.display_ctx.fill_text("PH", phase_center.x as f64, phase_center.y as f64 + 4.0);
-        let _ = self.display_ctx.fill_text("M", map_center.x as f64, map_center.y as f64 + 4.0);
-        let _ = self.display_ctx.fill_text("P", list_center.x as f64, list_center.y as f64 + 4.0);
         let _ = self.display_ctx.fill_text("C", chat_center.x as f64, chat_center.y as f64 + 4.0);
-        self.display_ctx.set_text_align("left");
-        let _ = self.display_ctx.fill_text("CHAT", chat_button_left + 12.0, chat_button_top + 18.0);
         if game.map_open {
             let _ = self.display_ctx.fill_text("+", zoom_in_center.x as f64, zoom_in_center.y as f64 + 4.0);
             let _ = self.display_ctx.fill_text("-", zoom_out_center.x as f64, zoom_out_center.y as f64 + 4.0);
@@ -1805,14 +1794,31 @@ impl Renderer {
             game.frame_count,
         );
 
+        if game.mobile_mode {
+            let button_w = 100.0;
+            let button_h = 20.0;
+            let button_x = map_left + map_size - button_w - 10.0;
+            let button_y = input_y - 28.0;
+            self.display_ctx.set_fill_style_str("#1b2a2e");
+            self.display_ctx.fill_rect(button_x, button_y, button_w, button_h);
+            self.display_ctx.set_stroke_style_str("#4a5a5a");
+            self.display_ctx.set_line_width(1.0);
+            self.display_ctx.stroke_rect(button_x, button_y, button_w, button_h);
+            self.display_ctx.set_fill_style_str("#e6efef");
+            self.display_ctx.set_font("12px monospace");
+            self.display_ctx.set_text_align("center");
+            let _ = self.display_ctx.fill_text("Teleport", button_x + button_w / 2.0, button_y + 14.0);
+        }
+
         self.display_ctx.set_fill_style_str("#e6efef");
         self.display_ctx.set_font("12px monospace");
         self.display_ctx.set_text_align("left");
-        let _ = self.display_ctx.fill_text(
-            "Map: arrows pan | Z zoom in | X zoom out | Tab switch fields | Enter teleport | M close",
-            map_left,
-            map_top - 12.0,
-        );
+        let help_text = if game.mobile_mode {
+            "Map: drag pan | +/- zoom | tap target | Teleport | X close"
+        } else {
+            "Map: arrows pan | Z zoom in | X zoom out | Tab switch fields | Enter teleport | M close"
+        };
+        let _ = self.display_ctx.fill_text(help_text, map_left, map_top - 12.0);
     }
 
     fn format_time(seconds: u32) -> String {
