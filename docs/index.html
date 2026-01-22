@@ -15,6 +15,7 @@
             width: 100%;
             height: 100%;
             overflow: hidden;
+            touch-action: none;
         }
         body {
             display: flex;
@@ -25,12 +26,23 @@
             image-rendering: pixelated;
             image-rendering: crisp-edges;
             cursor: default;
+            touch-action: none;
+        }
+        #mobile-input {
+            position: absolute;
+            opacity: 0;
+            width: 1px;
+            height: 1px;
+            left: -1000px;
+            top: -1000px;
+            border: 0;
+            padding: 0;
         }
     </style>
     
 <script type="module">
-import init, * as bindings from '/slime-armies/slime-armies-bd7c4e424be80a18.js';
-const wasm = await init({ module_or_path: '/slime-armies/slime-armies-bd7c4e424be80a18_bg.wasm' });
+import init, * as bindings from '/slime-armies/slime-armies-7a8e66a99878c001.js';
+const wasm = await init({ module_or_path: '/slime-armies/slime-armies-7a8e66a99878c001_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -39,9 +51,10 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-<link rel="modulepreload" href="/slime-armies/slime-armies-bd7c4e424be80a18.js" crossorigin="anonymous" integrity="sha384-/I4zvzDaUQnAwFl1z68FCYUFSwQ9NBitm3KQFpG+WxnqmcDWCkg5J/B4L6NWJt3i"><link rel="preload" href="/slime-armies/slime-armies-bd7c4e424be80a18_bg.wasm" crossorigin="anonymous" integrity="sha384-3fG7trn5S2wNyA+5b1w2KVSYqMocKisloGNiPP8R0jn06u9ERwpb7jQJEYk6rNK3" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/slime-armies/slime-armies-7a8e66a99878c001.js" crossorigin="anonymous" integrity="sha384-uGP9TOcJFhP31DaEkfSLlxbGFwuTE13mrJTMDi5kQE5GnaOAP/VoH/0lXOObXNWF"><link rel="preload" href="/slime-armies/slime-armies-7a8e66a99878c001_bg.wasm" crossorigin="anonymous" integrity="sha384-Gyj2CT8uiO7YnvvI8IlHopL/9q+p/p5SMRG21U/AHAXK2Ea1X+R6VqSDAPdT+glt" as="fetch" type="application/wasm"></head>
 <body>
-    <canvas id="canvas"></canvas>
+    <canvas id="canvas" tabindex="0"></canvas>
+    <input id="mobile-input" type="text" tabindex="-1" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-hidden="true" />
     <script type="module">
         // Debug helpers will be exposed by Trunk-generated script
         // Access via window.slime and window.slimeDebug after TrunkApplicationStarted event
