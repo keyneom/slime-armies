@@ -555,17 +555,24 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                     let target = event.target().unwrap();
                     let input_el: web_sys::HtmlInputElement = target.dyn_into().unwrap();
                     let value = input_el.value();
-                    if !value.is_empty() {
-                        INPUT_BUFFER.with(|buf| {
-                            let mut buf = buf.borrow_mut();
-                            for c in value.chars() {
-                                if c.is_ascii() && !c.is_ascii_control() {
-                                    buf.chars.push(c);
-                                }
-                            }
-                        });
-                        input_el.set_value("");
+                    if value.is_empty() {
+                        let input_type = event.input_type();
+                        if input_type == "deleteContentBackward" || input_type == "deleteContentForward" {
+                            INPUT_BUFFER.with(|buf| {
+                                buf.borrow_mut().backspace = true;
+                            });
+                        }
+                        return;
                     }
+                    INPUT_BUFFER.with(|buf| {
+                        let mut buf = buf.borrow_mut();
+                        for c in value.chars() {
+                            if c.is_ascii() && !c.is_ascii_control() {
+                                buf.chars.push(c);
+                            }
+                        }
+                    });
+                    input_el.set_value("");
                 });
                 input_el.add_event_listener_with_callback("input", input_listener.as_ref().unchecked_ref())?;
                 input_listener.forget();
