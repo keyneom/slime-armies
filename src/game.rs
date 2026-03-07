@@ -1,9 +1,10 @@
 use crate::input::Input;
-use crate::entities::{Player, ExplosionPool, Spider, Cannon, Snake, ProjectilePool, CannonEvent};
+use crate::entities::{Player, ExplosionPool, Spider, Cannon, Snake, Wisp, Guardian, ProjectilePool, CannonEvent};
 use crate::math::Vec2;
 use crate::net::PlayerState;
 use crate::world::{Camera, ChunkManager};
-use rand::{SeedableRng, Rng};
+use crate::payment;
+use rand::{SeedableRng, Rng, RngCore};
 use rand_xoshiro::Xoshiro256PlusPlus;
 use js_sys;
 use std::collections::{HashMap, HashSet};
@@ -18,8 +19,20 @@ const MAP_ZOOM_MIN: f32 = 0.25;
 const MAP_ZOOM_MAX: f32 = 4.0;
 const MAP_ZOOM_STEP: f32 = 1.25;
 const ROLLBACK_WINDOW_FRAMES: u32 = 6;
-const SPAWN_SAFE_DISTANCE: f32 = 90.0;
+const SPAWN_SAFE_DISTANCE: f32 = 160.0;
 const SPAWN_CHUNK_COOLDOWN_FRAMES: u32 = 300;
+const SPAWN_MIN_INTERVAL_FRAMES: u32 = 8;
+const SPAWN_INTERVAL_JITTER_FRAMES: u32 = 6;
+const SPAWN_IDLE_RATE_PER_FRAME: f32 = 0.0;
+const SPAWN_PER_WIDTH_PER_PLAYER: f32 = 1.0;
+const SPAWN_MAX_PER_FRAME: usize = 1;
+pub const COORD_DISPLAY_SCALE: f32 = 0.001;
+pub const COORD_DISPLAY_INV: f32 = 1000.0;
+pub const SHRINE_POS: Vec2 = Vec2::new(67.0 * COORD_DISPLAY_INV, 67.0 * COORD_DISPLAY_INV);
+pub const SHRINE_TRIGGER_DISTANCE: f32 = 40.0;
+const SPAWN_BUDGET_DECAY_PER_FRAME: f32 = 0.08;
+const SPAWN_FRONT_SAFE_DISTANCE: f32 = 140.0;
+const SPAWN_FRONT_DOT_LIMIT: f32 = 0.6;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Scene {
@@ -70,6 +83,8 @@ pub struct Game {
     pub spiders: Vec<Spider>,
     pub cannons: Vec<Cannon>,
     pub snakes: Vec<Snake>,
+    pub wisps: Vec<Wisp>,
+    pub guardians: Vec<Guardian>,
     pub projectiles: ProjectilePool,
     pub explosions: ExplosionPool,
     pub camera: Camera,
@@ -79,6 +94,13 @@ pub struct Game {
     pub end_frame: u32,
     pub wave: u32,
     pub kills: u32,
+    pub spider_kills: u32,
+    pub cannon_kills: u32,
+    pub snake_kills: u32,
+    pub wisp_kills: u32,
+    pub guardian_kills: u32,
+    pub attack_attempts: u32,
+    pub attack_hits: u32,
     pub deaths: u32,
     pub width: u32,
     pub height: u32,
@@ -97,13 +119,20 @@ pub struct Game {
     paid_obstacle_map: HashMap<[u8; 32], crate::world::Obstacle>,
     pending_paid_obstacle_candidates: HashMap<[u8; 32], crate::net::PaidObstacle>,
     pub pending_paid_obstacles: Vec<crate::net::PaidObstacle>,
+    pending_paid_ability_requests: Vec<PendingPaidAbilityRequest>,
+    pending_paid_ability_candidates: HashMap<[u8; 32], crate::net::PaidAbility>,
+    paid_ability_hashes: HashSet<[u8; 32]>,
     pub pending_cannon_shots: Vec<crate::net::CannonShot>,
     pub queued_join_room: bool,
     pub input_history: Vec<crate::net::InputFrame>,
     remote_simulations: HashMap<String, RemoteSimulation>,
     remote_predictions: HashMap<String, PlayerState>,
-    pub wave_kill_counts: [u32; 3],
-    pub wave_kill_targets: [u32; 3],
+    pub wave_kill_counts: [u32; 4],
+    pub wave_kill_targets: [u32; 4],
+    snake_chain_len: usize,
+    snake_chain_target: usize,
+    snake_chain_spawned: usize,
+    next_snake_chain_id: u16,
     spawn_chunk_last_frame: HashMap<(i32, i32), u32>,
     pub player_list_open: bool,
     pub player_list_scroll: i32,
@@ -115,11 +144,14 @@ pub struct Game {
     pub chat_input: String,
     pub chat_log: Vec<ChatLine>,
     pub last_chat_send_frame: u32,
+    pub net_debug_overlay: bool,
     pub mobile_mode: bool,
     pub viewport_width: f64,
     pub viewport_height: f64,
     spawn_progress: f32,
     last_spawn_positions: Vec<Vec2>,
+    spawn_budget: f32,
+    next_spawn_frame: u32,
     rng: Xoshiro256PlusPlus,
     // Menu state
     pub menu_selection: MenuSelection,
@@ -133,6 +165,9 @@ pub struct Game {
     pub pending_enemy_kills: Vec<(crate::net::EnemyType, u16)>,
     /// Player deaths that need to be reported to network
     pub pending_player_deaths: Vec<crate::net::PlayerDeath>,
+    /// Pending attack stats that need to be reported to network
+    pending_attack_attempts: u32,
+    pending_attack_hits: u32,
     /// Pending wave start to broadcast (host only)
     pub pending_wave_start: Option<crate::net::WaveStart>,
     /// Whether we're waiting for wave start from host (client only)
@@ -144,6 +179,22 @@ pub struct Game {
     /// Snapshot of enemy positions for consistent rendering (updated at sync rate)
     /// This ensures host and client see enemies at the same visual update rate
     pub enemy_render_snapshot: Option<EnemyRenderSnapshot>,
+    pub shockwave_cooldown: i32,
+    pub shockwave_timer: i32,
+    pub slow_spawn_timer: i32,
+    pub slow_spawn_cooldown: i32,
+    pub speed_boost_timer: i32,
+    pub speed_boost_cooldown: i32,
+    pub trail_timer: i32,
+    pub trail_cooldown: i32,
+    last_trail_frame: u32,
+    pub trail_segments: Vec<SlimeTrailSegment>,
+    ability_keymap: HashMap<String, crate::net::PaidAbilityType>,
+    pub ability_bind_open: bool,
+    ability_bind_selected: usize,
+    ability_bind_waiting: bool,
+    pub shrine_badge_unlocked: bool,
+    shrine_triggered: bool,
 }
 
 /// Snapshot of enemy positions for rendering (separate from simulation)
@@ -152,6 +203,8 @@ pub struct EnemyRenderSnapshot {
     pub spider_positions: Vec<(Vec2, Vec2, bool)>,  // (pos, dir, alive)
     pub cannon_positions: Vec<(Vec2, Vec2, Vec2, bool)>,  // (pos, dir, look_dir, alive)
     pub snake_positions: Vec<(Vec2, Vec2, f32, bool)>,  // (pos, dir, size, alive)
+    pub wisp_positions: Vec<(Vec2, Vec2, bool)>,  // (pos, dir, alive)
+    pub guardian_positions: Vec<(Vec2, Vec2, bool, bool, Vec2)>,  // (pos, dir, alive, strike_active, strike_pos)
 }
 
 pub struct ChatLine {
@@ -160,17 +213,243 @@ pub struct ChatLine {
     pub frame: u32,
 }
 
+pub struct AbilityUiEntry {
+    pub ability: crate::net::PaidAbilityType,
+    pub label: String,
+    pub key: String,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub ready: bool,
+}
+
+pub struct AbilityCatalogEntry {
+    pub ability: crate::net::PaidAbilityType,
+    pub label: String,
+    pub description: String,
+    pub cost_usd: f32,
+    pub key: String,
+    pub ready: bool,
+}
+
+pub struct SlimeTrailSegment {
+    obstacle: crate::world::Obstacle,
+    expires_frame: u32,
+}
+
+impl SlimeTrailSegment {
+    pub fn pos(&self) -> Vec2 {
+        self.obstacle.pos
+    }
+
+    pub fn radius(&self) -> f32 {
+        self.obstacle.radius
+    }
+}
+pub struct PendingPaidAbilityRequest {
+    pub ability_type: crate::net::PaidAbilityType,
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
+    pub nonce: u32,
+}
+
 struct RemoteSimulation {
     player: Player,
     last_sim_frame: u32,
     last_authoritative_frame: u32,
-    last_input: u8,
+    last_input: u16,
     pending_inputs: Vec<crate::net::InputFrame>,
-    snapshots: std::collections::VecDeque<(u32, Player, u8)>,
+    snapshots: std::collections::VecDeque<(u32, Player, u16)>,
     rollback_from: Option<u32>,
 }
 
 impl Game {
+    fn default_ability_keymap() -> HashMap<String, crate::net::PaidAbilityType> {
+        let mut map = HashMap::new();
+        map.insert("KeyR".to_string(), crate::net::PaidAbilityType::BubbleShield);
+        map.insert("KeyF".to_string(), crate::net::PaidAbilityType::Shockwave);
+        map.insert("KeyT".to_string(), crate::net::PaidAbilityType::SlowSpawn);
+        map.insert("KeyG".to_string(), crate::net::PaidAbilityType::SpeedBoost);
+        map.insert("KeyY".to_string(), crate::net::PaidAbilityType::SlimeTrail);
+        map
+    }
+
+    pub fn ability_entries(&self) -> Vec<(crate::net::PaidAbilityType, String)> {
+        vec![
+            (crate::net::PaidAbilityType::BubbleShield, "Bubble".to_string()),
+            (crate::net::PaidAbilityType::Shockwave, "Shockwave".to_string()),
+            (crate::net::PaidAbilityType::SlowSpawn, "Time Slow".to_string()),
+            (crate::net::PaidAbilityType::SpeedBoost, "Speed".to_string()),
+            (crate::net::PaidAbilityType::SlimeTrail, "Trail".to_string()),
+        ]
+    }
+
+    pub fn ability_catalog_entries(&self) -> Vec<AbilityCatalogEntry> {
+        let entries = vec![
+            (
+                crate::net::PaidAbilityType::BubbleShield,
+                "Bubble Shield",
+                "Absorb hits for a short time",
+                0.25,
+            ),
+            (
+                crate::net::PaidAbilityType::Shockwave,
+                "Shockwave",
+                "Blast nearby enemies",
+                0.25,
+            ),
+            (
+                crate::net::PaidAbilityType::SlowSpawn,
+                "Time Slow",
+                "Slow nearby enemies",
+                0.25,
+            ),
+            (
+                crate::net::PaidAbilityType::SpeedBoost,
+                "Speed Boost",
+                "Move faster briefly",
+                0.25,
+            ),
+            (
+                crate::net::PaidAbilityType::SlimeTrail,
+                "Slime Trail",
+                "Leave a lethal trail",
+                0.25,
+            ),
+        ];
+
+        entries
+            .into_iter()
+            .map(|(ability, label, description, cost_usd)| AbilityCatalogEntry {
+                ability,
+                label: label.to_string(),
+                description: description.to_string(),
+                cost_usd,
+                key: self.ability_key_for(ability).unwrap_or_else(|| "".to_string()),
+                ready: self.ability_ready(ability),
+            })
+            .collect()
+    }
+
+    fn ability_ready(&self, ability: crate::net::PaidAbilityType) -> bool {
+        match ability {
+            crate::net::PaidAbilityType::BubbleShield => self.player.shield_cooldown <= 0 && self.player.shield_timer <= 0,
+            crate::net::PaidAbilityType::Shockwave => self.shockwave_cooldown <= 0,
+            crate::net::PaidAbilityType::SlowSpawn => self.slow_spawn_cooldown <= 0 && self.slow_spawn_timer <= 0,
+            crate::net::PaidAbilityType::SpeedBoost => self.speed_boost_cooldown <= 0 && self.speed_boost_timer <= 0,
+            crate::net::PaidAbilityType::SlimeTrail => self.trail_cooldown <= 0 && self.trail_timer <= 0,
+        }
+    }
+
+    pub fn ability_bar_entries(&self) -> Vec<AbilityUiEntry> {
+        let entries = self.ability_entries();
+        let count = entries.len() as f64;
+        let width = 78.0;
+        let height = 28.0;
+        let gap = 8.0;
+        let total = count * width + (count - 1.0) * gap;
+        let start_x = (self.viewport_width as f64 - total) * 0.5;
+        let y = (self.viewport_height as f64) - 54.0;
+
+        let mut out = Vec::new();
+        for (i, (ability, label)) in entries.into_iter().enumerate() {
+            let x = start_x + i as f64 * (width + gap);
+            let key = self.ability_key_for(ability).unwrap_or_else(|| "".to_string());
+            out.push(AbilityUiEntry {
+                ability,
+                label,
+                key,
+                x,
+                y,
+                w: width,
+                h: height,
+                ready: self.ability_ready(ability),
+            });
+        }
+        out
+    }
+
+    pub fn handle_ability_bar_click(&mut self, screen_x: f64, screen_y: f64) -> bool {
+        for entry in self.ability_bar_entries() {
+            if screen_x >= entry.x
+                && screen_x <= entry.x + entry.w
+                && screen_y >= entry.y
+                && screen_y <= entry.y + entry.h
+            {
+                return self.request_paid_ability(entry.ability);
+            }
+        }
+        false
+    }
+
+    pub fn ability_key_for(&self, ability: crate::net::PaidAbilityType) -> Option<String> {
+        self.ability_keymap
+            .iter()
+            .find(|(_, v)| **v == ability)
+            .map(|(k, _)| k.clone())
+    }
+
+    pub fn toggle_ability_bind_menu(&mut self) {
+        self.ability_bind_open = !self.ability_bind_open;
+        self.ability_bind_waiting = false;
+    }
+
+    pub fn cycle_ability_bind_selection(&mut self, dir: i32) {
+        let len = self.ability_entries().len() as i32;
+        if len == 0 {
+            return;
+        }
+        let mut idx = self.ability_bind_selected as i32 + dir;
+        if idx < 0 {
+            idx = len - 1;
+        } else if idx >= len {
+            idx = 0;
+        }
+        self.ability_bind_selected = idx as usize;
+    }
+
+    pub fn start_ability_rebind(&mut self) {
+        self.ability_bind_waiting = true;
+    }
+
+    pub fn handle_ability_bind_key(&mut self, key_code: &str) -> bool {
+        if !self.ability_bind_open || !self.ability_bind_waiting {
+            return false;
+        }
+        let ability = self.ability_entries()[self.ability_bind_selected].0;
+        self.set_ability_binding(ability, key_code);
+        self.ability_bind_waiting = false;
+        true
+    }
+
+    pub fn ability_bind_selected(&self) -> usize {
+        self.ability_bind_selected
+    }
+
+    pub fn ability_bind_waiting(&self) -> bool {
+        self.ability_bind_waiting
+    }
+
+    pub fn shrine_triggered(&self) -> bool {
+        self.shrine_triggered
+    }
+
+    pub fn handle_ability_key(&mut self, code: &str) -> bool {
+        let ability = match self.ability_keymap.get(code) {
+            Some(a) => *a,
+            None => return false,
+        };
+        let _ = self.request_paid_ability(ability);
+        true
+    }
+
+    fn set_ability_binding(&mut self, ability: crate::net::PaidAbilityType, key_code: &str) {
+        let key_code = key_code.to_string();
+        self.ability_keymap.retain(|_, v| *v != ability);
+        self.ability_keymap.insert(key_code, ability);
+    }
     pub fn new(width: u32, height: u32) -> Self {
         let world_seed = 12345; // Fixed seed for consistent world generation
         Self {
@@ -179,6 +458,8 @@ impl Game {
             spiders: Vec::new(),
             cannons: Vec::new(),
             snakes: Vec::new(),
+            wisps: Vec::new(),
+            guardians: Vec::new(),
             projectiles: ProjectilePool::new(20),
             explosions: ExplosionPool::new(20),
             camera: Camera::new(width, height, CAMERA_ZOOM),
@@ -188,6 +469,13 @@ impl Game {
             end_frame: 0,
             wave: 0,
             kills: 0,
+            spider_kills: 0,
+            cannon_kills: 0,
+            snake_kills: 0,
+            wisp_kills: 0,
+            guardian_kills: 0,
+            attack_attempts: 0,
+            attack_hits: 0,
             deaths: 0,
             width,
             height,
@@ -206,13 +494,20 @@ impl Game {
             paid_obstacle_map: HashMap::new(),
             pending_paid_obstacle_candidates: HashMap::new(),
             pending_paid_obstacles: Vec::new(),
+            pending_paid_ability_requests: Vec::new(),
+            pending_paid_ability_candidates: HashMap::new(),
+            paid_ability_hashes: HashSet::new(),
             pending_cannon_shots: Vec::new(),
             queued_join_room: false,
             input_history: Vec::new(),
             remote_simulations: HashMap::new(),
             remote_predictions: HashMap::new(),
-            wave_kill_counts: [0; 3],
-            wave_kill_targets: [0; 3],
+            wave_kill_counts: [0; 4],
+            wave_kill_targets: [0; 4],
+            snake_chain_len: 0,
+            snake_chain_target: 0,
+            snake_chain_spawned: 0,
+            next_snake_chain_id: 0,
             spawn_chunk_last_frame: HashMap::new(),
             player_list_open: false,
             player_list_scroll: 0,
@@ -224,11 +519,14 @@ impl Game {
             chat_input: String::new(),
             chat_log: Vec::new(),
             last_chat_send_frame: u32::MAX,
+            net_debug_overlay: false,
             mobile_mode: false,
             viewport_width: width as f64,
             viewport_height: height as f64,
             spawn_progress: 0.0,
             last_spawn_positions: Vec::new(),
+            spawn_budget: 0.0,
+            next_spawn_frame: 0,
             rng: Xoshiro256PlusPlus::seed_from_u64(0),
             // Menu state
             menu_selection: MenuSelection::Play,
@@ -239,11 +537,29 @@ impl Game {
             sound_events: Vec::new(),
             pending_enemy_kills: Vec::new(),
             pending_player_deaths: Vec::new(),
+            pending_attack_attempts: 0,
+            pending_attack_hits: 0,
             pending_wave_start: None,
             waiting_for_wave_start: false,
             last_wave_start: None,
             pending_respawn: false,
             enemy_render_snapshot: None,
+            shockwave_cooldown: 0,
+            shockwave_timer: 0,
+            slow_spawn_timer: 0,
+            slow_spawn_cooldown: 0,
+            speed_boost_timer: 0,
+            speed_boost_cooldown: 0,
+            trail_timer: 0,
+            trail_cooldown: 0,
+            last_trail_frame: 0,
+            trail_segments: Vec::new(),
+            ability_keymap: Self::default_ability_keymap(),
+            ability_bind_open: false,
+            ability_bind_selected: 0,
+            ability_bind_waiting: false,
+            shrine_badge_unlocked: false,
+            shrine_triggered: false,
         }
     }
 
@@ -278,6 +594,7 @@ impl Game {
                     remote.attacking,
                     remote.blocking,
                     remote.phasing,
+                    remote.shielded,
                 );
                 RemoteSimulation::new_from_state(&state, remote.last_update_frame())
             });
@@ -292,6 +609,7 @@ impl Game {
                     remote.attacking,
                     remote.blocking,
                     remote.phasing,
+                    remote.shielded,
                 );
                 sim.apply_authoritative_state(&state, authoritative_frame);
             }
@@ -319,11 +637,19 @@ impl Game {
         let snake_positions: Vec<_> = self.snakes.iter()
             .map(|s| (s.pos, s.dir, s.size, s.alive))
             .collect();
+        let wisp_positions: Vec<_> = self.wisps.iter()
+            .map(|w| (w.pos, w.dir, w.alive))
+            .collect();
+        let guardian_positions: Vec<_> = self.guardians.iter()
+            .map(|g| (g.pos, g.dir, g.alive, g.strike_active(), g.strike_pos()))
+            .collect();
 
         self.enemy_render_snapshot = Some(EnemyRenderSnapshot {
             spider_positions,
             cannon_positions,
             snake_positions,
+            wisp_positions,
+            guardian_positions,
         });
     }
 
@@ -523,10 +849,46 @@ impl Game {
         let player_pos = self.player.pos;
         let player_look_dir = self.player.look_dir;
         let frame_count = self.frame_count;
+        let half_w = self.camera.screen_width / (2.0 * self.camera.zoom);
+        let half_h = self.camera.screen_height / (2.0 * self.camera.zoom);
+        let max_slow_dist = (half_w * half_w + half_h * half_h).sqrt().max(1.0);
 
-            if input.is_pressed(crate::input::BUTTON_MAP) {
-                self.toggle_map();
+        if self.shockwave_cooldown > 0 {
+            self.shockwave_cooldown -= 1;
+        }
+        if self.shockwave_timer > 0 {
+            self.shockwave_timer -= 1;
+        }
+        if self.slow_spawn_cooldown > 0 {
+            self.slow_spawn_cooldown -= 1;
+        }
+        if self.slow_spawn_timer > 0 {
+            self.slow_spawn_timer -= 1;
+        }
+        if self.speed_boost_cooldown > 0 {
+            self.speed_boost_cooldown -= 1;
+        }
+        if self.speed_boost_timer > 0 {
+            self.speed_boost_timer -= 1;
+        }
+        if self.trail_cooldown > 0 {
+            self.trail_cooldown -= 1;
+        }
+        if self.trail_timer > 0 {
+            self.trail_timer -= 1;
+        }
+        self.update_slime_trail();
+
+        let player_stationary = input.axis.length() < 0.05;
+        if run_enemy_ai && !self.guardians.is_empty() {
+            for guardian in &mut self.guardians {
+                guardian.regen_tick(player_stationary, SPAWN_CHUNK_COOLDOWN_FRAMES);
             }
+        }
+
+        if input.is_pressed(crate::input::BUTTON_MAP) {
+            self.toggle_map();
+        }
 
         // Capture input history for future rollback
         self.input_history.push(crate::net::InputFrame {
@@ -539,7 +901,16 @@ impl Game {
         self.chunks.update_for_positions(target_positions);
 
         if run_enemy_ai && self.wave == 0 && self.player.alive {
-            self.spawn_wave_for_players(player_count);
+            self.spawn_wave_for_players(player_count, target_positions);
+        }
+
+        let view_radius = half_w.max(half_h) * 1.2;
+        self.check_shrine_boss(target_positions, run_enemy_ai, view_radius);
+        if self.player.pos.distance(SHRINE_POS) < SHRINE_TRIGGER_DISTANCE {
+            if !self.shrine_badge_unlocked {
+                self.shrine_badge_unlocked = true;
+                self.push_chat_line("System".to_string(), "Badge unlocked: Shrinefinder".to_string());
+            }
         }
 
         for pos in target_positions {
@@ -549,23 +920,8 @@ impl Game {
         }
 
         if run_enemy_ai && self.wave > 0 {
-            if self.last_spawn_positions.len() != target_positions.len() {
-                self.last_spawn_positions = target_positions.to_vec();
-            }
-            let mut moved_total = 0.0;
-            for (idx, pos) in target_positions.iter().enumerate() {
-                if let Some(prev) = self.last_spawn_positions.get(idx) {
-                    moved_total += pos.distance(*prev);
-                }
-            }
-            self.last_spawn_positions = target_positions.to_vec();
-            self.spawn_progress += moved_total;
-
-            let spawn_stride = self.width as f32;
-            while self.spawn_progress >= spawn_stride {
-                self.spawn_enemies_for_movement(target_positions, player_count, frame_count);
-                self.spawn_progress -= spawn_stride;
-            }
+            self.update_spawn_budget(target_positions, player_count);
+            self.try_spawn_from_budget(target_positions, frame_count);
         }
 
         // Capture player state before update for sound triggers
@@ -582,6 +938,8 @@ impl Game {
                 // Sound for attack start (transition from not attacking to attacking)
                 if !was_attacking && self.player.is_attacking() {
                     self.sound_events.push(SoundEvent::Attack);
+                    self.attack_attempts = self.attack_attempts.saturating_add(1);
+                    self.pending_attack_attempts = self.pending_attack_attempts.saturating_add(1);
                 }
                 // Sound for phase start (transition from not phasing to phasing)
                 if !was_phasing && self.player.is_phasing() {
@@ -604,10 +962,17 @@ impl Game {
         let mut killed_spiders: Vec<usize> = Vec::new();
         let mut killed_cannons: Vec<usize> = Vec::new();
         let mut killed_snakes: Vec<usize> = Vec::new();
+        let mut killed_wisps: Vec<usize> = Vec::new();
+        let mut killed_guardians: Vec<usize> = Vec::new();
         let mut new_projectiles: Vec<(Vec2, Vec2, i32)> = Vec::new();
         let mut spider_bumps: Vec<(usize, Vec2, f32)> = Vec::new();
         let mut cannon_bumps: Vec<(usize, Vec2, f32)> = Vec::new();
         let mut snake_bumps: Vec<(usize, Vec2, f32)> = Vec::new();
+        let mut wisp_bumps: Vec<(usize, Vec2, f32)> = Vec::new();
+        let mut guardian_bumps: Vec<(usize, Vec2, f32)> = Vec::new();
+        let mut guardian_damaged = vec![false; self.guardians.len()];
+        let mut attack_hits_this_frame: u32 = 0;
+        let trail_segments = &self.trail_segments;
 
         // Update spiders and collect collisions (with obstacle awareness)
         for (i, spider) in self.spiders.iter_mut().enumerate() {
@@ -616,11 +981,24 @@ impl Game {
                 if run_enemy_ai {
                     // Find closest player for this enemy
                     let target = Self::find_closest_target(spider.pos, target_positions);
+                    let prev_pos = spider.pos;
+                    let prev_speed = spider.speed;
                     spider.update_infinite(target, &self.chunks);
+                    if self.slow_spawn_timer > 0 {
+                        let dist = spider.pos.distance(self.player.pos);
+                        let falloff = (1.0 - dist / max_slow_dist).clamp(0.0, 1.0);
+                        let slow_factor = 1.0 - 0.5 * falloff;
+                        let delta = spider.pos - prev_pos;
+                        spider.pos = prev_pos + delta * slow_factor;
+                        spider.speed = prev_speed * slow_factor;
+                    }
                 }
 
-                if self.player.collide_attack(spider.pos, spider.radius() * CREATURE_SCALE) {
+                if Self::trail_hits_enemy_segments(trail_segments, spider.pos, spider.radius() * CREATURE_SCALE) {
                     killed_spiders.push(i);
+                } else if self.player.collide_attack(spider.pos, spider.radius() * CREATURE_SCALE) {
+                    killed_spiders.push(i);
+                    attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
                 } else if self.player.collide_block(spider.pos, (spider.radius() - 3.5) * CREATURE_SCALE) {
                     let distance = player_pos.distance(spider.pos);
                     let bump = (11.0 * CREATURE_SCALE - distance).max(1.5 * CREATURE_SCALE);
@@ -634,8 +1012,150 @@ impl Game {
             }
         }
 
-        let half_w = self.camera.screen_width / (2.0 * self.camera.zoom);
-        let half_h = self.camera.screen_height / (2.0 * self.camera.zoom);
+        // Update wisps and collect collisions
+        for (i, wisp) in self.wisps.iter_mut().enumerate() {
+            if wisp.alive {
+                if run_enemy_ai {
+                    let target = Self::find_closest_target(wisp.pos, target_positions);
+                    let prev_pos = wisp.pos;
+                    let prev_dir = wisp.dir;
+                    wisp.update_infinite(target, &self.chunks);
+                    if self.slow_spawn_timer > 0 {
+                        let dist = wisp.pos.distance(self.player.pos);
+                        let falloff = (1.0 - dist / max_slow_dist).clamp(0.0, 1.0);
+                        let slow_factor = 1.0 - 0.5 * falloff;
+                        let delta = wisp.pos - prev_pos;
+                        wisp.pos = prev_pos + delta * slow_factor;
+                        wisp.dir = prev_dir;
+                    }
+                }
+
+                if Self::trail_hits_enemy_segments(trail_segments, wisp.pos, wisp.radius() * CREATURE_SCALE) {
+                    killed_wisps.push(i);
+                } else if self.player.collide_attack(wisp.pos, wisp.radius() * CREATURE_SCALE) {
+                    killed_wisps.push(i);
+                    attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
+                } else if self.player.collide_block(wisp.pos, (wisp.radius() - 2.0) * CREATURE_SCALE) {
+                    let distance = player_pos.distance(wisp.pos);
+                    let bump = (9.0 * CREATURE_SCALE - distance).max(1.0 * CREATURE_SCALE);
+                    wisp_bumps.push((i, player_look_dir, bump));
+                } else if self.player.collide_body(wisp.pos, (wisp.radius() - 2.0) * CREATURE_SCALE) {
+                    player_killed = true;
+                    if player_killed_by.is_none() {
+                        player_killed_by = Some((4, wisp.id as u16));
+                    }
+                }
+            }
+        }
+
+        // Update guardians and collect collisions
+        for (i, guardian) in self.guardians.iter_mut().enumerate() {
+            if guardian.alive {
+                let mut weighted_target = guardian.pos;
+                if !target_positions.is_empty() {
+                    let mut sum = Vec2::ZERO;
+                    let mut weight_sum = 0.0;
+                    for pos in target_positions {
+                        let dist = guardian.pos.distance(*pos);
+                        let weight = 1.0 / (1.0 + dist);
+                        sum += *pos * weight;
+                        weight_sum += weight;
+                    }
+                    if weight_sum > 0.0 {
+                        weighted_target = sum / weight_sum;
+                    }
+                }
+                let closest_target = Self::find_closest_target(guardian.pos, target_positions);
+                if run_enemy_ai {
+                    let home = guardian.home_pos;
+                    let dist_from_home = guardian.pos.distance(home);
+                    let leash_strength = (dist_from_home / 200.0).clamp(0.0, 1.0);
+                    let target = weighted_target * (0.7 - 0.3 * leash_strength) + home * (0.3 + 0.3 * leash_strength);
+                    let prev_pos = guardian.pos;
+                    let prev_speed = guardian.speed;
+                    guardian.update_infinite(target, &self.chunks);
+                    if self.slow_spawn_timer > 0 {
+                        let dist = guardian.pos.distance(self.player.pos);
+                        let falloff = (1.0 - dist / max_slow_dist).clamp(0.0, 1.0);
+                        let slow_factor = 1.0 - 0.5 * falloff;
+                        let delta = guardian.pos - prev_pos;
+                        guardian.pos = prev_pos + delta * slow_factor;
+                        guardian.speed = prev_speed * slow_factor;
+                    }
+                }
+                let strike_dir = (closest_target - guardian.pos).normalize();
+                let strike_dir = if strike_dir.length() == 0.0 { Vec2::new(0.0, -1.0) } else { strike_dir };
+                guardian.update_strike(closest_target, strike_dir);
+                guardian.update_tentacles(target_positions, &self.chunks, frame_count);
+
+                if Self::trail_hits_enemy_segments(trail_segments, guardian.pos, guardian.radius() * CREATURE_SCALE) {
+                    if !guardian_damaged[i] {
+                        if guardian.take_damage(1) {
+                            killed_guardians.push(i);
+                        }
+                        guardian_damaged[i] = true;
+                    }
+                } else if self.player.collide_attack(guardian.pos, guardian.radius() * CREATURE_SCALE) {
+                    if !guardian_damaged[i] {
+                        if guardian.take_damage(1) {
+                            killed_guardians.push(i);
+                        }
+                        attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
+                        guardian_damaged[i] = true;
+                    }
+                } else if self.player.collide_block(guardian.pos, guardian.radius() * CREATURE_SCALE) {
+                    let distance = player_pos.distance(guardian.pos);
+                    let bump = (14.0 * CREATURE_SCALE - distance).max(2.0 * CREATURE_SCALE);
+                    guardian_bumps.push((i, player_look_dir, bump));
+                } else {
+                    for (tent_idx, tip_pos) in guardian.tentacle_tip_positions() {
+                        if self.player.collide_block(tip_pos, crate::entities::Guardian::tentacle_hit_radius() * CREATURE_SCALE) {
+                            let normal = (tip_pos - self.player.pos).normalize();
+                            guardian.bounce_tentacle(tent_idx, normal);
+                        }
+                    }
+                    let mut bounce_requests: Vec<(usize, Vec2)> = Vec::new();
+                    let tentacle_radius = crate::entities::Guardian::tentacle_hit_radius() * CREATURE_SCALE;
+                    let body_radius = 4.5 * CREATURE_SCALE + tentacle_radius;
+                    let body_vulnerable = self.player.alive && !self.player.is_phasing() && !self.player.is_shielded();
+                    for tentacle in guardian.tentacle_paths() {
+                        for seg_idx in 1..tentacle.joints.len() {
+                            let a = tentacle.joints[seg_idx - 1];
+                            let b = tentacle.joints[seg_idx];
+                            let closest = Self::closest_point_on_segment(self.player.pos, a, b);
+                            if self.player.collide_block(closest, tentacle_radius) {
+                                let normal = (closest - self.player.pos).normalize();
+                                bounce_requests.push((tentacle.mode as usize, normal));
+                                continue;
+                            }
+                            if body_vulnerable && Self::distance_point_to_segment(self.player.pos, a, b) <= body_radius {
+                                player_killed = true;
+                                if player_killed_by.is_none() {
+                                    player_killed_by = Some((5, guardian.id as u16));
+                                }
+                            }
+                        }
+                    }
+                    for (idx, normal) in bounce_requests {
+                        guardian.bounce_tentacle(idx, normal);
+                    }
+                    if guardian.strike_active()
+                        && guardian.pos.distance(self.player.pos) <= guardian.strike_range() * 1.25
+                        && guardian.strike_points().iter().any(|pos| self.player.collide_body(*pos, 6.0 * CREATURE_SCALE))
+                    {
+                        player_killed = true;
+                        if player_killed_by.is_none() {
+                            player_killed_by = Some((5, guardian.id as u16));
+                        }
+                    } else if self.player.collide_body(guardian.pos, guardian.radius() * CREATURE_SCALE) {
+                        player_killed = true;
+                        if player_killed_by.is_none() {
+                            player_killed_by = Some((5, guardian.id as u16));
+                        }
+                    }
+                }
+            }
+        }
 
         // Update cannons and collect collisions (with obstacle awareness)
         for (i, cannon) in self.cannons.iter_mut().enumerate() {
@@ -649,7 +1169,16 @@ impl Game {
                             && cannon.pos.y - 50.0 <= target.y + half_h
                     });
                     let target = Self::find_closest_target(cannon.pos, target_positions);
-                    if let Some(event) = cannon.update_infinite(target, frame_count, on_screen, &self.chunks) {
+                    let mut event = cannon.update_infinite(target, frame_count, on_screen, &self.chunks);
+                    if self.slow_spawn_timer > 0 {
+                        let dist = cannon.pos.distance(self.player.pos);
+                        let falloff = (1.0 - dist / max_slow_dist).clamp(0.0, 1.0);
+                        let slow_factor = 1.0 - 0.5 * falloff;
+                        if slow_factor < 0.75 && frame_count % 2 == 0 {
+                            event = None;
+                        }
+                    }
+                    if let Some(event) = event {
                         match event {
                             CannonEvent::Shoot { pos, speed } => {
                                 new_projectiles.push((pos, speed, 80));
@@ -664,8 +1193,11 @@ impl Game {
                     }
                 }
 
-                if self.player.collide_attack(cannon.pos, cannon.radius()) {
+                if Self::trail_hits_enemy_segments(trail_segments, cannon.pos, cannon.radius()) {
                     killed_cannons.push(i);
+                } else if self.player.collide_attack(cannon.pos, cannon.radius()) {
+                    killed_cannons.push(i);
+                    attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
                 } else if self.player.collide_block(cannon.pos, cannon.radius() - 4.0) {
                     let distance = player_pos.distance(cannon.pos);
                     let bump = (11.5 - distance).max(1.5);
@@ -683,7 +1215,10 @@ impl Game {
         if run_enemy_ai {
             for i in (0..self.snakes.len()).rev() {
                 if self.snakes[i].alive {
-                    let previous = if i > 0 && self.snakes[i - 1].alive {
+                    let previous = if i > 0
+                        && self.snakes[i - 1].alive
+                        && self.snakes[i - 1].chain_id == self.snakes[i].chain_id
+                    {
                         Some(self.snakes[i - 1].clone())
                     } else {
                         None
@@ -694,7 +1229,17 @@ impl Game {
                     } else {
                         player_pos // segments follow previous, target is only used if no previous
                     };
+                    let prev_pos = self.snakes[i].pos;
+                    let prev_speed = self.snakes[i].speed;
                     self.snakes[i].update(target, previous.as_ref());
+                    if self.slow_spawn_timer > 0 {
+                        let dist = self.snakes[i].pos.distance(self.player.pos);
+                        let falloff = (1.0 - dist / max_slow_dist).clamp(0.0, 1.0);
+                        let slow_factor = 1.0 - 0.5 * falloff;
+                        let delta = self.snakes[i].pos - prev_pos;
+                        self.snakes[i].pos = prev_pos + delta * slow_factor;
+                        self.snakes[i].speed = prev_speed * slow_factor;
+                    }
                 }
             }
         }
@@ -702,8 +1247,11 @@ impl Game {
         // Check snake collisions separately
         for (i, snake) in self.snakes.iter().enumerate() {
             if snake.alive {
-                if self.player.collide_attack(snake.pos, snake.radius() * CREATURE_SCALE) {
+                if Self::trail_hits_enemy_segments(trail_segments, snake.pos, snake.radius() * CREATURE_SCALE) {
                     killed_snakes.push(i);
+                } else if self.player.collide_attack(snake.pos, snake.radius() * CREATURE_SCALE) {
+                    killed_snakes.push(i);
+                    attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
                 } else if self.player.collide_block(snake.pos, snake.radius() * CREATURE_SCALE) {
                     let distance = player_pos.distance(snake.pos);
                     let bump = (8.5 * CREATURE_SCALE + snake.radius() * CREATURE_SCALE - distance)
@@ -720,6 +1268,17 @@ impl Game {
             }
         }
 
+        for (i, dir, amount) in guardian_bumps {
+            if i < self.guardians.len() {
+                self.guardians[i].pos += dir * amount;
+            }
+        }
+
+        if attack_hits_this_frame > 0 {
+            self.attack_hits = self.attack_hits.saturating_add(attack_hits_this_frame);
+            self.pending_attack_hits = self.pending_attack_hits.saturating_add(attack_hits_this_frame);
+        }
+
         // Update projectiles (with obstacle collision)
         self.projectiles.update_with_collision(&self.chunks);
 
@@ -733,6 +1292,12 @@ impl Game {
                 continue;
             }
             if projectile.hostile {
+                if self.player.is_shielded()
+                    && projectile.pos.distance(self.player.pos) < 8.0 * CREATURE_SCALE
+                {
+                    projectiles_to_reflect.push(idx);
+                    continue;
+                }
                 // Original uses radius 3 for attack/block, radius 1 for body
                 if self.player.collide_attack(projectile.pos, 3.0 * CREATURE_SCALE) {
                     projectiles_to_kill.push(idx);
@@ -761,6 +1326,21 @@ impl Game {
                         killed_snakes.push(i);
                     }
                 }
+        for (i, wisp) in self.wisps.iter().enumerate() {
+            if wisp.alive && projectile.pos.distance(wisp.pos) < wisp.radius() * CREATURE_SCALE && !killed_wisps.contains(&i) {
+                killed_wisps.push(i);
+            }
+        }
+                for (i, guardian) in self.guardians.iter_mut().enumerate() {
+                    if guardian.alive && projectile.pos.distance(guardian.pos) < guardian.radius() * CREATURE_SCALE {
+                        if i < guardian_damaged.len() && !guardian_damaged[i] {
+                            if guardian.take_damage(1) {
+                                killed_guardians.push(i);
+                            }
+                            guardian_damaged[i] = true;
+                        }
+                    }
+                }
             }
         }
 
@@ -775,7 +1355,7 @@ impl Game {
         }
 
         // Apply all collected actions (blocking bumps enemies)
-        if !spider_bumps.is_empty() || !cannon_bumps.is_empty() || !snake_bumps.is_empty() {
+        if !spider_bumps.is_empty() || !cannon_bumps.is_empty() || !snake_bumps.is_empty() || !wisp_bumps.is_empty() {
             self.sound_events.push(SoundEvent::Block);
         }
         for (i, dir, amount) in spider_bumps {
@@ -787,9 +1367,199 @@ impl Game {
         for (i, dir, amount) in snake_bumps {
             self.snakes[i].bump(dir, amount);
         }
+        for (i, dir, amount) in wisp_bumps {
+            self.wisps[i].bump(dir, amount);
+        }
 
         // Kill enemies and spawn explosions
         // Also track kills for network reporting
+        for i in killed_spiders {
+            let pos = self.spiders[i].pos;
+            let enemy_id = self.spiders[i].id as u16;
+            self.spiders[i].kill();
+            self.kills += 1;
+            self.spider_kills += 1;
+            self.wave_kill_counts[0] = self.wave_kill_counts[0].saturating_add(1);
+            self.explosions.spawn(pos, 7, 0, 0);
+            self.sound_events.push(SoundEvent::EnemyKill);
+            self.pending_enemy_kills.push((crate::net::EnemyType::Spider, enemy_id));
+        }
+        for i in killed_cannons {
+            let pos = self.cannons[i].pos;
+            let enemy_id = self.cannons[i].id as u16;
+            self.cannons[i].kill();
+            self.kills += 1;
+            self.cannon_kills += 1;
+            self.wave_kill_counts[1] = self.wave_kill_counts[1].saturating_add(1);
+            self.explosions.spawn(pos, 8, 0, 0);
+            self.sound_events.push(SoundEvent::EnemyKill);
+            self.pending_enemy_kills.push((crate::net::EnemyType::Cannon, enemy_id));
+        }
+        for i in killed_snakes {
+            let pos = self.snakes[i].pos;
+            let enemy_id = self.snakes[i].id as u16;
+            self.snakes[i].kill();
+            self.kills += 1;
+            self.snake_kills += 1;
+            self.wave_kill_counts[2] = self.wave_kill_counts[2].saturating_add(1);
+            self.explosions.spawn(pos, 9, 0, 0);
+            self.sound_events.push(SoundEvent::EnemyKill);
+            self.pending_enemy_kills.push((crate::net::EnemyType::Snake, enemy_id));
+        }
+        for i in killed_wisps {
+            let pos = self.wisps[i].pos;
+            let enemy_id = self.wisps[i].id as u16;
+            self.wisps[i].kill();
+            self.kills += 1;
+            self.wisp_kills += 1;
+            self.wave_kill_counts[3] = self.wave_kill_counts[3].saturating_add(1);
+            self.explosions.spawn(pos, 6, 0, 0);
+            self.sound_events.push(SoundEvent::EnemyKill);
+            self.pending_enemy_kills.push((crate::net::EnemyType::Wisp, enemy_id));
+        }
+        for i in killed_guardians {
+            let pos = self.guardians[i].pos;
+            let enemy_id = self.guardians[i].id as u16;
+            self.guardians[i].alive = false;
+            self.kills += 1;
+            self.guardian_kills += 1;
+            self.explosions.spawn(pos, 12, 0, 0);
+            self.sound_events.push(SoundEvent::EnemyKill);
+            self.pending_enemy_kills.push((crate::net::EnemyType::Guardian, enemy_id));
+        }
+
+        // Spawn cannon projectiles
+        for (pos, speed, duration) in new_projectiles {
+            self.projectiles.spawn(pos, speed, duration);
+        }
+
+        // Kill player if needed
+        if player_killed && self.player.alive {
+            self.kill_player(player_killed_by);
+        }
+
+        // Update explosions
+        self.explosions.update();
+
+        // Check for wave progression based on kill target
+        if run_enemy_ai && self.wave_targets_met() {
+            self.spawn_wave_for_players(player_count, target_positions);
+        }
+    }
+
+    fn spawn_wave(&mut self) {
+        // Default to 1 player (solo play) - multiplayer will use spawn_wave_for_players
+        let target_positions = [self.player.pos];
+        self.spawn_wave_for_players(1, &target_positions);
+    }
+
+    fn check_shrine_boss(&mut self, target_positions: &[Vec2], run_enemy_ai: bool, view_radius: f32) {
+        if self.shrine_triggered || !run_enemy_ai {
+            return;
+        }
+        let triggered = target_positions
+            .iter()
+            .any(|pos| pos.distance(SHRINE_POS) <= view_radius);
+        if triggered {
+            self.spawn_shrine_boss(SHRINE_POS);
+            self.shrine_triggered = true;
+        }
+    }
+
+    fn spawn_shrine_boss(&mut self, center: Vec2) {
+        let mut spawned = 0;
+        for _ in 0..3 {
+            if self.spawn_enemy_at(crate::net::EnemyType::Spider, center, 80.0) {
+                spawned += 1;
+            }
+        }
+        for _ in 0..1 {
+            if self.spawn_enemy_at(crate::net::EnemyType::Cannon, center, 120.0) {
+                spawned += 1;
+            }
+        }
+        for _ in 0..6 {
+            if self.spawn_enemy_at(crate::net::EnemyType::Wisp, center, 70.0) {
+                spawned += 1;
+            }
+        }
+        let guardian_id = self.guardians.len();
+        self.guardians.push(Guardian::new_at_position(guardian_id, center));
+        if spawned > 0 {
+            self.sound_events.push(SoundEvent::Explosion);
+        }
+    }
+
+    fn spawn_enemy_at(&mut self, enemy_type: crate::net::EnemyType, center: Vec2, spread: f32) -> bool {
+        for _ in 0..10 {
+            let angle = self.rng.gen::<f32>() * std::f32::consts::TAU;
+            let distance = self.rng.gen::<f32>() * spread;
+            let pos = Vec2::new(center.x + angle.cos() * distance, center.y + angle.sin() * distance);
+            if self.chunks.collides_with_obstacle(pos, 10.0) {
+                continue;
+            }
+            match enemy_type {
+                crate::net::EnemyType::Spider => {
+                    let id = self.spiders.len();
+                    self.spiders.push(Spider::new_at_position(id, pos, &mut self.rng));
+                }
+                crate::net::EnemyType::Cannon => {
+                    let id = self.cannons.len();
+                    self.cannons.push(Cannon::new_at_position(id, pos, &mut self.rng));
+                }
+                crate::net::EnemyType::Snake => {
+                    let id = self.snakes.len();
+                    self.snakes.push(Snake::new_at_position(id, None, pos));
+                }
+                crate::net::EnemyType::Wisp => {
+                    let id = self.wisps.len();
+                    self.wisps.push(Wisp::new_at_position(id, pos, &mut self.rng));
+                }
+                crate::net::EnemyType::Guardian => {
+                    let id = self.guardians.len();
+                    self.guardians.push(Guardian::new_at_position(id, pos));
+                }
+            }
+            return true;
+        }
+        false
+    }
+
+    fn trigger_shockwave(&mut self, radius: f32) {
+        if radius <= 0.0 {
+            return;
+        }
+        let center = self.player.pos;
+        self.shockwave_timer = 12;
+        self.shockwave_cooldown = 420;
+        self.sound_events.push(SoundEvent::Explosion);
+
+        let mut killed_spiders: Vec<usize> = Vec::new();
+        let mut killed_cannons: Vec<usize> = Vec::new();
+        let mut killed_snakes: Vec<usize> = Vec::new();
+        let mut killed_wisps: Vec<usize> = Vec::new();
+
+        for (i, spider) in self.spiders.iter().enumerate() {
+            if spider.alive && spider.pos.distance(center) < radius {
+                killed_spiders.push(i);
+            }
+        }
+        for (i, cannon) in self.cannons.iter().enumerate() {
+            if cannon.alive && cannon.pos.distance(center) < radius {
+                killed_cannons.push(i);
+            }
+        }
+        for (i, snake) in self.snakes.iter().enumerate() {
+            if snake.alive && snake.pos.distance(center) < radius {
+                killed_snakes.push(i);
+            }
+        }
+        for (i, wisp) in self.wisps.iter().enumerate() {
+            if wisp.alive && wisp.pos.distance(center) < radius {
+                killed_wisps.push(i);
+            }
+        }
+
         for i in killed_spiders {
             let pos = self.spiders[i].pos;
             let enemy_id = self.spiders[i].id as u16;
@@ -820,80 +1590,187 @@ impl Game {
             self.sound_events.push(SoundEvent::EnemyKill);
             self.pending_enemy_kills.push((crate::net::EnemyType::Snake, enemy_id));
         }
-
-        // Spawn cannon projectiles
-        for (pos, speed, duration) in new_projectiles {
-            self.projectiles.spawn(pos, speed, duration);
-        }
-
-        // Kill player if needed
-        if player_killed && self.player.alive {
-            self.kill_player(player_killed_by);
-        }
-
-        // Update explosions
-        self.explosions.update();
-
-        // Check for wave progression based on kill target
-        if run_enemy_ai && self.wave_targets_met() {
-            self.spawn_wave_for_players(player_count);
+        for i in killed_wisps {
+            let pos = self.wisps[i].pos;
+            let enemy_id = self.wisps[i].id as u16;
+            self.wisps[i].kill();
+            self.kills += 1;
+            self.wave_kill_counts[3] = self.wave_kill_counts[3].saturating_add(1);
+            self.explosions.spawn(pos, 6, 0, 0);
+            self.sound_events.push(SoundEvent::EnemyKill);
+            self.pending_enemy_kills.push((crate::net::EnemyType::Wisp, enemy_id));
         }
     }
 
-    fn spawn_wave(&mut self) {
-        // Default to 1 player (solo play) - multiplayer will use spawn_wave_for_players
-        self.spawn_wave_for_players(1);
+    fn update_slime_trail(&mut self) {
+        if self.trail_timer > 0 {
+            if self.frame_count.saturating_sub(self.last_trail_frame) >= 6 {
+                let pos = self.player.pos;
+                if !self.chunks.collides_with_obstacle(pos, 6.0) {
+                    let obstacle = crate::world::Obstacle {
+                        pos,
+                        radius: 8.0,
+                        variant: 3,
+                    };
+                    self.trail_segments.push(SlimeTrailSegment {
+                        obstacle,
+                        expires_frame: self.frame_count + 480,
+                    });
+                    self.last_trail_frame = self.frame_count;
+                }
+            }
+        }
+
+        if !self.trail_segments.is_empty() {
+            let current = self.frame_count;
+            let mut i = 0;
+            while i < self.trail_segments.len() {
+                if self.trail_segments[i].expires_frame <= current {
+                    let segment = self.trail_segments.remove(i);
+                    let _ = segment;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    fn trail_hits_enemy_segments(trail_segments: &[SlimeTrailSegment], pos: Vec2, radius: f32) -> bool {
+        for segment in trail_segments {
+            if pos.distance(segment.pos()) < radius + segment.radius() {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn distance_point_to_segment(point: Vec2, a: Vec2, b: Vec2) -> f32 {
+        let ab = b - a;
+        let ap = point - a;
+        let ab_len_sq = ab.dot(ab);
+        if ab_len_sq == 0.0 {
+            return ap.length();
+        }
+        let mut t = ap.dot(ab) / ab_len_sq;
+        if t < 0.0 {
+            t = 0.0;
+        } else if t > 1.0 {
+            t = 1.0;
+        }
+        let closest = a + ab * t;
+        point.distance(closest)
+    }
+
+    fn closest_point_on_segment(point: Vec2, a: Vec2, b: Vec2) -> Vec2 {
+        let ab = b - a;
+        let ap = point - a;
+        let ab_len_sq = ab.dot(ab);
+        if ab_len_sq == 0.0 {
+            return a;
+        }
+        let mut t = ap.dot(ab) / ab_len_sq;
+        if t < 0.0 {
+            t = 0.0;
+        } else if t > 1.0 {
+            t = 1.0;
+        }
+        a + ab * t
     }
 
     /// Spawn a wave scaled by player count
     /// Uses EXACT original formula scaled by player count:
     /// - Original: 160x160 = 25,600 px² visible area
     /// - Our game has a larger viewport, so we multiply by player count
-    pub fn spawn_wave_for_players(&mut self, player_count: usize) {
+    pub fn spawn_wave_for_players(&mut self, player_count: usize, target_positions: &[Vec2]) {
         self.wave += 1;
 
+        let rng_seed = self.rng.next_u64();
+        self.rng = Xoshiro256PlusPlus::seed_from_u64(rng_seed);
+
         let player_scale = player_count.max(1) as u32;
-        let (base_spiders, base_cannons, base_snakes) = Self::wave_base_counts(self.wave);
+        let (base_spiders, base_cannons, base_snakes, base_wisps) = Self::wave_base_counts(self.wave);
         let spider_count = base_spiders.saturating_mul(player_scale) as usize;
         let cannon_count = base_cannons.saturating_mul(player_scale) as usize;
-        let snake_count = base_snakes.saturating_mul(player_scale) as usize;
+        let wisp_count = base_wisps.saturating_mul(player_scale) as usize;
+        let snake_chain_target = base_snakes.saturating_mul(player_scale) as usize;
+        let snake_chain_len = if base_snakes > 0 {
+            ((self.wave / 2).max(1)).min(50) as usize
+        } else {
+            0
+        };
+        let snake_segment_target = snake_chain_target.saturating_mul(snake_chain_len);
 
-        self.wave_kill_counts = [0; 3];
+        self.wave_kill_counts = [0; 4];
         self.wave_kill_targets = [
             spider_count as u32,
             cannon_count as u32,
-            snake_count as u32,
+            snake_segment_target as u32,
+            wisp_count as u32,
         ];
+        self.snake_chain_len = snake_chain_len;
+        self.snake_chain_target = snake_chain_target;
+        self.snake_chain_spawned = self.count_snake_chains();
         self.spawn_chunk_last_frame.clear();
         self.spawn_progress = 0.0;
         self.last_spawn_positions.clear();
-        self.last_spawn_positions.push(self.player.pos);
+        self.spawn_budget = 0.0;
+        self.next_spawn_frame = self.frame_count;
+        self.last_spawn_positions = target_positions.to_vec();
 
-        // Initial spawn so wave starts with enemies.
-        let target_positions = [self.player.pos];
-        self.spawn_enemies_for_movement(&target_positions, player_count, self.frame_count);
+        if self.snake_chain_target > 0 && self.snake_chain_len > 0 {
+            if self.spawn_snake_chain(target_positions, self.snake_chain_len, self.frame_count) {
+                self.snake_chain_spawned = self.snake_chain_spawned.saturating_add(1);
+                self.next_snake_chain_id = self.next_snake_chain_id.wrapping_add(1);
+            }
+        }
+
+        // Initial spawn so wave starts with enemies, but keep it smooth.
+        self.spawn_initial_enemies(target_positions, player_count, self.frame_count);
 
         // Create wave start event for network broadcast
         let wave_start = crate::net::WaveStart {
             wave: self.wave,
             spider_count: spider_count as u16,
             cannon_count: cannon_count as u16,
-            snake_count: snake_count as u16,
+            snake_count: snake_segment_target.min(u16::MAX as usize) as u16,
+            wisp_count: wisp_count as u16,
             spawn_x: self.player.pos.x,
             spawn_y: self.player.pos.y,
-            rng_seed: 0,
+            rng_seed,
         };
         self.pending_wave_start = Some(wave_start);
         self.last_wave_start = Some(wave_start);
     }
 
     /// Spawn a wave using a specific RNG seed (for deterministic multiplayer)
-    pub fn spawn_wave_with_seed(&mut self, rng_seed: u64, spider_count: usize, cannon_count: usize, snake_count: usize) {
+    pub fn spawn_wave_with_seed(
+        &mut self,
+        rng_seed: u64,
+        spider_count: usize,
+        cannon_count: usize,
+        snake_count: usize,
+        wisp_count: usize,
+    ) {
         let player_pos = self.player.pos;
-        self.spawn_wave_with_seed_at(rng_seed, spider_count, cannon_count, snake_count, player_pos);
+        self.spawn_wave_with_seed_at(
+            rng_seed,
+            spider_count,
+            cannon_count,
+            snake_count,
+            wisp_count,
+            player_pos,
+        );
     }
 
-    pub fn spawn_wave_with_seed_at(&mut self, rng_seed: u64, spider_count: usize, cannon_count: usize, snake_count: usize, player_pos: Vec2) {
+    pub fn spawn_wave_with_seed_at(
+        &mut self,
+        rng_seed: u64,
+        spider_count: usize,
+        cannon_count: usize,
+        snake_count: usize,
+        wisp_count: usize,
+        player_pos: Vec2,
+    ) {
         // Set RNG to the shared seed
         self.rng = Xoshiro256PlusPlus::seed_from_u64(rng_seed);
 
@@ -901,6 +1778,8 @@ impl Game {
         self.spiders.clear();
         self.cannons.clear();
         self.snakes.clear();
+        self.wisps.clear();
+        self.guardians.clear();
 
         // Spawn enemies around the player position (in infinite world)
         // Use validated spawning to avoid placing enemies in obstacles
@@ -924,20 +1803,52 @@ impl Game {
                 id, previous, player_pos, spawn_distance, &self.chunks, &mut self.rng
             ));
         }
+
+        for id in 0..wisp_count {
+            let mut pos = player_pos;
+            for _ in 0..10 {
+                let angle = self.rng.gen::<f32>() * std::f32::consts::TAU;
+                let distance = spawn_distance + self.rng.gen::<f32>() * 100.0;
+                pos = Vec2::new(
+                    player_pos.x + angle.cos() * distance,
+                    player_pos.y + angle.sin() * distance,
+                );
+                if !self.chunks.collides_with_obstacle(pos, 8.0) && pos.distance(player_pos) > 50.0 {
+                    break;
+                }
+            }
+            self.wisps.push(Wisp::new_at_position(id, pos, &mut self.rng));
+        }
     }
 
     /// Apply a wave start event from the network
     pub fn apply_wave_start(&mut self, wave_start: &crate::net::WaveStart) {
         self.wave = wave_start.wave;
-        self.wave_kill_counts = [0; 3];
+        self.rng = Xoshiro256PlusPlus::seed_from_u64(wave_start.rng_seed);
+        self.wave_kill_counts = [0; 4];
         self.wave_kill_targets = [
             wave_start.spider_count as u32,
             wave_start.cannon_count as u32,
             wave_start.snake_count as u32,
+            wave_start.wisp_count as u32,
         ];
+        self.snake_chain_len = if self.wave % 10 == 0 {
+            ((self.wave / 2).max(1)).min(50) as usize
+        } else {
+            0
+        };
+        if self.snake_chain_len > 0 {
+            let total_segments = wave_start.snake_count as usize;
+            self.snake_chain_target = (total_segments + self.snake_chain_len - 1) / self.snake_chain_len;
+        } else {
+            self.snake_chain_target = 0;
+        }
+        self.snake_chain_spawned = self.count_snake_chains();
         self.spawn_chunk_last_frame.clear();
         self.spawn_progress = 0.0;
         self.last_spawn_positions.clear();
+        self.spawn_budget = 0.0;
+        self.next_spawn_frame = self.frame_count;
     }
 
     /// Take pending wave start event (for network broadcast)
@@ -957,6 +1868,7 @@ impl Game {
                 killed_by_type,
                 killed_by_id,
                 victim_hash: 0,
+                event_id: 0,
             });
             self.explosions.spawn(self.player.pos, 25, 0, 0);
             self.explosions.spawn(self.player.pos, 27, -3, 0);
@@ -1009,6 +1921,10 @@ impl Game {
         if !self.player_list_open {
             self.player_list_search_active = false;
         }
+    }
+
+    pub fn toggle_net_debug_overlay(&mut self) {
+        self.net_debug_overlay = !self.net_debug_overlay;
     }
 
     pub fn toggle_chat(&mut self) {
@@ -1301,15 +2217,15 @@ impl Game {
             Err(_) => return false,
         };
 
-        self.map_center = Vec2::new(x, y);
+        self.map_center = Vec2::new(x * COORD_DISPLAY_INV, y * COORD_DISPLAY_INV);
         self.map_target = Some(self.map_center);
         self.update_map_inputs_from_center();
         true
     }
 
     fn update_map_inputs_from_center(&mut self) {
-        self.map_input_x = format!("{:.0}", self.map_center.x);
-        self.map_input_y = format!("{:.0}", self.map_center.y);
+        self.map_input_x = format!("{:.1}", self.map_center.x * COORD_DISPLAY_SCALE);
+        self.map_input_y = format!("{:.1}", self.map_center.y * COORD_DISPLAY_SCALE);
     }
 
     fn try_update_map_center_from_inputs(&mut self) {
@@ -1317,7 +2233,7 @@ impl Game {
             self.map_input_x.trim().parse::<f32>(),
             self.map_input_y.trim().parse::<f32>(),
         ) {
-            self.map_center = Vec2::new(x, y);
+            self.map_center = Vec2::new(x * COORD_DISPLAY_INV, y * COORD_DISPLAY_INV);
             self.map_target = Some(self.map_center);
         }
     }
@@ -1404,6 +2320,130 @@ impl Game {
         std::mem::take(&mut self.pending_paid_obstacles)
     }
 
+    pub fn request_paid_ability(&mut self, ability_type: crate::net::PaidAbilityType) -> bool {
+        if self
+            .pending_paid_ability_requests
+            .iter()
+            .any(|req| req.ability_type as u8 == ability_type as u8)
+        {
+            return false;
+        }
+        if !payment::support_valid() {
+            payment::prompt_support();
+            self.push_chat_line("System".to_string(), "Payment required for paid ability. Press 4 to open payments.".to_string());
+            return false;
+        }
+        match ability_type {
+            crate::net::PaidAbilityType::BubbleShield => {
+                if self.player.shield_cooldown > 0 || self.player.shield_timer > 0 {
+                    return false;
+                }
+            }
+            crate::net::PaidAbilityType::Shockwave => {
+                if self.shockwave_cooldown > 0 {
+                    return false;
+                }
+            }
+            crate::net::PaidAbilityType::SlowSpawn => {
+                if self.slow_spawn_cooldown > 0 || self.slow_spawn_timer > 0 {
+                    return false;
+                }
+            }
+            crate::net::PaidAbilityType::SpeedBoost => {
+                if self.speed_boost_cooldown > 0 || self.speed_boost_timer > 0 {
+                    return false;
+                }
+            }
+            crate::net::PaidAbilityType::SlimeTrail => {
+                if self.trail_cooldown > 0 || self.trail_timer > 0 {
+                    return false;
+                }
+            }
+        }
+
+        let pos = self.player.pos;
+        let radius = match ability_type {
+            crate::net::PaidAbilityType::BubbleShield => 0.0,
+            crate::net::PaidAbilityType::Shockwave => 70.0,
+            crate::net::PaidAbilityType::SlowSpawn => 0.0,
+            crate::net::PaidAbilityType::SpeedBoost => 0.0,
+            crate::net::PaidAbilityType::SlimeTrail => 0.0,
+        };
+        let nonce = self.frame_count;
+        self.pending_paid_ability_requests.push(PendingPaidAbilityRequest {
+            ability_type,
+            x: pos.x,
+            y: pos.y,
+            radius,
+            nonce,
+        });
+        true
+    }
+
+    pub fn take_paid_ability_requests(&mut self) -> Vec<PendingPaidAbilityRequest> {
+        std::mem::take(&mut self.pending_paid_ability_requests)
+    }
+
+    pub fn store_paid_ability_candidate(&mut self, ability: crate::net::PaidAbility) {
+        self.pending_paid_ability_candidates
+            .insert(ability.proof_hash, ability);
+    }
+
+    pub fn take_paid_ability_candidate(&mut self, proof_hash: [u8; 32]) -> Option<crate::net::PaidAbility> {
+        self.pending_paid_ability_candidates.remove(&proof_hash)
+    }
+
+    pub fn pending_paid_ability_hashes(&self) -> Vec<[u8; 32]> {
+        self.pending_paid_ability_candidates.keys().copied().collect()
+    }
+
+    pub fn apply_paid_ability(&mut self, ability: crate::net::PaidAbility, is_local: bool) -> bool {
+        if self.paid_ability_hashes.contains(&ability.proof_hash) {
+            return false;
+        }
+        self.paid_ability_hashes.insert(ability.proof_hash);
+
+        match crate::net::PaidAbilityType::from_u8(ability.ability_type) {
+            Some(crate::net::PaidAbilityType::BubbleShield) => {
+                if is_local {
+                    if self.player.try_activate_shield() {
+                        self.sound_events.push(SoundEvent::Phase);
+                    }
+                }
+                true
+            }
+            Some(crate::net::PaidAbilityType::Shockwave) => {
+                if is_local {
+                    self.trigger_shockwave(ability.radius);
+                }
+                true
+            }
+            Some(crate::net::PaidAbilityType::SlowSpawn) => {
+                if is_local {
+                    self.slow_spawn_timer = 300;
+                    self.slow_spawn_cooldown = 120;
+                }
+                true
+            }
+            Some(crate::net::PaidAbilityType::SpeedBoost) => {
+                if is_local {
+                    if self.player.try_activate_speed_boost(240, 120) {
+                        self.sound_events.push(SoundEvent::Phase);
+                    }
+                }
+                true
+            }
+            Some(crate::net::PaidAbilityType::SlimeTrail) => {
+                if is_local {
+                    self.trail_timer = 300;
+                    self.trail_cooldown = 120;
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn take_pending_cannon_shots(&mut self) -> Vec<crate::net::CannonShot> {
         std::mem::take(&mut self.pending_cannon_shots)
     }
@@ -1432,6 +2472,15 @@ impl Game {
         self.start_frame = self.frame_count;
         self.wave = 0;
         self.kills = 0;
+        self.spider_kills = 0;
+        self.cannon_kills = 0;
+        self.snake_kills = 0;
+        self.wisp_kills = 0;
+        self.guardian_kills = 0;
+        self.attack_attempts = 0;
+        self.attack_hits = 0;
+        self.pending_attack_attempts = 0;
+        self.pending_attack_hits = 0;
         self.deaths = 0;
         self.player = Player::new_at_position(Vec2::ZERO);
         self.camera = Camera::new(self.width, self.height, CAMERA_ZOOM);
@@ -1450,13 +2499,20 @@ impl Game {
         self.paid_obstacle_map.clear();
         self.pending_paid_obstacle_candidates.clear();
         self.pending_paid_obstacles.clear();
+        self.pending_paid_ability_requests.clear();
+        self.pending_paid_ability_candidates.clear();
+        self.paid_ability_hashes.clear();
         self.pending_cannon_shots.clear();
         self.queued_join_room = false;
         self.input_history.clear();
         self.remote_simulations.clear();
         self.remote_predictions.clear();
-        self.wave_kill_counts = [0; 3];
-        self.wave_kill_targets = [0; 3];
+        self.wave_kill_counts = [0; 4];
+        self.wave_kill_targets = [0; 4];
+        self.snake_chain_len = 0;
+        self.snake_chain_target = 0;
+        self.snake_chain_spawned = 0;
+        self.next_snake_chain_id = 0;
         self.spawn_chunk_last_frame.clear();
         self.spawn_progress = 0.0;
         self.last_spawn_positions.clear();
@@ -1473,9 +2529,15 @@ impl Game {
         self.spiders.clear();
         self.cannons.clear();
         self.snakes.clear();
+        self.wisps.clear();
+        self.guardians.clear();
         self.projectiles.clear();
         self.explosions.clear();
         self.pending_player_deaths.clear();
+        self.shockwave_cooldown = 0;
+        self.shockwave_timer = 0;
+        self.shrine_badge_unlocked = false;
+        self.shrine_triggered = false;
         self.scene = Scene::Game;
     }
 
@@ -1489,6 +2551,10 @@ impl Game {
         self.wave = 0;
         self.kills = 0;
         self.deaths = 0;
+        self.attack_attempts = 0;
+        self.attack_hits = 0;
+        self.pending_attack_attempts = 0;
+        self.pending_attack_hits = 0;
         self.player = Player::new_at_position(Vec2::ZERO);
         self.camera = Camera::new(self.width, self.height, CAMERA_ZOOM);
         self.chunks = ChunkManager::new(self.world_seed);
@@ -1506,13 +2572,20 @@ impl Game {
         self.paid_obstacle_map.clear();
         self.pending_paid_obstacle_candidates.clear();
         self.pending_paid_obstacles.clear();
+        self.pending_paid_ability_requests.clear();
+        self.pending_paid_ability_candidates.clear();
+        self.paid_ability_hashes.clear();
         self.pending_cannon_shots.clear();
         self.queued_join_room = false;
         self.input_history.clear();
         self.remote_simulations.clear();
         self.remote_predictions.clear();
-        self.wave_kill_counts = [0; 3];
-        self.wave_kill_targets = [0; 3];
+        self.wave_kill_counts = [0; 4];
+        self.wave_kill_targets = [0; 4];
+        self.snake_chain_len = 0;
+        self.snake_chain_target = 0;
+        self.snake_chain_spawned = 0;
+        self.next_snake_chain_id = 0;
         self.spawn_chunk_last_frame.clear();
         self.spawn_progress = 0.0;
         self.last_spawn_positions.clear();
@@ -1529,9 +2602,15 @@ impl Game {
         self.spiders.clear();
         self.cannons.clear();
         self.snakes.clear();
+        self.wisps.clear();
+        self.guardians.clear();
         self.projectiles.clear();
         self.explosions.clear();
         self.pending_player_deaths.clear();
+        self.shockwave_cooldown = 0;
+        self.shockwave_timer = 0;
+        self.shrine_badge_unlocked = false;
+        self.shrine_triggered = false;
         self.scene = Scene::Game;
     }
 
@@ -1577,24 +2656,46 @@ impl Game {
             ));
         }
 
+        // Add wisps (alive or dead so clients can clear dead ones)
+        for wisp in &self.wisps {
+            enemies.push(EnemyState::new_wisp(
+                wisp.id,
+                wisp.alive,
+                wisp.pos,
+                wisp.dir,
+            ));
+        }
+
+        for guardian in &self.guardians {
+            enemies.push(EnemyState::new_guardian(
+                guardian.id,
+                guardian.alive,
+                guardian.pos,
+                guardian.dir,
+            ));
+        }
+
         crate::net::EnemySync {
             wave: self.wave,
             enemies,
         }
     }
 
-    fn wave_base_counts(wave: u32) -> (u32, u32, u32) {
+    fn wave_base_counts(wave: u32) -> (u32, u32, u32, u32) {
         let is_boss = wave % 10 == 0;
         if is_boss {
-            let snake_count = (wave as u32).min(50);
+            let boss_index = (wave / 10).max(1);
+            let snake_count = (2 + boss_index).min(50);
             let base = wave.saturating_sub(10) / 4;
             let cannon_count = (base / 3).min(20);
             let spider_count = base.saturating_sub(cannon_count).min(100);
-            (spider_count, cannon_count, snake_count)
+            let wisp_count = (wave / 2).min(60);
+            (spider_count, cannon_count, snake_count, wisp_count)
         } else {
             let cannon_count = (wave / 3).min(20);
             let spider_count = wave.saturating_sub(cannon_count).min(100);
-            (spider_count, cannon_count, 0)
+            let wisp_count = (wave / 2).min(60);
+            (spider_count, cannon_count, 0, wisp_count)
         }
     }
 
@@ -1607,109 +2708,261 @@ impl Game {
         true
     }
 
-    fn spawn_enemies_for_chunks(&mut self, chunks: &[(i32, i32)], player_count: usize, avoid_positions: &[Vec2], current_frame: u32) {
-        use crate::world::CHUNK_SIZE;
-        if self.wave == 0 {
+    fn count_snake_chains(&self) -> usize {
+        let mut chains: HashSet<u16> = HashSet::new();
+        for snake in &self.snakes {
+            if snake.alive {
+                chains.insert(snake.chain_id);
+            }
+        }
+        chains.len()
+    }
+
+    fn update_spawn_budget(&mut self, target_positions: &[Vec2], player_count: usize) {
+        if self.wave == 0 || target_positions.is_empty() {
             return;
         }
 
-        let player_scale = player_count.max(1) as f32;
-        let (base_spiders, base_cannons, base_snakes) = Self::wave_base_counts(self.wave);
-        let reference_area = self.width as f32 * self.height as f32;
-        let chunk_area = (CHUNK_SIZE as f32) * (CHUNK_SIZE as f32);
+        if self.last_spawn_positions.len() != target_positions.len() {
+            self.last_spawn_positions = target_positions.to_vec();
+        }
 
-        for &(cx, cy) in chunks {
-            if let Some(last_frame) = self.spawn_chunk_last_frame.get(&(cx, cy)) {
-                if current_frame.saturating_sub(*last_frame) < SPAWN_CHUNK_COOLDOWN_FRAMES {
-                    continue;
-                }
+        let mut moved_total = 0.0;
+        for (idx, pos) in target_positions.iter().enumerate() {
+            if let Some(prev) = self.last_spawn_positions.get(idx) {
+                moved_total += pos.distance(*prev);
             }
+        }
+        self.last_spawn_positions = target_positions.to_vec();
 
-            let chunk = match self.chunks.chunks.get(&(cx, cy)) {
-                Some(c) => c,
-                None => continue,
-            };
-
-            let seed = chunk.enemy_spawn_seed ^ (self.wave as u64).wrapping_mul(0x9E3779B97F4A7C15);
-            let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
-
-            let spider_f = (base_spiders as f32 * player_scale) * (chunk_area / reference_area);
-            let cannon_f = (base_cannons as f32 * player_scale) * (chunk_area / reference_area);
-            let snake_f = (base_snakes as f32 * player_scale) * (chunk_area / reference_area);
-
-            let spider_count = Self::sample_spawn_count(spider_f, &mut rng);
-            let cannon_count = Self::sample_spawn_count(cannon_f, &mut rng);
-            let snake_count = Self::sample_spawn_count(snake_f, &mut rng);
-
-            let origin = Vec2::new((cx * CHUNK_SIZE) as f32, (cy * CHUNK_SIZE) as f32);
-            let max_offset = CHUNK_SIZE as f32;
-
-            for _ in 0..spider_count {
-                if let Some(pos) = Self::random_point_in_chunk(&mut rng, origin, max_offset, &self.chunks, 8.0, avoid_positions, SPAWN_SAFE_DISTANCE) {
-                    let id = self.spiders.len();
-                    self.spiders.push(Spider::new_at_position(id, pos, &mut rng));
-                }
+        self.spawn_progress += moved_total;
+        let spawn_stride = self.width as f32;
+        if spawn_stride > 0.0 && self.spawn_progress >= spawn_stride {
+            let strides = self.spawn_progress / spawn_stride;
+            let per_stride = SPAWN_PER_WIDTH_PER_PLAYER * player_count.max(1) as f32;
+            let mut gain = strides * per_stride;
+            if self.slow_spawn_timer > 0 {
+                gain *= 0.4;
             }
+            self.spawn_budget += gain;
+            self.spawn_progress = self.spawn_progress % spawn_stride;
+        }
 
-            for _ in 0..cannon_count {
-                if let Some(pos) = Self::random_point_in_chunk(&mut rng, origin, max_offset, &self.chunks, 10.0, avoid_positions, SPAWN_SAFE_DISTANCE) {
-                    let id = self.cannons.len();
-                    self.cannons.push(Cannon::new_at_position(id, pos, &mut rng));
-                }
-            }
-
-            if snake_count > 0 {
-                let mut previous: Option<Snake> = None;
-                for _ in 0..snake_count {
-                    let pos = if let Some(spawn) = Self::random_point_in_chunk(&mut rng, origin, max_offset, &self.chunks, 12.0, avoid_positions, SPAWN_SAFE_DISTANCE) {
-                        spawn
-                    } else {
-                        origin + Vec2::new(max_offset * 0.5, max_offset * 0.5)
-                    };
-                    let id = self.snakes.len();
-                    let snake = Snake::new_at_position(id, previous.as_ref(), pos);
-                    previous = Some(snake.clone());
-                    self.snakes.push(snake);
-                }
-            }
-
-            self.spawn_chunk_last_frame.insert((cx, cy), current_frame);
+        let mut idle_gain = SPAWN_IDLE_RATE_PER_FRAME * player_count.max(1) as f32;
+        if self.slow_spawn_timer > 0 {
+            idle_gain *= 0.4;
+        }
+        self.spawn_budget += idle_gain;
+        if moved_total <= 0.01 {
+            let decay = SPAWN_BUDGET_DECAY_PER_FRAME * player_count.max(1) as f32;
+            self.spawn_budget = (self.spawn_budget - decay).max(0.0);
         }
     }
 
-    fn spawn_enemies_for_movement(&mut self, target_positions: &[Vec2], player_count: usize, current_frame: u32) {
-        if self.wave == 0 {
+    fn try_spawn_from_budget(&mut self, target_positions: &[Vec2], current_frame: u32) {
+        if self.wave == 0 || target_positions.is_empty() {
             return;
         }
-        let (base_spiders, base_cannons, base_snakes) = Self::wave_base_counts(self.wave);
-        let weights = [
-            base_spiders.max(1),
-            base_cannons,
-            base_snakes,
-        ];
-        let total: u32 = weights.iter().sum();
-        if total == 0 {
+        if self.spawn_budget < 1.0 || current_frame < self.next_spawn_frame {
             return;
         }
 
-        let spawn_count = player_count.max(1);
-        for _ in 0..spawn_count {
-            let roll = self.rng.gen_range(0..total);
-            let enemy_type = if roll < weights[0] {
-                crate::net::EnemyType::Spider
-            } else if roll < weights[0] + weights[1] {
-                crate::net::EnemyType::Cannon
-            } else {
-                crate::net::EnemyType::Snake
-            };
-            self.spawn_enemy_near_players(enemy_type, target_positions, current_frame);
+        let mut remaining = self.spawn_budget.floor() as usize;
+        if remaining == 0 {
+            return;
         }
+        remaining = remaining.min(SPAWN_MAX_PER_FRAME);
+
+        let mut spawned = 0;
+        for _ in 0..remaining {
+            if self.spawn_enemy_from_weights(target_positions, current_frame) {
+                self.spawn_budget -= 1.0;
+                spawned += 1;
+            } else {
+                break;
+            }
+        }
+
+        if spawned > 0 {
+            let jitter = if SPAWN_INTERVAL_JITTER_FRAMES > 0 {
+                self.rng.gen_range(0..=SPAWN_INTERVAL_JITTER_FRAMES)
+            } else {
+                0
+            };
+            self.next_spawn_frame = current_frame + SPAWN_MIN_INTERVAL_FRAMES + jitter;
+        }
+    }
+
+    fn spawn_initial_enemies(&mut self, target_positions: &[Vec2], player_count: usize, current_frame: u32) {
+        let initial = player_count.max(1).min(3);
+        let mut spawned = 0;
+        for _ in 0..initial {
+            if self.spawn_enemy_from_weights(target_positions, current_frame) {
+                spawned += 1;
+            }
+        }
+        if spawned > 0 {
+            self.next_spawn_frame = current_frame + SPAWN_MIN_INTERVAL_FRAMES;
+        }
+    }
+
+    fn spawn_snake_chain(&mut self, target_positions: &[Vec2], count: usize, current_frame: u32) -> bool {
+        use crate::world::CHUNK_SIZE;
+
+        if count == 0 {
+            return false;
+        }
+
+        let mut head_pos: Option<Vec2> = None;
+        let mut head_chunk: Option<(i32, i32)> = None;
+
+        if !target_positions.is_empty() {
+            let mut candidates: Vec<(i32, i32)> = Vec::new();
+            for pos in target_positions {
+                let cx = (pos.x / CHUNK_SIZE as f32).floor() as i32;
+                let cy = (pos.y / CHUNK_SIZE as f32).floor() as i32;
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        candidates.push((cx + dx, cy + dy));
+                    }
+                }
+            }
+            candidates.sort();
+            candidates.dedup();
+
+            let max_attempts = candidates.len().min(12);
+            for _ in 0..max_attempts {
+                let idx = self.rng.gen_range(0..candidates.len());
+                let chunk = candidates[idx];
+                if !self.chunks.chunks.contains_key(&chunk) {
+                    continue;
+                }
+                if let Some(last_frame) = self.spawn_chunk_last_frame.get(&chunk) {
+                    if current_frame.saturating_sub(*last_frame) < SPAWN_CHUNK_COOLDOWN_FRAMES {
+                        continue;
+                    }
+                }
+                let origin = Vec2::new((chunk.0 * CHUNK_SIZE) as f32, (chunk.1 * CHUNK_SIZE) as f32);
+                if let Some(pos) = Self::random_point_in_chunk(
+                    &mut self.rng,
+                    origin,
+                    CHUNK_SIZE as f32,
+                    &self.chunks,
+                    12.0,
+                    target_positions,
+                    SPAWN_SAFE_DISTANCE,
+                ) {
+                    let player_pos = self.player.pos;
+                    let to_spawn = (pos - player_pos).normalize();
+                    if player_pos.distance(pos) < SPAWN_FRONT_SAFE_DISTANCE
+                        && to_spawn.dot(self.player.look_dir) > SPAWN_FRONT_DOT_LIMIT
+                    {
+                        continue;
+                    }
+                    head_pos = Some(pos);
+                    head_chunk = Some(chunk);
+                    break;
+                }
+            }
+        }
+
+        if head_pos.is_none() {
+            let spawn_target = if target_positions.is_empty() {
+                self.player.pos
+            } else {
+                let idx = self.rng.gen_range(0..target_positions.len());
+                target_positions[idx]
+            };
+            let spawn_distance = 400.0;
+            let fallback = Snake::new_around_validated(
+                0,
+                None,
+                spawn_target,
+                spawn_distance,
+                &self.chunks,
+                &mut self.rng,
+            );
+            head_pos = Some(fallback.pos);
+        }
+
+        let head_pos = match head_pos {
+            Some(pos) => pos,
+            None => return false,
+        };
+        if let Some(chunk) = head_chunk {
+            self.spawn_chunk_last_frame.insert(chunk, current_frame);
+        }
+
+        let chain_id = self.next_snake_chain_id;
+        let target = if target_positions.is_empty() {
+            self.player.pos
+        } else {
+            Self::find_closest_target(head_pos, target_positions)
+        };
+        let mut tail_dir = (head_pos - target).normalize();
+        if tail_dir.length_squared() == 0.0 {
+            let angle = self.rng.gen::<f32>() * std::f32::consts::TAU;
+            tail_dir = Vec2::new(angle.cos(), angle.sin());
+        }
+        let head_dir = (target - head_pos).normalize();
+        let segment_spacing = 15.0 * CREATURE_SCALE;
+
+        for segment_index in 0..count {
+            let pos = head_pos - tail_dir * (segment_spacing * segment_index as f32);
+            let id = self.snakes.len();
+            let dir = if head_dir.length_squared() > 0.0 { head_dir } else { Vec2::UP };
+            self.snakes.push(Snake::new_chain_segment(id, chain_id, segment_index, pos, dir));
+        }
+
+        true
+    }
+
+
+    fn spawn_enemy_from_weights(&mut self, target_positions: &[Vec2], current_frame: u32) -> bool {
+        if self.wave == 0 {
+            return false;
+        }
+        let (base_spiders, base_cannons, base_snakes, base_wisps) = Self::wave_base_counts(self.wave);
+        let mut weights = [base_spiders, base_cannons, base_snakes, base_wisps];
+        if self.snake_chain_target == 0 || self.snake_chain_spawned >= self.snake_chain_target {
+            weights[2] = 0;
+        }
+        let total: u32 = weights.iter().sum();
+        if total == 0 {
+            return false;
+        }
+
+        let roll = self.rng.gen_range(0..total);
+        let enemy_type = if roll < weights[0] {
+            crate::net::EnemyType::Spider
+        } else if roll < weights[0] + weights[1] {
+            crate::net::EnemyType::Cannon
+        } else if roll < weights[0] + weights[1] + weights[2] {
+            crate::net::EnemyType::Snake
+        } else {
+            crate::net::EnemyType::Wisp
+        };
+        self.spawn_enemy_near_players(enemy_type, target_positions, current_frame)
     }
 
     fn spawn_enemy_near_players(&mut self, enemy_type: crate::net::EnemyType, target_positions: &[Vec2], current_frame: u32) -> bool {
         use crate::world::CHUNK_SIZE;
 
         if target_positions.is_empty() {
+            return false;
+        }
+
+        if enemy_type == crate::net::EnemyType::Snake {
+            if self.snake_chain_target == 0 || self.snake_chain_len == 0 {
+                return false;
+            }
+            if self.snake_chain_spawned < self.snake_chain_target {
+                if self.spawn_snake_chain(target_positions, self.snake_chain_len, current_frame) {
+                    self.snake_chain_spawned = self.snake_chain_spawned.saturating_add(1);
+                    self.next_snake_chain_id = self.next_snake_chain_id.wrapping_add(1);
+                    return true;
+                }
+            }
             return false;
         }
 
@@ -1748,6 +3001,8 @@ impl Game {
                 crate::net::EnemyType::Spider => 8.0,
                 crate::net::EnemyType::Cannon => 10.0,
                 crate::net::EnemyType::Snake => 12.0,
+                crate::net::EnemyType::Wisp => 6.0,
+                crate::net::EnemyType::Guardian => 18.0,
             };
 
             if let Some(pos) = Self::random_point_in_chunk(
@@ -1759,6 +3014,13 @@ impl Game {
                 target_positions,
                 SPAWN_SAFE_DISTANCE,
             ) {
+                let player_pos = self.player.pos;
+                let to_spawn = (pos - player_pos).normalize();
+                if player_pos.distance(pos) < SPAWN_FRONT_SAFE_DISTANCE
+                    && to_spawn.dot(self.player.look_dir) > SPAWN_FRONT_DOT_LIMIT
+                {
+                    continue;
+                }
                 match enemy_type {
                     crate::net::EnemyType::Spider => {
                         let id = self.spiders.len();
@@ -1772,6 +3034,14 @@ impl Game {
                         let id = self.snakes.len();
                         let snake = Snake::new_at_position(id, None, pos);
                         self.snakes.push(snake);
+                    }
+                    crate::net::EnemyType::Wisp => {
+                        let id = self.wisps.len();
+                        self.wisps.push(Wisp::new_at_position(id, pos, &mut self.rng));
+                    }
+                    crate::net::EnemyType::Guardian => {
+                        let id = self.guardians.len();
+                        self.guardians.push(Guardian::new_at_position(id, pos));
                     }
                 }
                 self.spawn_chunk_last_frame.insert(chunk, current_frame);
@@ -1812,16 +3082,6 @@ impl Game {
         None
     }
 
-    fn sample_spawn_count(value: f32, rng: &mut Xoshiro256PlusPlus) -> usize {
-        if value <= 0.0 {
-            return 0;
-        }
-        let base = value.floor();
-        let frac = value - base;
-        let extra = if rng.gen::<f32>() < frac { 1.0 } else { 0.0 };
-        (base + extra) as usize
-    }
-
     /// Apply enemy sync from host (client only)
     pub fn apply_enemy_sync(&mut self, sync: &crate::net::EnemySync) {
         use crate::net::EnemyType;
@@ -1833,6 +3093,8 @@ impl Game {
             self.spiders.clear();
             self.cannons.clear();
             self.snakes.clear();
+            self.wisps.clear();
+            self.guardians.clear();
         }
 
         // Process each enemy in the sync
@@ -1904,6 +3166,33 @@ impl Game {
                     snake.dir = enemy_state.dir();
                     snake.size = enemy_state.snake_size();
                 }
+                EnemyType::Wisp => {
+                    let id = enemy_state.id as usize;
+                    while self.wisps.len() <= id {
+                        self.wisps.push(Wisp::new_at_position(
+                            self.wisps.len(),
+                            enemy_state.pos(),
+                            &mut self.rng,
+                        ));
+                    }
+                    let wisp = &mut self.wisps[id];
+                    wisp.alive = enemy_state.is_alive();
+                    wisp.pos = enemy_state.pos();
+                    wisp.dir = enemy_state.dir();
+                }
+                EnemyType::Guardian => {
+                    let id = enemy_state.id as usize;
+                    while self.guardians.len() <= id {
+                        self.guardians.push(Guardian::new_at_position(
+                            self.guardians.len(),
+                            enemy_state.pos(),
+                        ));
+                    }
+                    let guardian = &mut self.guardians[id];
+                    guardian.alive = enemy_state.is_alive();
+                    guardian.pos = enemy_state.pos();
+                    guardian.dir = enemy_state.dir();
+                }
             }
         }
     }
@@ -1945,6 +3234,23 @@ impl Game {
                     self.sound_events.push(SoundEvent::EnemyKill);
                 }
             }
+            EnemyType::Wisp => {
+                if id < self.wisps.len() && self.wisps[id].alive {
+                    let pos = self.wisps[id].pos;
+                    self.wisps[id].kill();
+                    self.wave_kill_counts[3] = self.wave_kill_counts[3].saturating_add(1);
+                    self.explosions.spawn(pos, 6, 0, 0);
+                    self.sound_events.push(SoundEvent::EnemyKill);
+                }
+            }
+            EnemyType::Guardian => {
+                if id < self.guardians.len() && self.guardians[id].alive {
+                    let pos = self.guardians[id].pos;
+                    self.guardians[id].alive = false;
+                    self.explosions.spawn(pos, 12, 0, 0);
+                    self.sound_events.push(SoundEvent::EnemyKill);
+                }
+            }
         }
     }
 
@@ -1983,7 +3289,7 @@ impl Game {
         let cmd = parts.next().ok_or_else(|| "empty command".to_string())?.to_lowercase();
 
         match cmd.as_str() {
-            "help" => Ok("commands: help, start_game, teleport x y, set_wave n, set_kills n, set_deaths n, spawn_wave [players], spawn_counts spiders cannons snakes, clear_enemies, kill_player, respawn, drop_obstacle x y radius variant [proof_hash]".to_string()),
+            "help" => Ok("commands: help, start_game, teleport x y, set_wave n, set_kills n, set_deaths n, spawn_wave [players], spawn_counts spiders cannons snakes [wisps], clear_enemies, kill_player, respawn, drop_obstacle x y radius variant [proof_hash], bind_ability <shield|shockwave|slow_spawn|speed_boost|slime_trail> <KeyX>".to_string()),
             "start_game" => {
                 self.debug_start_game();
                 Ok("started game".to_string())
@@ -2014,21 +3320,34 @@ impl Game {
                     Some(val) => val.parse().map_err(|_| "invalid player_count".to_string())?,
                     None => 1,
                 };
-                self.spawn_wave_for_players(player_count);
+                let target_positions = [self.player.pos];
+                self.spawn_wave_for_players(player_count, &target_positions);
                 Ok(format!("spawned wave {} (players={})", self.wave, player_count))
             }
             "spawn_counts" => {
                 let spiders: usize = parts.next().ok_or_else(|| "missing spider count".to_string())?.parse().map_err(|_| "invalid spider count".to_string())?;
                 let cannons: usize = parts.next().ok_or_else(|| "missing cannon count".to_string())?.parse().map_err(|_| "invalid cannon count".to_string())?;
                 let snakes: usize = parts.next().ok_or_else(|| "missing snake count".to_string())?.parse().map_err(|_| "invalid snake count".to_string())?;
+                let wisps: usize = match parts.next() {
+                    Some(val) => val.parse().map_err(|_| "invalid wisp count".to_string())?,
+                    None => 0,
+                };
                 let seed = (self.frame_count as u64).wrapping_mul(1664525).wrapping_add(1013904223);
-                self.spawn_wave_with_seed(seed, spiders, cannons, snakes);
-                Ok(format!("spawned enemies (spiders={}, cannons={}, snakes={})", spiders, cannons, snakes))
+                self.spawn_wave_with_seed(seed, spiders, cannons, snakes, wisps);
+                Ok(format!(
+                    "spawned enemies (spiders={}, cannons={}, snakes={}, wisps={})",
+                    spiders,
+                    cannons,
+                    snakes,
+                    wisps
+                ))
             }
             "clear_enemies" => {
                 self.spiders.clear();
                 self.cannons.clear();
                 self.snakes.clear();
+                self.wisps.clear();
+                self.guardians.clear();
                 self.projectiles.clear();
                 Ok("cleared enemies and projectiles".to_string())
             }
@@ -2065,6 +3384,20 @@ impl Game {
                     Err("failed to place paid obstacle".to_string())
                 }
             }
+            "bind_ability" => {
+                let ability = parts.next().ok_or_else(|| "missing ability".to_string())?;
+                let key = parts.next().ok_or_else(|| "missing key".to_string())?;
+                let ability_type = match ability {
+                    "shield" => crate::net::PaidAbilityType::BubbleShield,
+                    "shockwave" => crate::net::PaidAbilityType::Shockwave,
+                    "slow_spawn" => crate::net::PaidAbilityType::SlowSpawn,
+                    "speed_boost" => crate::net::PaidAbilityType::SpeedBoost,
+                    "slime_trail" => crate::net::PaidAbilityType::SlimeTrail,
+                    _ => return Err("unknown ability".to_string()),
+                };
+                self.set_ability_binding(ability_type, key);
+                Ok(format!("bound {:?} to {}", ability_type, key))
+            }
             _ => Err("unknown command (try: help)".to_string()),
         }
     }
@@ -2072,6 +3405,14 @@ impl Game {
     /// Take pending enemy kills (for reporting to network)
     pub fn take_pending_kills(&mut self) -> Vec<(crate::net::EnemyType, u16)> {
         std::mem::take(&mut self.pending_enemy_kills)
+    }
+
+    pub fn take_pending_attack_stats(&mut self) -> (u32, u32) {
+        let attempts = self.pending_attack_attempts;
+        let hits = self.pending_attack_hits;
+        self.pending_attack_attempts = 0;
+        self.pending_attack_hits = 0;
+        (attempts, hits)
     }
 
     /// Take pending player deaths (for reporting to network)
@@ -2142,7 +3483,7 @@ impl RemoteSimulation {
         self.rollback_from = None;
     }
 
-    fn queue_input(&mut self, frame: u32, input: u8) {
+    fn queue_input(&mut self, frame: u32, input: u16) {
         if self.pending_inputs.iter().any(|entry| entry.frame == frame) {
             return;
         }
@@ -2209,6 +3550,7 @@ impl RemoteSimulation {
             self.player.is_attacking(),
             self.player.blocking,
             self.player.is_phasing(),
+            self.player.is_shielded(),
         )
     }
 }

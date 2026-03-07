@@ -43,11 +43,82 @@
             border: 0;
             padding: 0;
         }
+        #payment-modal {
+            position: absolute;
+            inset: 0;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.65);
+            z-index: 20;
+            font-family: "Space Mono", "Courier New", monospace;
+            color: #e6f1f1;
+        }
+        #payment-modal.active {
+            display: flex;
+        }
+        .payment-card {
+            width: min(520px, 92vw);
+            background: #0f1518;
+            border: 2px solid #2b3a3d;
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.4);
+            padding: 20px;
+            border-radius: 10px;
+        }
+        .payment-card h2 {
+            font-size: 18px;
+            margin-bottom: 8px;
+        }
+        .payment-card p {
+            font-size: 12px;
+            margin-bottom: 12px;
+            color: #b8c7c7;
+        }
+        .payment-list {
+            display: grid;
+            gap: 8px;
+            margin-bottom: 16px;
+        }
+        .payment-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 10px;
+            background: #141e22;
+            border: 1px solid #233238;
+            border-radius: 8px;
+            font-size: 12px;
+        }
+        .payment-item span {
+            color: #d8e4e4;
+        }
+        .payment-item small {
+            color: #9bb1b1;
+        }
+        .payment-actions {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+        }
+        .payment-actions button {
+            background: #1b2a2e;
+            color: #e6f1f1;
+            border: 1px solid #2b3a3d;
+            padding: 8px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .payment-actions button.primary {
+            background: #2b6d7a;
+            border-color: #3793a3;
+        }
     </style>
     
+    
 <script type="module">
-import init, * as bindings from '/slime-armies/slime-armies-ec324dbef086f2a1.js';
-const wasm = await init({ module_or_path: '/slime-armies/slime-armies-ec324dbef086f2a1_bg.wasm' });
+import init, * as bindings from '/slime-armies/slime-armies-903dffef79e6c474.js';
+const wasm = await init({ module_or_path: '/slime-armies/slime-armies-903dffef79e6c474_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -56,7 +127,213 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-<link rel="modulepreload" href="/slime-armies/slime-armies-ec324dbef086f2a1.js" crossorigin="anonymous" integrity="sha384-kaTXMQo80G1Upn4aHcOk1qbvMkMVponnq/uX3fcKsq3MwdScW2zV5b7exSfWtUUl"><link rel="preload" href="/slime-armies/slime-armies-ec324dbef086f2a1_bg.wasm" crossorigin="anonymous" integrity="sha384-Xlt91MBJWAnuQU5zjl1StVyoEZZuQdw78jAoqmoPLOGvL8yxjxzqU/JsgFGVNH+G" as="fetch" type="application/wasm"></head>
+    <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
+    <script>
+        const P2PAGO_ACCOUNT = "slime-armies-payments";
+        const P2PAGO_MAX_AGE_MS = 1000 * 60 * 10;
+        const P2PAGO_DEFAULT_USD = 3;
+        const P2PAGO_ABILITY_CATALOG = [
+            {
+                id: "bubble_shield",
+                name: "Bubble Shield",
+                costUsd: 0.25,
+                description: "Absorb hits for a short time",
+            },
+            {
+                id: "shockwave",
+                name: "Shockwave",
+                costUsd: 0.25,
+                description: "Blast nearby enemies",
+            },
+            {
+                id: "time_slow",
+                name: "Time Slow",
+                costUsd: 0.25,
+                description: "Slow nearby enemies",
+            },
+            {
+                id: "speed_boost",
+                name: "Speed Boost",
+                costUsd: 0.25,
+                description: "Move faster briefly",
+            },
+            {
+                id: "slime_trail",
+                name: "Slime Trail",
+                costUsd: 0.25,
+                description: "Leave a lethal trail",
+            },
+        ];
+
+        let paymentModal = null;
+        let paymentModalReady = false;
+        let paymentModalPending = false;
+
+        const showPaymentModal = () => {
+            if (!paymentModalReady || !paymentModal) {
+                paymentModalPending = true;
+                return;
+            }
+            paymentModal.classList.add("active");
+        };
+        const hidePaymentModal = () => {
+            if (!paymentModalReady || !paymentModal) {
+                return;
+            }
+            paymentModal.classList.remove("active");
+        };
+
+        const initPaymentModal = () => {
+            paymentModal = document.createElement("div");
+            paymentModal.id = "payment-modal";
+            paymentModal.innerHTML = `
+                <div class="payment-card">
+                    <h2>Paid Abilities</h2>
+                    <p>Payments unlock paid abilities. Each use costs the amount below.</p>
+                    <div class="payment-list" id="payment-list"></div>
+                    <div class="payment-actions">
+                        <button id="payment-close">Close</button>
+                        <button class="primary" id="payment-deposit">Add $${P2PAGO_DEFAULT_USD.toFixed(2)}</button>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(paymentModal);
+
+            const paymentList = paymentModal.querySelector("#payment-list");
+            const paymentClose = paymentModal.querySelector("#payment-close");
+            const paymentDeposit = paymentModal.querySelector("#payment-deposit");
+
+            const renderPaymentList = () => {
+                paymentList.innerHTML = "";
+                for (const ability of P2PAGO_ABILITY_CATALOG) {
+                    const row = document.createElement("div");
+                    row.className = "payment-item";
+                    row.innerHTML = `
+                        <span>${ability.name} <small>${ability.description}</small></span>
+                        <strong>$${ability.costUsd.toFixed(2)}</strong>
+                    `;
+                    paymentList.appendChild(row);
+                }
+            };
+            renderPaymentList();
+
+            paymentClose.addEventListener("click", hidePaymentModal);
+            paymentModal.addEventListener("click", (event) => {
+                if (event.target === paymentModal) {
+                    hidePaymentModal();
+                }
+            });
+            paymentDeposit.addEventListener("click", () => {
+                window.p2pagoPromptPayment();
+            });
+
+            paymentModalReady = true;
+            if (paymentModalPending) {
+                showPaymentModal();
+                paymentModalPending = false;
+            }
+        };
+
+        if (document.readyState === "loading") {
+            document.addEventListener("DOMContentLoaded", initPaymentModal, { once: true });
+        } else {
+            initPaymentModal();
+        }
+
+        const paymentStatus = { valid: false, lastChecked: 0 };
+        let p2pagoSdkPromise = null;
+
+        const loadP2pagoSdk = () => {
+            if (window.Zkp2pDonate) {
+                return Promise.resolve(window.Zkp2pDonate);
+            }
+            if (p2pagoSdkPromise) {
+                return p2pagoSdkPromise;
+            }
+            const cacheBuster = Date.now();
+            p2pagoSdkPromise = new Promise((resolve, reject) => {
+                const existing = document.querySelector('script[data-p2pago]');
+                if (existing) {
+                    existing.addEventListener('load', () => resolve(window.Zkp2pDonate));
+                    existing.addEventListener('error', reject);
+                    return;
+                }
+                const script = document.createElement('script');
+                script.dataset.p2pago = 'true';
+                script.src = `https://raw.githubusercontent.com/keyneom/p2pago/main/docs/zkp2p-donate.js?cachebust=${cacheBuster}`;
+                script.onload = () => resolve(window.Zkp2pDonate);
+                script.onerror = () => {
+                    const cdn = document.createElement('script');
+                    cdn.dataset.p2pago = 'true';
+                    cdn.src = `https://cdn.jsdelivr.net/gh/keyneom/p2pago@main/docs/zkp2p-donate.js?cachebust=${cacheBuster}`;
+                    cdn.onload = () => resolve(window.Zkp2pDonate);
+                    cdn.onerror = () => {
+                        const fallback = document.createElement('script');
+                        fallback.dataset.p2pago = 'true';
+                        fallback.src = 'static/p2pago/zkp2p-donate.js';
+                        fallback.onload = () => resolve(window.Zkp2pDonate);
+                        fallback.onerror = reject;
+                        document.head.appendChild(fallback);
+                    };
+                    document.head.appendChild(cdn);
+                };
+                document.head.appendChild(script);
+            });
+            return p2pagoSdkPromise;
+        };
+
+        const refreshPaymentStatus = async () => {
+            const sdk = await loadP2pagoSdk();
+            if (!sdk || !sdk.getDonationStatus) {
+                paymentStatus.valid = false;
+                return;
+            }
+            try {
+                const status = await sdk.getDonationStatus(P2PAGO_ACCOUNT, { maxAgeMs: P2PAGO_MAX_AGE_MS });
+                paymentStatus.valid = !!status && status.valid === true;
+                paymentStatus.lastChecked = Date.now();
+            } catch (err) {
+                console.warn("P2PAGO status check failed.", err);
+                paymentStatus.valid = false;
+            }
+        };
+
+        refreshPaymentStatus();
+        setInterval(refreshPaymentStatus, 30000);
+
+        window.p2pagoPaymentValid = () => {
+            if (Date.now() - paymentStatus.lastChecked > 45000) {
+                refreshPaymentStatus();
+            }
+            return paymentStatus.valid;
+        };
+        window.p2pagoPromptPayment = async () => {
+            const sdk = await loadP2pagoSdk();
+            if (!sdk || !sdk.openDonation) {
+                console.warn("P2PAGO SDK not available yet.");
+                showPaymentModal();
+                return;
+            }
+            sdk.openDonation({
+                amountUsd: P2PAGO_DEFAULT_USD,
+                openInstallPageIfMissing: true,
+            });
+        };
+
+        window.p2pagoOpenPaymentModal = () => {
+            showPaymentModal();
+        };
+
+        window.p2pagoRecordPayment = async (txHash) => {
+            const sdk = await loadP2pagoSdk();
+            if (!sdk || !sdk.recordDonation) {
+                return;
+            }
+            sdk.recordDonation(P2PAGO_ACCOUNT, { txHash });
+            refreshPaymentStatus();
+        };
+    </script>
+<link rel="modulepreload" href="/slime-armies/slime-armies-903dffef79e6c474.js" crossorigin="anonymous" integrity="sha384-5gJ6rwo6/EaAquMe3sz6zn9KWGKleGpvjQ5M/9WNgsWcla9l0hnJsYF/iNgkeFJk"><link rel="preload" href="/slime-armies/slime-armies-903dffef79e6c474_bg.wasm" crossorigin="anonymous" integrity="sha384-8Mg7f/zcR9HfyA2q1o8nmDTVcczrumVDshGpQWwBa7Yy+cz6RXC+lLs159FsBL0A" as="fetch" type="application/wasm"></head>
 <body>
     <canvas id="canvas" tabindex="0"></canvas>
     <input id="mobile-input" type="text" tabindex="-1" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-hidden="true" />

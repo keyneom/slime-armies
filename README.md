@@ -9,6 +9,12 @@ Inspired by the original "One Slime Army" (WASM-4).
 - **WASD / Arrow Keys**: Move
 - **Z / Space**: Attack (hold to block, release to swing)
 - **X / Shift**: Dodge
+- **R**: Bubble Shield (paid ability, default)
+- **F**: Shockwave (paid ability, default)
+- **T**: Slow spawn (paid ability, default)
+- **G**: Speed boost (paid ability, default)
+- **Y**: Slime trail (paid ability, default)
+- **F3**: Toggle network debug overlay (relay queue/traffic stats)
 - **M**: Open map (arrows pan, Z zoom in, X zoom out, type coords, Enter to teleport)
 
 ## Development
@@ -30,12 +36,35 @@ cargo install trunk
 
 **Note:** Use the `scripts/` wrappers for trunk; they unset `NO_COLOR` / `FORCE_COLOR`, which otherwise can cause `invalid value '1' for '--no-color'` when running `trunk` directly (e.g. in Cursor's terminal or CI).
 
+## TURN Fallback
+
+You can configure ICE/TURN at runtime from the browser console:
+
+```js
+// Add TURN fallback while keeping default STUN:
+window.slime.set_turn_fallback("turn:turn.example.com:3478?transport=udp", "user", "pass");
+
+// Or fully override ICE URL list (comma-separated):
+window.slime.set_ice_servers(
+  "stun:stun.l.google.com:19302,turn:turn.example.com:3478?transport=udp",
+  "user",
+  "pass"
+);
+
+// Reset to default STUN-only config:
+window.slime.reset_ice_servers();
+```
+
 ## Architecture
 
 - **Rust + WebAssembly**: Core game logic
 - **Canvas 2D**: Rendering
-- **Matchbox + GGRS**: P2P networking with rollback netcode (planned)
-- **Hybrid P2P topology**: Supernodes for 100+ player scaling (planned)
+- **Matchbox**: P2P networking
+- **Socket fork (compatible)**: local `matchbox_socket` fork keeps Matchbox signaling protocol compatibility while enabling selective peer links
+- **Two-layer P2P**: temporary discovery layer (matchbox signaling) + long-lived gameplay overlay (tree relay)
+- **Discovery detach**: regular nodes can detach from signaling after overlay bootstrap; supernodes/root stay attached for discovery continuity
+- **Rollback netcode**: lightweight input/state rollback (in progress)
+- **Hybrid P2P topology**: dynamic multi-supernode relay tree with area-aware routing, adaptive fanout, and parent failover (in progress)
 
 ## Roadmap
 
@@ -43,8 +72,8 @@ cargo install trunk
 - [x] Phase 2: Enemies (spider, cannon, snake boss)
 - [x] Phase 3: Infinite world with chunk loading
 - [x] Phase 4: Basic P2P multiplayer
-- [ ] Phase 5: GGRS rollback netcode
-- [ ] Phase 6: Supernode architecture for scale
+- [~] Phase 5: Rollback netcode (input/state rollback in place; full GGRS-style model pending)
+- [~] Phase 6: Supernode architecture for scale (multi-supernode relay + failover in place; tuning pending)
 - [x] Phase 7: World-wide minimap
 - [ ] Phase 8: Polish and optimization
 

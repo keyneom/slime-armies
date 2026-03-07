@@ -9,6 +9,58 @@ Transform "One Slime Army" from a single-player WASM-4 game into a P2P multiplay
 
 ## Current Session - Enemy Sync Fix
 
+## Current Session - Multi-Supernode Relay Tree (In Progress)
+
+### Goal
+Reduce centralized relay load and move from single-supernode fanout to a cascading multi-supernode tree with area-aware routing.
+
+### Implemented this session
+- [x] Added `NETWORK_SCALING_PLAN.md` with research + phased architecture.
+- [x] Added control-plane protocol messages:
+  - `TopologyUpdateEvent`
+  - `AreaAuthorityUpdateEvent`
+- [x] Added `area_id` metadata to hot-path batch payloads:
+  - `PlayerStateEntry.area_id`
+  - `InputFrameEntry.area_id`
+- [x] Added dynamic relay topology state in `NetworkSession`:
+  - `supernode_set`, `super_root_id`, `relay_parent`, `relay_backup_parent`, `relay_children`, `relay_epoch`
+- [x] Added dynamic area authority map (`area_id -> authority_hash`) with periodic root broadcast.
+- [x] Changed state/input routing to parent/children cascade:
+  - Upstream: leaf/child to parent
+  - Downstream: parent to children (filtered by area + distance)
+- [x] Changed enemy sync + wave start fanout from “root to all peers” to “root to children” with child forwarding.
+- [x] Added runtime backup-parent failover:
+  - Track per-peer last-seen frames
+  - Switch to backup parent after timeout + cooldown
+  - Route via `active_parent` for upstream traffic
+- [x] Root now sends per-peer topology assignments (`parent`, `backup_parent`, `children`) instead of generic hints.
+- [x] Dynamic supernode count now depends on both room size and active world-area spread.
+- [x] Dynamic relay fanout now scales with room size.
+- [x] Sticky anchor switching now uses hysteresis margin + distance-based forced reassignment.
+- [x] Parent handoff now uses a short duplex upstream window for smoother transitions.
+- [x] Forked `matchbox_socket` locally (server-protocol compatible) with selective desired-peer connectivity.
+- [x] Network session now feeds desired links (parent/backup/children/supernode+witness/bootstrap) to socket.
+- [x] Sparse-link mode is enabled immediately at room connect to avoid initial full-mesh offer storms.
+- [x] Added explicit signaling detach control in socket fork (discovery can end while gameplay data channels stay up).
+- [x] `PeerLeft` no longer forcibly closes active data channels (supports discovery-leave + persistent gameplay overlay).
+- [x] Added session-level two-layer behavior:
+  - regular nodes keep discovery attached during bootstrap only;
+  - after overlay parent/route stabilizes, they detach from signaling;
+  - detached nodes keep using relayed topology instead of local re-election.
+- [x] Added optional TURN fallback configuration (runtime ICE override + TURN injection via `window.slime` APIs).
+- [~] Extended cascaded routing to additional event classes:
+  - kill/death, paid obstacle/ability, paid acks, chat, vote-mute, cannon shots now use tree relay paths.
+  - late-join state sync still uses direct host sends (kept for now).
+- [~] Added runtime relay telemetry + guardrails:
+  - counters for recv/sent(upstream/downstream/broadcast), drops, queue depth, stale-parent switches.
+  - capped relay/downlink queue sizes and capped batch payload sizes to prevent runaway backlog.
+  - adaptive state/input send cadence under congestion (`relay_congestion_level`) to reduce message pressure.
+  - in-game net debug overlay (`F3`) to view relay pressure/traffic/drop metrics live.
+  - periodic telemetry console summary for larger rooms (throttled).
+
+### Remaining work in this track
+- [~] Tune congestion thresholds and per-topic budgets via larger room load tests.
+
 ### Issue: Enemies Out of Sync Between Players
 **Problem**: Enemies appeared in different positions for different players because:
 - Deterministic spawning requires both players to spawn at exact same frame with same position
@@ -67,6 +119,12 @@ CLIENT (joiner):
 - [x] Wave progression based on team kill target; enemies spawn per newly explored chunks across players
 - [x] Wave targets tracked per enemy type; spawn density tied to screen-area exploration
 - [x] World generation seed derives from room id for deterministic chunks
+- [x] Smooth spawn pacing: movement-based budget + jittered cadence (no bursty wave dumps)
+- [x] WaveStart now seeds RNG properly (deterministic seed shared to clients)
+- [x] Added Wisp enemy type with network sync and rendering
+- [x] Added paid abilities: Bubble Shield and Shockwave (network gated + supernode ack)
+- [x] Added Shrinefinder badge + shrine encounter at (67, 67)
+- [x] p2pago SDK bundled (UMD) + support gating hooks for paid abilities
 
 ## Build & Test
 ```bash
@@ -86,6 +144,8 @@ trunk serve  # Dev server on http://localhost:8080
   - [x] Track kills, deaths, and time played per user.
   - [x] Track room totals for kills, deaths, and time played (time played = sum of all players).
 - [~] Paid ability gating (e.g., pay to drop an obstacle at a chosen location) using x402 or on-chain proofs with host validation.
+  - [x] Paid ability event + supernode ack flow (Bubble Shield, Shockwave)
+  - [ ] On-chain or external receipt verification
 - [ ] Define and deploy a generic immutable smart contract to verify paid unlocks and distribute tournament winnings; winner determination likely needs a separate consensus process.
 - [ ] Future upgrades (laser attack, stronger shields) and competitive crypto prizes (last-man-standing, PvP tournaments).
 - [ ] Mobile-friendly UX (touch controls, responsive HUD, safe areas for chat/map/player list).

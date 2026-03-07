@@ -3,7 +3,7 @@ use wasm_bindgen::JsValue;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
 
 use crate::game::{Game, Scene, MenuSelection};
-use crate::entities::{Player, Spider, Cannon, Snake, Projectile};
+use crate::entities::{Player, Spider, Cannon, Snake, Wisp, Projectile};
 use crate::math::Vec2;
 use crate::world::{Camera, CHUNK_SIZE};
 use crate::net::{NetworkSession, NetworkState, RemotePlayer, PlayerStats};
@@ -259,6 +259,18 @@ impl Renderer {
         // Draw terrain/obstacles from chunks
         self.render_terrain(game);
 
+        // Draw shrine structure
+        self.render_shrine(game);
+
+        // Draw slime trail segments
+        if !game.trail_segments.is_empty() {
+            self.ctx.set_fill_style_str("#44aa88");
+            for segment in &game.trail_segments {
+                let screen_pos = camera.world_to_screen(segment.pos());
+                self.fill_circle(screen_pos.x as f64, screen_pos.y as f64, segment.radius() as f64);
+            }
+        }
+
         if let Some(snapshot) = &game.enemy_render_snapshot {
             // Draw snakes (back to front so head is on top)
             for i in (0..snapshot.snake_positions.len()).rev() {
@@ -279,6 +291,13 @@ impl Renderer {
             for (i, (pos, dir, look_dir, alive)) in snapshot.cannon_positions.iter().enumerate() {
                 if *alive {
                     self.render_cannon_snapshot(i, *pos, *dir, *look_dir, camera);
+                }
+            }
+
+            // Draw wisps
+            for (i, (pos, dir, alive)) in snapshot.wisp_positions.iter().enumerate() {
+                if *alive {
+                    self.render_wisp_snapshot(i, *pos, *dir, game.frame_count, camera);
                 }
             }
         } else {
@@ -302,11 +321,35 @@ impl Renderer {
                     self.render_cannon(cannon, camera);
                 }
             }
+
+            // Draw wisps
+            for wisp in &game.wisps {
+                if wisp.alive {
+                    self.render_wisp(wisp, game.frame_count, camera);
+                }
+            }
+        }
+        for guardian in &game.guardians {
+            if guardian.alive {
+                self.render_guardian(guardian, game.frame_count, camera);
+            }
         }
 
         // Draw projectiles
         for projectile in game.projectiles.iter() {
             self.render_projectile(projectile, camera);
+        }
+
+        if game.shockwave_timer > 0 {
+            let progress = 1.0 - (game.shockwave_timer as f64 / 12.0);
+            let radius = self.world_to_render_size((20.0 + progress as f32 * 70.0) as f64 * CREATURE_SCALE) as f64;
+            let screen_pos = camera.world_to_screen(game.player.pos);
+            let render_x = self.world_to_render_pixel(screen_pos.x as f64) as f64;
+            let render_y = self.world_to_render_pixel(screen_pos.y as f64) as f64;
+            self.ctx.set_stroke_style_str(COLOR_LIGHT);
+            self.ctx.set_global_alpha(0.6);
+            self.draw_circle_outline(render_x, render_y, (radius / 2.0).ceil());
+            self.ctx.set_global_alpha(1.0);
         }
 
         // Draw remote players
@@ -333,6 +376,68 @@ impl Renderer {
         }
 
         // HUD and names are drawn in overlay for readability
+    }
+
+    fn render_shrine(&self, game: &Game) {
+        let camera = &game.camera;
+        let shrine_pos = crate::game::SHRINE_POS;
+        let screen_pos = camera.world_to_screen(shrine_pos);
+        let (min_x, min_y, max_x, max_y) = camera.visible_bounds();
+        if shrine_pos.x < min_x - 120.0 || shrine_pos.x > max_x + 120.0 || shrine_pos.y < min_y - 120.0 || shrine_pos.y > max_y + 120.0 {
+            return;
+        }
+
+        let base_radius = 18.0;
+        let glow = if game.shrine_triggered() { 0.8 } else { 0.4 };
+        let pulse = ((game.frame_count as f64 * 0.06).sin() * 0.5 + 0.5) * 0.6 + 0.4;
+
+        self.ctx.set_global_alpha(glow);
+        self.ctx.set_fill_style_str("#88c9ff");
+        self.fill_circle(screen_pos.x as f64, screen_pos.y as f64, base_radius + 10.0);
+        self.ctx.set_global_alpha(1.0);
+
+        self.ctx.set_fill_style_str("#243a4a");
+        self.fill_circle(screen_pos.x as f64, screen_pos.y as f64, base_radius + 4.0);
+
+        self.ctx.set_fill_style_str("#8cd4ff");
+        self.fill_circle(screen_pos.x as f64, screen_pos.y as f64, base_radius);
+
+        self.ctx.set_fill_style_str("#0f1820");
+        self.fill_circle(screen_pos.x as f64, screen_pos.y as f64, base_radius * 0.5);
+
+        self.ctx.set_stroke_style_str("#bfe8ff");
+        self.ctx.set_line_width(2.0);
+        self.ctx.begin_path();
+        let _ = self.ctx.arc(
+            screen_pos.x as f64,
+            screen_pos.y as f64,
+            base_radius as f64 * 1.35,
+            0.0,
+            std::f64::consts::TAU,
+        );
+        self.ctx.stroke();
+
+        self.ctx.set_global_alpha(pulse);
+        self.ctx.set_stroke_style_str("#c7f1ff");
+        self.ctx.set_line_width(1.5);
+        self.ctx.begin_path();
+        let _ = self.ctx.arc(
+            screen_pos.x as f64,
+            screen_pos.y as f64,
+            base_radius as f64 * 1.7,
+            0.0,
+            std::f64::consts::TAU,
+        );
+        self.ctx.stroke();
+        self.ctx.set_global_alpha(1.0);
+
+        let pillar_offset = base_radius as f64 * 1.6;
+        let pillar_size = 6.0;
+        self.ctx.set_fill_style_str("#1d2a33");
+        self.ctx.fill_rect(screen_pos.x as f64 - pillar_offset - pillar_size / 2.0, screen_pos.y as f64 - pillar_size / 2.0, pillar_size, pillar_size);
+        self.ctx.fill_rect(screen_pos.x as f64 + pillar_offset - pillar_size / 2.0, screen_pos.y as f64 - pillar_size / 2.0, pillar_size, pillar_size);
+        self.ctx.fill_rect(screen_pos.x as f64 - pillar_size / 2.0, screen_pos.y as f64 - pillar_offset - pillar_size / 2.0, pillar_size, pillar_size);
+        self.ctx.fill_rect(screen_pos.x as f64 - pillar_size / 2.0, screen_pos.y as f64 + pillar_offset - pillar_size / 2.0, pillar_size, pillar_size);
     }
 
     fn render_terrain(&self, game: &Game) {
@@ -591,122 +696,160 @@ impl Renderer {
 
     fn render_snake(&self, snake: &Snake, frame_count: u32, camera: &Camera) {
         let screen_pos = camera.world_to_screen(snake.pos);
-        let x = screen_pos.x as f64;
-        let y = screen_pos.y as f64;
+        let (x, y) = self.snap_point(screen_pos.x as f64, screen_pos.y as f64);
         let size = snake.size as f64 * CREATURE_SCALE;
+        self.ctx.set_global_alpha(1.0);
         let flip: f64 = if (frame_count / 5 + snake.id as u32) % 2 == 0 { 1.0 } else { -1.0 };
+        let (dx, dy) = if snake.dir.x == 0.0 && snake.dir.y == 0.0 {
+            (0.0, 1.0)
+        } else {
+            (snake.dir.x as f64, snake.dir.y as f64)
+        };
 
-        // DRAW_COLORS = 4 (magenta/pink) for legs/antennae
         self.ctx.set_stroke_style_str(COLOR_4);
         self.ctx.set_line_width((1.0 * CREATURE_SCALE).max(1.0));
 
-        // Legs/antennae
+        // Legs first so body fill masks inner parts
+        let leg_scale = 1.15;
+        let (s1x, s1y) = self.snap_point(
+            x + (dx * (2.5 + flip) * 0.1 + dy * leg_scale) * size,
+            y + (dy * (2.5 + flip) * 0.1 - dx * leg_scale) * size,
+        );
+        let (e1x, e1y) = self.snap_point(
+            x - (dx * (2.5 + flip) * 0.1 + dy * leg_scale) * size,
+            y - (dy * (2.5 + flip) * 0.1 - dx * leg_scale) * size,
+        );
         self.ctx.begin_path();
-        self.ctx.move_to(
-            x + (snake.dir.x as f64 * (2.5 + flip) * 0.1 + snake.dir.y as f64 * 0.8) * size,
-            y + (snake.dir.y as f64 * (2.5 + flip) * 0.1 - snake.dir.x as f64 * 0.8) * size,
-        );
-        self.ctx.line_to(
-            x - (snake.dir.x as f64 * (2.5 + flip) * 0.1 + snake.dir.y as f64 * 0.8) * size,
-            y - (snake.dir.y as f64 * (2.5 + flip) * 0.1 - snake.dir.x as f64 * 0.8) * size,
-        );
+        self.ctx.move_to(s1x, s1y);
+        self.ctx.line_to(e1x, e1y);
         self.ctx.stroke();
 
+        let (s2x, s2y) = self.snap_point(
+            x + (dx * (2.5 - flip) * 0.1 - dy * leg_scale) * size,
+            y + (dy * (2.5 - flip) * 0.1 + dx * leg_scale) * size,
+        );
+        let (e2x, e2y) = self.snap_point(
+            x - (dx * (2.5 - flip) * 0.1 - dy * leg_scale) * size,
+            y - (dy * (2.5 - flip) * 0.1 + dx * leg_scale) * size,
+        );
         self.ctx.begin_path();
-        self.ctx.move_to(
-            x + (snake.dir.x as f64 * (2.5 - flip) * 0.1 - snake.dir.y as f64 * 0.8) * size,
-            y + (snake.dir.y as f64 * (2.5 - flip) * 0.1 + snake.dir.x as f64 * 0.8) * size,
-        );
-        self.ctx.line_to(
-            x - (snake.dir.x as f64 * (2.5 - flip) * 0.1 - snake.dir.y as f64 * 0.8) * size,
-            y - (snake.dir.y as f64 * (2.5 - flip) * 0.1 + snake.dir.x as f64 * 0.8) * size,
-        );
+        self.ctx.move_to(s2x, s2y);
+        self.ctx.line_to(e2x, e2y);
         self.ctx.stroke();
 
-        // Fangs/teeth (original draws on all segments)
-        self.ctx.begin_path();
-        self.ctx.move_to(
-            x + (snake.dir.x as f64 * 0.50 - snake.dir.y as f64 * 0.1) * size,
-            y + (snake.dir.y as f64 * 0.50 + snake.dir.x as f64 * 0.1) * size,
-        );
-        self.ctx.line_to(
-            x + (snake.dir.x as f64 * 0.65 - snake.dir.y as f64 * 0.2) * size,
-            y + (snake.dir.y as f64 * 0.65 + snake.dir.x as f64 * 0.2) * size,
-        );
-        self.ctx.stroke();
-
-        self.ctx.begin_path();
-        self.ctx.move_to(
-            x + (snake.dir.x as f64 * 0.50 + snake.dir.y as f64 * 0.1) * size,
-            y + (snake.dir.y as f64 * 0.50 - snake.dir.x as f64 * 0.1) * size,
-        );
-        self.ctx.line_to(
-            x + (snake.dir.x as f64 * 0.65 + snake.dir.y as f64 * 0.2) * size,
-            y + (snake.dir.y as f64 * 0.65 - snake.dir.x as f64 * 0.2) * size,
-        );
-        self.ctx.stroke();
-
-        // Body - DRAW_COLORS = 0x41 (color 4 fill, color 1 outline)
+        // Body fill (black) + outline (red), like DRAW_COLORS=0x41
+        self.ctx.set_fill_style_str(COLOR_BG);
+        self.draw_circle_filled(x, y, size);
         self.ctx.set_fill_style_str(COLOR_4);
-        self.fill_circle(x, y, size);
+        self.ctx.set_stroke_style_str(COLOR_4);
+        self.ctx.set_line_width((1.0 * CREATURE_SCALE).max(1.0));
+        self.draw_circle_outline(x, y, size);
+
+        // Fangs on top so they remain visible
+        let (f1x, f1y) = self.snap_point(
+            x + (dx * 0.50 - dy * 0.1) * size,
+            y + (dy * 0.50 + dx * 0.1) * size,
+        );
+        let (f2x, f2y) = self.snap_point(
+            x + (dx * 0.65 - dy * 0.2) * size,
+            y + (dy * 0.65 + dx * 0.2) * size,
+        );
+        self.ctx.begin_path();
+        self.ctx.move_to(f1x, f1y);
+        self.ctx.line_to(f2x, f2y);
+        self.ctx.stroke();
+
+        let (f3x, f3y) = self.snap_point(
+            x + (dx * 0.50 + dy * 0.1) * size,
+            y + (dy * 0.50 - dx * 0.1) * size,
+        );
+        let (f4x, f4y) = self.snap_point(
+            x + (dx * 0.65 + dy * 0.2) * size,
+            y + (dy * 0.65 - dx * 0.2) * size,
+        );
+        self.ctx.begin_path();
+        self.ctx.move_to(f3x, f3y);
+        self.ctx.line_to(f4x, f4y);
+        self.ctx.stroke();
     }
 
     fn render_snake_snapshot(&self, id: usize, pos: Vec2, dir: Vec2, size: f32, frame_count: u32, camera: &Camera) {
         let screen_pos = camera.world_to_screen(pos);
-        let x = screen_pos.x as f64;
-        let y = screen_pos.y as f64;
+        let (x, y) = self.snap_point(screen_pos.x as f64, screen_pos.y as f64);
         let size = size as f64 * CREATURE_SCALE;
+        self.ctx.set_global_alpha(1.0);
         let flip: f64 = if (frame_count / 5 + id as u32) % 2 == 0 { 1.0 } else { -1.0 };
+        let (dx, dy) = if dir.x == 0.0 && dir.y == 0.0 {
+            (0.0, 1.0)
+        } else {
+            (dir.x as f64, dir.y as f64)
+        };
 
         self.ctx.set_stroke_style_str(COLOR_4);
         self.ctx.set_line_width((1.0 * CREATURE_SCALE).max(1.0));
 
+        // Legs first so body fill masks inner parts
+        let leg_scale = 1.15;
+        let (s1x, s1y) = self.snap_point(
+            x + (dx * (2.5 + flip) * 0.1 + dy * leg_scale) * size,
+            y + (dy * (2.5 + flip) * 0.1 - dx * leg_scale) * size,
+        );
+        let (e1x, e1y) = self.snap_point(
+            x - (dx * (2.5 + flip) * 0.1 + dy * leg_scale) * size,
+            y - (dy * (2.5 + flip) * 0.1 - dx * leg_scale) * size,
+        );
         self.ctx.begin_path();
-        self.ctx.move_to(
-            x + (dir.x as f64 * (2.5 + flip) * 0.1 + dir.y as f64 * 0.8) * size,
-            y + (dir.y as f64 * (2.5 + flip) * 0.1 - dir.x as f64 * 0.8) * size,
-        );
-        self.ctx.line_to(
-            x - (dir.x as f64 * (2.5 + flip) * 0.1 + dir.y as f64 * 0.8) * size,
-            y - (dir.y as f64 * (2.5 + flip) * 0.1 - dir.x as f64 * 0.8) * size,
-        );
+        self.ctx.move_to(s1x, s1y);
+        self.ctx.line_to(e1x, e1y);
         self.ctx.stroke();
 
+        let (s2x, s2y) = self.snap_point(
+            x + (dx * (2.5 - flip) * 0.1 - dy * leg_scale) * size,
+            y + (dy * (2.5 - flip) * 0.1 + dx * leg_scale) * size,
+        );
+        let (e2x, e2y) = self.snap_point(
+            x - (dx * (2.5 - flip) * 0.1 - dy * leg_scale) * size,
+            y - (dy * (2.5 - flip) * 0.1 + dx * leg_scale) * size,
+        );
         self.ctx.begin_path();
-        self.ctx.move_to(
-            x + (dir.x as f64 * (2.5 - flip) * 0.1 - dir.y as f64 * 0.8) * size,
-            y + (dir.y as f64 * (2.5 - flip) * 0.1 + dir.x as f64 * 0.8) * size,
-        );
-        self.ctx.line_to(
-            x - (dir.x as f64 * (2.5 - flip) * 0.1 - dir.y as f64 * 0.8) * size,
-            y - (dir.y as f64 * (2.5 - flip) * 0.1 + dir.x as f64 * 0.8) * size,
-        );
+        self.ctx.move_to(s2x, s2y);
+        self.ctx.line_to(e2x, e2y);
         self.ctx.stroke();
 
-        self.ctx.begin_path();
-        self.ctx.move_to(
-            x + (dir.x as f64 * 0.50 - dir.y as f64 * 0.1) * size,
-            y + (dir.y as f64 * 0.50 + dir.x as f64 * 0.1) * size,
-        );
-        self.ctx.line_to(
-            x + (dir.x as f64 * 0.65 - dir.y as f64 * 0.2) * size,
-            y + (dir.y as f64 * 0.65 + dir.x as f64 * 0.2) * size,
-        );
-        self.ctx.stroke();
-
-        self.ctx.begin_path();
-        self.ctx.move_to(
-            x + (dir.x as f64 * 0.50 + dir.y as f64 * 0.1) * size,
-            y + (dir.y as f64 * 0.50 - dir.x as f64 * 0.1) * size,
-        );
-        self.ctx.line_to(
-            x + (dir.x as f64 * 0.65 + dir.y as f64 * 0.2) * size,
-            y + (dir.y as f64 * 0.65 - dir.x as f64 * 0.2) * size,
-        );
-        self.ctx.stroke();
-
+        // Body fill (black) + outline (red)
+        self.ctx.set_fill_style_str(COLOR_BG);
+        self.draw_circle_filled(x, y, size);
         self.ctx.set_fill_style_str(COLOR_4);
-        self.fill_circle(x, y, size);
+        self.ctx.set_stroke_style_str(COLOR_4);
+        self.ctx.set_line_width((1.0 * CREATURE_SCALE).max(1.0));
+        self.draw_circle_outline(x, y, size);
+
+        // Fangs on top so they remain visible
+        let (f1x, f1y) = self.snap_point(
+            x + (dx * 0.50 - dy * 0.1) * size,
+            y + (dy * 0.50 + dx * 0.1) * size,
+        );
+        let (f2x, f2y) = self.snap_point(
+            x + (dx * 0.65 - dy * 0.2) * size,
+            y + (dy * 0.65 + dx * 0.2) * size,
+        );
+        self.ctx.begin_path();
+        self.ctx.move_to(f1x, f1y);
+        self.ctx.line_to(f2x, f2y);
+        self.ctx.stroke();
+
+        let (f3x, f3y) = self.snap_point(
+            x + (dx * 0.50 + dy * 0.1) * size,
+            y + (dy * 0.50 - dx * 0.1) * size,
+        );
+        let (f4x, f4y) = self.snap_point(
+            x + (dx * 0.65 + dy * 0.2) * size,
+            y + (dy * 0.65 - dx * 0.2) * size,
+        );
+        self.ctx.begin_path();
+        self.ctx.move_to(f3x, f3y);
+        self.ctx.line_to(f4x, f4y);
+        self.ctx.stroke();
     }
 
     fn render_projectile(&self, projectile: &Projectile, camera: &Camera) {
@@ -718,12 +861,106 @@ impl Renderer {
         self.fill_circle(screen_pos.x as f64, screen_pos.y as f64, 1.5 * CREATURE_SCALE);
     }
 
+    fn render_wisp(&self, wisp: &Wisp, frame_count: u32, camera: &Camera) {
+        self.render_wisp_snapshot(wisp.id, wisp.pos, wisp.dir, frame_count, camera);
+    }
+
+    fn render_wisp_snapshot(&self, id: usize, pos: Vec2, dir: Vec2, frame_count: u32, camera: &Camera) {
+        let screen_pos = camera.world_to_screen(pos);
+        let (x, y) = self.snap_point(screen_pos.x as f64, screen_pos.y as f64);
+        let scale = CREATURE_SCALE;
+        let pulse = ((frame_count / 6 + id as u32) % 10) as f64 / 10.0;
+
+        self.ctx.set_fill_style_str(COLOR_LIGHT);
+        self.ctx.set_global_alpha(0.6);
+        self.fill_circle(x, y, 3.5 * scale);
+        self.ctx.set_global_alpha(1.0);
+
+        self.ctx.set_fill_style_str(COLOR_ACCENT1);
+        let orbit = 4.0 * scale;
+        let ox = x + (dir.x as f64 * orbit) * (0.6 + pulse);
+        let oy = y + (dir.y as f64 * orbit) * (0.6 + pulse);
+        self.fill_circle(ox, oy, 1.2 * scale);
+    }
+
+    fn render_guardian(&self, guardian: &crate::entities::Guardian, frame_count: u32, camera: &Camera) {
+        let pos = guardian.pos;
+        let dir = guardian.dir;
+        let screen_pos = camera.world_to_screen(pos);
+        let (x, y) = self.snap_point(screen_pos.x as f64, screen_pos.y as f64);
+        let scale = CREATURE_SCALE;
+        let pulse = ((frame_count as f64 * 0.07).sin() * 0.3 + 0.7) as f64;
+
+        let (_dx, _dy) = if dir.x == 0.0 && dir.y == 0.0 {
+            (0.0, 1.0)
+        } else {
+            (dir.x as f64, dir.y as f64)
+        };
+
+        let body_radius = 7.5 * scale;
+        self.ctx.set_fill_style_str("#2a3b44");
+        self.fill_circle(x, y, body_radius as f64);
+
+        self.ctx.set_fill_style_str("#546a74");
+        self.fill_circle(x - 2.0 * scale as f64, y - 2.0 * scale as f64, (body_radius * 0.6) as f64);
+
+        let tentacle_width = 2.2 * scale as f64;
+        self.ctx.set_stroke_style_str("#7fa3b3");
+        self.ctx.set_line_width(tentacle_width.max(1.0));
+
+        for tentacle in guardian.tentacle_paths() {
+            self.draw_tentacle_path(tentacle, camera, pulse);
+        }
+
+        if guardian.strike_active() {
+            self.ctx.set_global_alpha(0.85);
+            self.ctx.set_fill_style_str("#ff7d6b");
+            for target in guardian.strike_points().iter() {
+                let strike_screen = camera.world_to_screen(*target);
+                let (sx, sy) = self.snap_point(strike_screen.x as f64, strike_screen.y as f64);
+                self.fill_circle(sx, sy, (4.8 * scale) as f64);
+            }
+            let strike_screen = camera.world_to_screen(guardian.strike_pos());
+            let (sx, sy) = self.snap_point(strike_screen.x as f64, strike_screen.y as f64);
+            self.fill_circle(sx, sy, (5.5 * scale) as f64);
+            self.ctx.set_global_alpha(1.0);
+        }
+    }
+
+    fn draw_tentacle_path(&self, tentacle: &crate::entities::Tentacle, camera: &Camera, pulse: f64) {
+        let mut first = true;
+        for (idx, joint) in tentacle.joints.iter().enumerate() {
+            let screen = camera.world_to_screen(*joint);
+            let (x, y) = self.snap_point(screen.x as f64, screen.y as f64);
+            if first {
+                self.ctx.begin_path();
+                self.ctx.move_to(x, y);
+                first = false;
+            } else {
+                let jitter = (pulse * (idx as f64 + tentacle.mode as f64)).sin() * 1.2;
+                self.ctx.line_to(x + jitter, y + jitter);
+            }
+        }
+        self.ctx.stroke();
+    }
+
     fn render_player(&self, player: &Player, camera: &Camera) {
         let screen_pos = camera.world_to_screen(player.pos);
         let (cx, cy) = self.snap_point(screen_pos.x as f64, screen_pos.y as f64);
         let render_cx = self.world_to_render_pixel(screen_pos.x as f64) as f64;
         let render_cy = self.world_to_render_pixel(screen_pos.y as f64) as f64;
         let scale = CREATURE_SCALE;
+
+        if player.is_shielded() {
+            self.ctx.save();
+            let _ = self.ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+            self.ctx.set_global_alpha(0.45);
+            self.ctx.set_stroke_style_str(COLOR_LIGHT);
+            let radius = self.world_to_render_size(14.0 * scale) as f64;
+            self.draw_circle_outline(render_cx, render_cy, (radius / 2.0).ceil());
+            self.ctx.set_global_alpha(1.0);
+            self.ctx.restore();
+        }
 
         // Phase effect - ghostly trail when phasing
         if player.is_phasing() {
@@ -844,6 +1081,17 @@ impl Renderer {
         let render_cx = self.world_to_render_pixel(screen_pos.x as f64) as f64;
         let render_cy = self.world_to_render_pixel(screen_pos.y as f64) as f64;
         let scale = CREATURE_SCALE;
+
+        if remote.shielded {
+            self.ctx.save();
+            let _ = self.ctx.set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+            self.ctx.set_global_alpha(0.45);
+            self.ctx.set_stroke_style_str(COLOR_LIGHT);
+            let radius = self.world_to_render_size(14.0 * scale) as f64;
+            self.draw_circle_outline(render_cx, render_cy, (radius / 2.0).ceil());
+            self.ctx.set_global_alpha(1.0);
+            self.ctx.restore();
+        }
 
         // Phase effect - ghostly trail when phasing
         if remote.phasing {
@@ -1118,24 +1366,32 @@ impl Renderer {
         let _ = self
             .display_ctx
             .fill_text(&format!("Kills: {}", game.kills), 10.0, 45.0);
+        let display_x = game.player.pos.x / 1000.0;
+        let display_y = game.player.pos.y / 1000.0;
         let _ = self.display_ctx.fill_text(
-            &format!("Pos: ({:.0}, {:.0})", game.player.pos.x, game.player.pos.y),
+            &format!("Pos: ({:.1}, {:.1})", display_x, display_y),
             10.0,
             65.0,
         );
+        if game.shrine_badge_unlocked {
+            let _ = self.display_ctx.fill_text("Badge: Shrinefinder", 10.0, 85.0);
+        }
         if network.room_code.is_empty() {
             let stats = PlayerStats {
                 kills: game.kills,
-                spider_kills: game.kills,
-                cannon_kills: 0,
-                snake_kills: 0,
+                spider_kills: game.spider_kills,
+                cannon_kills: game.cannon_kills,
+                snake_kills: game.snake_kills,
+                wisp_kills: game.wisp_kills,
+                attack_attempts: game.attack_attempts,
+                attack_hits: game.attack_hits,
                 deaths: game.deaths,
                 time_played_frames: game.frame_count.saturating_sub(game.start_frame),
             };
             let score = network.score_for_stats(&stats);
             let _ = self
                 .display_ctx
-                .fill_text(&format!("Score: {}", score), 10.0, 85.0);
+                .fill_text(&format!("Score: {}", score), 10.0, if game.shrine_badge_unlocked { 105.0 } else { 85.0 });
         }
         let map_size = 120.0;
         let map_padding = 10.0;
@@ -1146,10 +1402,16 @@ impl Renderer {
             self.display_ctx.set_font("12px monospace");
             self.display_ctx.set_text_align("left");
             let _ = self.display_ctx.fill_text("M: Map", map_left, map_top - 6.0);
+            let _ = self.display_ctx.fill_text("B: Bind Abilities", map_left, map_top - 22.0);
+            let _ = self.display_ctx.fill_text("4: Payments", map_left, map_top - 36.0);
+            let _ = self.display_ctx.fill_text("F3: Net Debug", map_left, map_top - 50.0);
         }
 
         if !network.room_code.is_empty() {
             self.render_team_stats(game, network);
+        }
+        if game.net_debug_overlay {
+            self.render_network_debug_overlay(network);
         }
         self.render_minimap(game, network);
         if game.map_open {
@@ -1162,8 +1424,55 @@ impl Renderer {
             self.render_mobile_controls(game);
         }
 
+        if !game.map_open {
+            self.render_ability_bar(game);
+        }
+
         self.render_network_status_on(&self.display_ctx, network);
     }
+
+    fn render_ability_bar(&self, game: &Game) {
+        let entries = game.ability_bar_entries();
+        if entries.is_empty() {
+            return;
+        }
+
+        self.display_ctx.set_font("10px monospace");
+        self.display_ctx.set_text_align("center");
+
+        for (idx, entry) in entries.iter().enumerate() {
+            let color = if entry.ready { COLOR_LIGHT } else { "#556" };
+            self.display_ctx.set_stroke_style_str(color);
+            let _ = self.display_ctx.stroke_rect(entry.x, entry.y, entry.w, entry.h);
+
+            self.display_ctx.set_fill_style_str(color);
+            let label_y = entry.y + entry.h * 0.55;
+            let _ = self.display_ctx.fill_text(&entry.label, entry.x + entry.w * 0.5, label_y);
+
+            if !entry.key.is_empty() {
+                let key = entry.key.trim_start_matches("Key");
+                let key_y = entry.y + entry.h + 10.0;
+                let _ = self.display_ctx.fill_text(key, entry.x + entry.w * 0.5, key_y);
+            }
+
+            if game.ability_bind_open && idx == game.ability_bind_selected() {
+                self.display_ctx.set_stroke_style_str(COLOR_ACCENT2);
+                let _ = self.display_ctx.stroke_rect(entry.x - 2.0, entry.y - 2.0, entry.w + 4.0, entry.h + 4.0);
+            }
+        }
+
+        if game.ability_bind_open {
+            self.display_ctx.set_fill_style_str(COLOR_LIGHT);
+            self.display_ctx.set_font("12px monospace");
+            let msg = if game.ability_bind_waiting() {
+                "Press a key to bind (Esc to cancel)"
+            } else {
+                "Bind: arrows to select, Enter to rebind, Esc to close"
+            };
+            let _ = self.display_ctx.fill_text(msg, (self.width as f64) * 0.5, (self.height as f64) - 10.0);
+        }
+    }
+
 
     fn render_gameover_overlay(&self, game: &Game, network: &NetworkSession) {
         self.display_ctx.set_global_alpha(1.0);
@@ -1252,6 +1561,72 @@ impl Renderer {
         if game.player_list_open && !game.map_open {
             self.render_player_list_overlay(game, network, &entries);
         }
+    }
+
+    fn render_network_debug_overlay(&self, network: &NetworkSession) {
+        let telemetry = &network.relay_telemetry;
+        let queue_depth = network.relay_queue_depth();
+        let congestion = network.relay_congestion_level();
+        let role = if network.is_host { "ROOT" } else { "NODE" };
+
+        let left = 10.0;
+        let top = 110.0;
+        let width = 290.0;
+        let height = 96.0;
+
+        self.display_ctx.set_fill_style_str("rgba(0,0,0,0.55)");
+        self.display_ctx.fill_rect(left, top, width, height);
+        self.display_ctx.set_stroke_style_str("#445566");
+        self.display_ctx.set_line_width(1.0);
+        self.display_ctx.stroke_rect(left, top, width, height);
+
+        self.display_ctx.set_fill_style_str("#d7e6e6");
+        self.display_ctx.set_font("11px monospace");
+        self.display_ctx.set_text_align("left");
+        let _ = self.display_ctx.fill_text(
+            &format!(
+                "Net {} {} q:{} lvl:{} conn:{} known:{} links:{}",
+                role,
+                if network.discovery_attached() { "DISC" } else { "OVR" },
+                queue_depth,
+                congestion,
+                network.peer_count() + 1,
+                network.known_peer_count(),
+                network.desired_peer_count()
+            ),
+            left + 8.0,
+            top + 16.0,
+        );
+        let _ = self.display_ctx.fill_text(
+            &format!(
+                "rx:{} up:{} dn:{} bc:{}",
+                telemetry.recv_messages, telemetry.sent_upstream, telemetry.sent_downstream, telemetry.sent_broadcast
+            ),
+            left + 8.0,
+            top + 34.0,
+        );
+        let _ = self.display_ctx.fill_text(
+            &format!(
+                "drop:{} qdrop:{} maxq:{} sw:{}",
+                telemetry.dropped_messages,
+                telemetry.dropped_queue_entries,
+                telemetry.max_queue_depth,
+                telemetry.stale_parent_switches
+            ),
+            left + 8.0,
+            top + 52.0,
+        );
+        let _ = self.display_ctx.fill_text(
+            &format!(
+                "root:{:?} supernodes:{} fanout:{}",
+                network.supernode_id,
+                network.supernode_set.len(),
+                network.relay_fanout()
+            ),
+            left + 8.0,
+            top + 70.0,
+        );
+        let _ = self.display_ctx.fill_text("F3 to hide", left + 8.0, top + 88.0);
     }
 
     fn render_player_list_overlay(&self, game: &Game, network: &NetworkSession, entries: &[PlayerEntry]) {
@@ -1521,6 +1896,11 @@ impl Renderer {
                     enemies.push((*pos, 2));
                 }
             }
+            for (pos, _dir, alive) in &snapshot.wisp_positions {
+                if *alive {
+                    enemies.push((*pos, 3));
+                }
+            }
         } else {
             for spider in &game.spiders {
                 if spider.alive {
@@ -1535,6 +1915,16 @@ impl Renderer {
             for snake in &game.snakes {
                 if snake.alive {
                     enemies.push((snake.pos, 2));
+                }
+            }
+            for wisp in &game.wisps {
+                if wisp.alive {
+                    enemies.push((wisp.pos, 3));
+                }
+            }
+            for guardian in &game.guardians {
+                if guardian.alive {
+                    enemies.push((guardian.pos, 4));
                 }
             }
         }
@@ -1598,10 +1988,22 @@ impl Renderer {
             let color = match kind {
                 1 => "#dd8844",
                 2 => "#55aa55",
+                3 => "#c9a6ff",
+                4 => "#7fa3b3",
                 _ => COLOR_ACCENT2,
             };
             self.display_ctx.set_fill_style_str(color);
             self.display_ctx.fill_rect(x, y, 2.0, 2.0);
+        }
+
+        let shrine_pos = crate::game::SHRINE_POS;
+        let fx = (shrine_pos.x as f64 - world_min_x) / world_span_x;
+        let fy = (shrine_pos.y as f64 - world_min_y) / world_span_y;
+        if fx >= 0.0 && fx <= 1.0 && fy >= 0.0 && fy <= 1.0 {
+            let sx = map_left + fx * (map_size - 2.0) + 1.0;
+            let sy = map_top + fy * (map_size - 2.0) + 1.0;
+            self.display_ctx.set_fill_style_str("#8cd4ff");
+            self.display_ctx.fill_rect(sx - 2.0, sy - 2.0, 4.0, 4.0);
         }
 
         let mut players = Vec::new();
@@ -1724,6 +2126,8 @@ impl Renderer {
                     let color = match kind {
                         1 => "#dd8844",
                         2 => "#55aa55",
+                        3 => "#c9a6ff",
+                        4 => "#7fa3b3",
                         _ => COLOR_ACCENT2,
                     };
                     self.display_ctx.set_fill_style_str(color);
@@ -1755,6 +2159,18 @@ impl Renderer {
                     }
                 }
             }
+        }
+
+        let shrine_pos = crate::game::SHRINE_POS;
+        if shrine_pos.x as f64 >= world_min_x && shrine_pos.x as f64 <= world_max_x
+            && shrine_pos.y as f64 >= world_min_y && shrine_pos.y as f64 <= world_max_y
+        {
+            let x = map_left + (shrine_pos.x as f64 - world_min_x) * pixels_per_world;
+            let y = map_top + (shrine_pos.y as f64 - world_min_y) * pixels_per_world;
+            self.display_ctx.set_fill_style_str("#8cd4ff");
+            self.display_ctx.begin_path();
+            let _ = self.display_ctx.arc(x, y, 4.0, 0.0, std::f64::consts::TAU);
+            self.display_ctx.fill();
         }
 
         if let Some(target) = game.map_target {

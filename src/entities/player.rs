@@ -5,10 +5,13 @@ use crate::world::ChunkManager;
 // Timer constants from original game
 const ATTACK_MIN: i32 = -5;
 const PHASE_MIN: i32 = -10;
+const SHIELD_DURATION: i32 = 120;
+const SHIELD_COOLDOWN: i32 = 600;
 
 // Movement speed - increased for larger viewport
 const MOVE_SPEED: f32 = 3.5;
 const PHASE_SPEED: f32 = 5.0;
+const SPEED_BOOST_MULTIPLIER: f32 = 1.6;
 // Creature scale for collision/interaction sizes
 const CREATURE_SCALE: f32 = 2.0;
 
@@ -40,6 +43,10 @@ pub struct Player {
     pub phase_timer: i32,
     pub attack_timer: i32,
     pub blocking: bool,
+    pub shield_timer: i32,
+    pub shield_cooldown: i32,
+    pub speed_boost_timer: i32,
+    pub speed_boost_cooldown: i32,
 }
 
 impl Player {
@@ -54,6 +61,10 @@ impl Player {
             phase_timer: PHASE_MIN,
             attack_timer: ATTACK_MIN,
             blocking: false,
+            shield_timer: 0,
+            shield_cooldown: 0,
+            speed_boost_timer: 0,
+            speed_boost_cooldown: 0,
         }
     }
 
@@ -68,6 +79,10 @@ impl Player {
             phase_timer: PHASE_MIN,
             attack_timer: ATTACK_MIN,
             blocking: false,
+            shield_timer: 0,
+            shield_cooldown: 0,
+            speed_boost_timer: 0,
+            speed_boost_cooldown: 0,
         }
     }
 
@@ -126,6 +141,18 @@ impl Player {
         if self.phase_timer > PHASE_MIN {
             self.phase_timer -= 1;
         }
+        if self.shield_timer > 0 {
+            self.shield_timer -= 1;
+        }
+        if self.shield_cooldown > 0 {
+            self.shield_cooldown -= 1;
+        }
+        if self.speed_boost_timer > 0 {
+            self.speed_boost_timer -= 1;
+        }
+        if self.speed_boost_cooldown > 0 {
+            self.speed_boost_cooldown -= 1;
+        }
     }
 
     fn update_input(&mut self, input: &Input) {
@@ -157,10 +184,11 @@ impl Player {
     }
 
     fn get_speed(&self) -> f32 {
-        if self.phase_timer > 0 {
-            PHASE_SPEED
+        let base = if self.phase_timer > 0 { PHASE_SPEED } else { self.move_speed };
+        if self.speed_boost_timer > 0 {
+            base * SPEED_BOOST_MULTIPLIER
         } else {
-            self.move_speed
+            base
         }
     }
 
@@ -180,9 +208,31 @@ impl Player {
         self.phase_timer > 0
     }
 
+    pub fn is_shielded(&self) -> bool {
+        self.shield_timer > 0
+    }
+
+    pub fn try_activate_shield(&mut self) -> bool {
+        if self.shield_cooldown > 0 || self.shield_timer > 0 {
+            return false;
+        }
+        self.shield_timer = SHIELD_DURATION;
+        self.shield_cooldown = SHIELD_COOLDOWN;
+        true
+    }
+
+    pub fn try_activate_speed_boost(&mut self, duration: i32, cooldown: i32) -> bool {
+        if self.speed_boost_cooldown > 0 || self.speed_boost_timer > 0 {
+            return false;
+        }
+        self.speed_boost_timer = duration;
+        self.speed_boost_cooldown = cooldown;
+        true
+    }
+
     /// Body collision - original uses 4.5 + radius
     pub fn collide_body(&self, target: Vec2, radius: f32) -> bool {
-        if !self.alive || self.is_phasing() {
+        if !self.alive || self.is_phasing() || self.is_shielded() {
             return false;
         }
         self.pos.distance(target) < 4.5 * CREATURE_SCALE + radius
@@ -234,6 +284,7 @@ impl Player {
         self.blocking = state.is_blocking();
         self.attack_timer = if state.is_attacking() { 1 } else { ATTACK_MIN };
         self.phase_timer = if state.is_phasing() { 1 } else { PHASE_MIN };
+        self.shield_timer = if state.is_shielded() { 1 } else { 0 };
         if self.move_dir.x != 0.0 || self.move_dir.y != 0.0 {
             self.phase_dir = self.move_dir;
         }

@@ -1,21 +1,23 @@
 use crate::math::Vec2;
 
-pub const BUTTON_UP: u8 = 0b0000_0001;
-pub const BUTTON_DOWN: u8 = 0b0000_0010;
-pub const BUTTON_LEFT: u8 = 0b0000_0100;
-pub const BUTTON_RIGHT: u8 = 0b0000_1000;
-pub const BUTTON_ATTACK: u8 = 0b0001_0000;  // Z key / Space
-pub const BUTTON_PHASE: u8 = 0b0010_0000;   // X key / Shift (quantum phase)
-pub const BUTTON_MAP: u8 = 0b0100_0000;     // M key / Map toggle
+pub const BUTTON_UP: u16 = 0b0000_0000_0000_0001;
+pub const BUTTON_DOWN: u16 = 0b0000_0000_0000_0010;
+pub const BUTTON_LEFT: u16 = 0b0000_0000_0000_0100;
+pub const BUTTON_RIGHT: u16 = 0b0000_0000_0000_1000;
+pub const BUTTON_ATTACK: u16 = 0b0000_0000_0001_0000;  // Z key / Space
+pub const BUTTON_PHASE: u16 = 0b0000_0000_0010_0000;   // X key / Shift (quantum phase)
+pub const BUTTON_MAP: u16 = 0b0000_0000_0100_0000;     // M key / Map toggle
+pub const BUTTON_ABILITY1: u16 = 0b0000_0000_1000_0000; // R key / Bubble shield
+pub const BUTTON_ABILITY2: u16 = 0b0000_0001_0000_0000; // F key / Shockwave
 
 #[derive(Debug, Clone, Default)]
 pub struct Input {
-    pub down: u8,
-    prev: u8,
-    pub pressed: u8,
-    pub released: u8,
+    pub down: u16,
+    prev: u16,
+    pub pressed: u16,
+    pub released: u16,
     pub axis: Vec2,
-    touch_down: u8,
+    touch_down: u16,
     touch_axis: Option<Vec2>,
 }
 
@@ -24,7 +26,7 @@ impl Input {
         Self::default()
     }
 
-    pub fn from_raw(raw: u8, prev_raw: u8) -> Self {
+    pub fn from_raw(raw: u16, prev_raw: u16) -> Self {
         let mut input = Self {
             down: raw,
             prev: prev_raw,
@@ -77,29 +79,29 @@ impl Input {
         }
     }
 
-    pub fn is_down(&self, button: u8) -> bool {
+    pub fn is_down(&self, button: u16) -> bool {
         self.down & button != 0
     }
 
-    pub fn is_pressed(&self, button: u8) -> bool {
+    pub fn is_pressed(&self, button: u16) -> bool {
         self.pressed & button != 0
     }
 
-    pub fn is_released(&self, button: u8) -> bool {
+    pub fn is_released(&self, button: u16) -> bool {
         self.released & button != 0
     }
 
-    pub fn get_raw(&self) -> u8 {
+    pub fn get_raw(&self) -> u16 {
         self.down | self.touch_down
     }
 
-    pub fn set_touch_state(&mut self, axis: Option<Vec2>, down_mask: u8) {
+    pub fn set_touch_state(&mut self, axis: Option<Vec2>, down_mask: u16) {
         self.touch_axis = axis;
         self.touch_down = down_mask;
     }
 }
 
-fn key_to_button(code: &str) -> u8 {
+fn key_to_button(code: &str) -> u16 {
     match code {
         "ArrowUp" | "KeyW" => BUTTON_UP,
         "ArrowDown" | "KeyS" => BUTTON_DOWN,
@@ -108,6 +110,8 @@ fn key_to_button(code: &str) -> u8 {
         "KeyZ" | "Space" => BUTTON_ATTACK,
         "KeyX" | "ShiftLeft" | "ShiftRight" => BUTTON_PHASE,
         "KeyM" => BUTTON_MAP,
+        "KeyR" => BUTTON_ABILITY1,
+        "KeyF" => BUTTON_ABILITY2,
         _ => 0,
     }
 }

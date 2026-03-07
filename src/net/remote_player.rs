@@ -12,6 +12,7 @@ pub struct RemotePlayer {
     pub attacking: bool,
     pub blocking: bool,
     pub phasing: bool,
+    pub shielded: bool,
 
     // For interpolation
     target_pos: Vec2,
@@ -32,6 +33,7 @@ impl RemotePlayer {
             attacking: state.is_attacking(),
             blocking: state.is_blocking(),
             phasing: state.is_phasing(),
+            shielded: state.is_shielded(),
             target_pos: pos,
             prev_pos: pos,
             interpolation_t: 1.0,
@@ -49,6 +51,7 @@ impl RemotePlayer {
         self.attacking = state.is_attacking();
         self.blocking = state.is_blocking();
         self.phasing = state.is_phasing();
+        self.shielded = state.is_shielded();
         self.interpolation_t = 0.0;
         self.last_update_frame = frame;
     }
@@ -64,6 +67,7 @@ impl RemotePlayer {
         self.attacking = state.is_attacking();
         self.blocking = state.is_blocking();
         self.phasing = state.is_phasing();
+        self.shielded = state.is_shielded();
         self.interpolation_t = 1.0;
     }
 

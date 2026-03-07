@@ -17,6 +17,8 @@ pub struct Cannon {
     shoot_timer: u32,
 }
 
+const PROJECTILE_SPEED: f32 = 5.5;
+
 impl Cannon {
     pub fn new<R: Rng>(id: usize, screen_width: f32, screen_height: f32, rng: &mut R) -> Self {
         let x = rng.gen::<f32>() * 100.0 - 50.0;
@@ -160,7 +162,7 @@ impl Cannon {
 
         if on_screen && (frame_count + self.shoot_timer) % 100 == 0 {
             let projectile_pos = self.pos + self.look_dir * 4.0;
-            let projectile_speed = self.look_dir * 2.0;
+            let projectile_speed = self.look_dir * PROJECTILE_SPEED;
             return Some(CannonEvent::Shoot { pos: projectile_pos, speed: projectile_speed });
         }
 
@@ -221,7 +223,7 @@ impl Cannon {
         // Shooting (only when on screen)
         if on_screen && (frame_count + self.shoot_timer) % 100 == 0 {
             let projectile_pos = self.pos + self.look_dir * 4.0;
-            let projectile_speed = self.look_dir * 2.0;
+            let projectile_speed = self.look_dir * PROJECTILE_SPEED;
             return Some(CannonEvent::Shoot { pos: projectile_pos, speed: projectile_speed });
         }
 

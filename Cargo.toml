@@ -56,3 +56,9 @@ features = [
 [profile.release]
 lto = true
 opt-level = "z"
+
+[patch.crates-io]
+matchbox_socket = { path = "vendor/matchbox_socket" }
+
+[dev-dependencies]
+uuid = "1"

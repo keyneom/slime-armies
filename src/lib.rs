@@ -14,11 +14,12 @@ mod entities;
 mod world;
 mod net;
 mod audio;
+mod payment;
 
 use game::{Game, Scene};
 use input::Input;
 use render::Renderer;
-use net::{NetworkSession, NetworkState, PlayerState};
+use net::{IceConfig, NetworkSession, NetworkState, PlayerState};
 use audio::Audio;
 
 // Default signaling server - using Johan Helsing's public matchbox server
@@ -28,6 +29,7 @@ const DEFAULT_SIGNALING_SERVER: &str = "wss://match-0-13.helsing.studio";
 // Configurable server URL (can be set via JS)
 thread_local! {
     static SIGNALING_SERVER: RefCell<String> = RefCell::new(DEFAULT_SIGNALING_SERVER.to_string());
+    static ICE_CONFIG: RefCell<IceConfig> = RefCell::new(IceConfig::default());
 }
 
 // Thread-local storage for game state accessible from JS
@@ -286,7 +288,8 @@ pub fn create_room() -> String {
         if let Some(state) = gs.borrow().as_ref() {
             let mut state_ref = state.borrow_mut();
             let server = signaling_server_url();
-            state_ref.network.create_room(&server)
+            let ice = ice_config();
+            state_ref.network.create_room(&server, &ice)
         } else {
             String::new()
         }
@@ -300,7 +303,8 @@ pub fn join_room(room_code: &str) {
         if let Some(state) = gs.borrow().as_ref() {
             let mut state_ref = state.borrow_mut();
             let server = signaling_server_url();
-            state_ref.network.join_room(&server, room_code);
+            let ice = ice_config();
+            state_ref.network.join_room(&server, room_code, &ice);
         }
     });
 }
@@ -401,6 +405,79 @@ pub fn get_signaling_server() -> String {
     SIGNALING_SERVER.with(|s| s.borrow().clone())
 }
 
+/// Set ICE server URLs and optional auth for TURN.
+/// `urls_csv` supports comma-separated values, e.g.:
+/// "stun:stun.l.google.com:19302,turn:turn.example.com:3478?transport=udp"
+#[wasm_bindgen]
+pub fn set_ice_servers(urls_csv: &str, username: &str, credential: &str) {
+    let urls: Vec<String> = urls_csv
+        .split(',')
+        .map(|u| u.trim())
+        .filter(|u| !u.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    ICE_CONFIG.with(|cfg| {
+        let mut cfg = cfg.borrow_mut();
+        cfg.urls = if urls.is_empty() {
+            IceConfig::default().urls
+        } else {
+            urls
+        };
+        cfg.username = if username.trim().is_empty() {
+            None
+        } else {
+            Some(username.trim().to_string())
+        };
+        cfg.credential = if credential.trim().is_empty() {
+            None
+        } else {
+            Some(credential.trim().to_string())
+        };
+    });
+}
+
+/// Enable TURN fallback while keeping default STUN servers.
+#[wasm_bindgen]
+pub fn set_turn_fallback(url: &str, username: &str, credential: &str) {
+    let turn_url = url.trim();
+    if turn_url.is_empty() {
+        return;
+    }
+    ICE_CONFIG.with(|cfg| {
+        let mut cfg = cfg.borrow_mut();
+        if cfg.urls.is_empty() {
+            cfg.urls = IceConfig::default().urls;
+        }
+        if !cfg.urls.iter().any(|u| u == turn_url) {
+            cfg.urls.push(turn_url.to_string());
+        }
+        cfg.username = if username.trim().is_empty() {
+            None
+        } else {
+            Some(username.trim().to_string())
+        };
+        cfg.credential = if credential.trim().is_empty() {
+            None
+        } else {
+            Some(credential.trim().to_string())
+        };
+    });
+}
+
+/// Reset ICE servers back to default STUN-only configuration.
+#[wasm_bindgen]
+pub fn reset_ice_servers() {
+    ICE_CONFIG.with(|cfg| {
+        *cfg.borrow_mut() = IceConfig::default();
+    });
+}
+
+/// Returns the currently configured ICE URLs as comma-separated text.
+#[wasm_bindgen]
+pub fn get_ice_servers() -> String {
+    ICE_CONFIG.with(|cfg| cfg.borrow().urls.join(","))
+}
+
 /// Toggle audio mute on/off
 #[wasm_bindgen]
 pub fn toggle_mute() {
@@ -458,9 +535,24 @@ pub fn send_debug_command(command: String) {
     });
 }
 
+fn make_event_id(seed: u64, a: u64, b: u64, c: u64) -> u64 {
+    let mut x = seed ^ 0x9e3779b97f4a7c15;
+    x = x.wrapping_add(a.wrapping_mul(0xbf58476d1ce4e5b9));
+    x = x.rotate_left(27) ^ b.wrapping_mul(0x94d049bb133111eb);
+    x = x.wrapping_add(c.wrapping_mul(0x9e3779b97f4a7c15));
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    x
+}
+
 /// Helper function to get the signaling server URL
 fn signaling_server_url() -> String {
     SIGNALING_SERVER.with(|s| s.borrow().clone())
+}
+
+fn ice_config() -> IceConfig {
+    ICE_CONFIG.with(|cfg| cfg.borrow().clone())
 }
 
 struct GameState {
@@ -1110,7 +1202,13 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                             if state_ref.game.can_send_chat() {
                                 let local_hash = state_ref.network.local_peer_hash.unwrap_or(0);
                                 let trimmed = text.trim();
-                                if trimmed.to_ascii_lowercase().starts_with("/mute") {
+                                if trimmed.to_ascii_lowercase().starts_with("/bind ") {
+                                    let cmd = trimmed.trim_start_matches('/').to_string();
+                                    match state_ref.game.apply_debug_command(&cmd) {
+                                        Ok(message) => state_ref.game.push_chat_line("System".to_string(), message),
+                                        Err(err) => state_ref.game.push_chat_line("System".to_string(), err),
+                                    }
+                                } else if trimmed.to_ascii_lowercase().starts_with("/mute") {
                                     let target = trimmed.splitn(2, ' ').nth(1).unwrap_or("").trim();
                                     if local_hash == 0 {
                                         state_ref.game.push_chat_line(
@@ -1238,6 +1336,18 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                                         handled_keys.push(code.clone());
                                     }
                                 }
+                                "KeyB" => {
+                                    if state_ref.game.scene == Scene::Game {
+                                        state_ref.game.toggle_ability_bind_menu();
+                                        handled_keys.push(code.clone());
+                                    }
+                                }
+                                "F3" => {
+                                    if state_ref.game.scene == Scene::Game {
+                                        state_ref.game.toggle_net_debug_overlay();
+                                        handled_keys.push(code.clone());
+                                    }
+                                }
                                 "Slash" => {
                                     if state_ref.game.player_list_open {
                                         state_ref.game.activate_player_list_search();
@@ -1287,6 +1397,32 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     }
                     // Process key down events for game input
                     for code in buf.keys_down.drain(..) {
+                        if state_ref.game.ability_bind_open {
+                            if state_ref.game.ability_bind_waiting() {
+                                if state_ref.game.handle_ability_bind_key(&code) {
+                                    continue;
+                                }
+                            } else if code == "ArrowLeft" {
+                                state_ref.game.cycle_ability_bind_selection(-1);
+                                continue;
+                            } else if code == "ArrowRight" {
+                                state_ref.game.cycle_ability_bind_selection(1);
+                                continue;
+                            } else if code == "Enter" {
+                                state_ref.game.start_ability_rebind();
+                                continue;
+                            } else if code == "Escape" {
+                                state_ref.game.toggle_ability_bind_menu();
+                                continue;
+                            }
+                        }
+                        if code == "Digit4" {
+                            crate::payment::open_payment_modal();
+                            continue;
+                        }
+                        if state_ref.game.handle_ability_key(&code) {
+                            continue;
+                        }
                         state_ref.input.key_down(&code);
                     }
 
@@ -1401,6 +1537,11 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                             }
                         }
                     }
+                    if state_ref.game.scene == Scene::Game && !state_ref.game.map_open {
+                        if state_ref.game.handle_ability_bar_click(x, y) {
+                            buf.click = None;
+                        }
+                    }
                 }
 
                 if buf.enter
@@ -1419,7 +1560,7 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
             if state_ref.game.mobile_mode {
                 TOUCH_STATE.with(|state| {
                     let mut state = state.borrow_mut();
-                    let mut down_mask = 0u8;
+                    let mut down_mask = 0u16;
                     let mut axis = None;
                     if !state_ref.game.map_open && !state_ref.game.player_list_open {
                         if state.attack_id.is_some() {
@@ -1538,7 +1679,8 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 let player_name = state_ref.game.player_name.clone();
                 state_ref.network.set_player_name(&player_name);
                 let server = signaling_server_url();
-                let code = state_ref.network.create_room(&server);
+                let ice = ice_config();
+                let code = state_ref.network.create_room(&server, &ice);
                 // Store the room code so it displays in the UI
                 state_ref.game.room_code_input = code;
                 // Don't start game yet - wait for connection on title screen
@@ -1547,7 +1689,8 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 let player_name = state_ref.game.player_name.clone();
                 state_ref.network.set_player_name(&player_name);
                 let server = signaling_server_url();
-                state_ref.network.join_room(&server, &room_code);
+                let ice = ice_config();
+                state_ref.network.join_room(&server, &room_code, &ice);
                 // Don't start game yet - wait for connection on title screen
             }
 
@@ -1680,18 +1823,39 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 for (enemy_type, enemy_id) in kills {
                     state_ref.network.record_local_kill(enemy_type);
                     let killer_hash = state_ref.network.local_peer_hash.unwrap_or(0);
+                    let event_id = make_event_id(
+                        killer_hash,
+                        enemy_type as u64,
+                        enemy_id as u64,
+                        state_ref.game.frame_count as u64,
+                    );
                     state_ref.network.send_enemy_kill(net::EnemyKill {
                         enemy_type: enemy_type as u8,
                         enemy_id,
                         killer_x: player_pos.x,
                         killer_y: player_pos.y,
                         killer_hash,
+                        event_id,
                     });
                 }
 
-                // Process enemy kills from other players
-                let remote_kills = state_ref.network.take_enemy_kills();
-                for (_peer_id, kill) in remote_kills {
+                let (attack_attempts, attack_hits) = state_ref.game.take_pending_attack_stats();
+                if attack_attempts > 0 {
+                    state_ref.network.record_local_attack_attempts(attack_attempts);
+                }
+                if attack_hits > 0 {
+                    state_ref.network.record_local_attack_hits(attack_hits);
+                }
+
+                // Process enemy kills from other players (optimistic first)
+                let optimistic_kills = state_ref.network.take_enemy_kills_optimistic();
+                for kill in optimistic_kills {
+                    if let Some(enemy_type) = net::EnemyType::from_u8(kill.enemy_type) {
+                        state_ref.game.kill_enemy(enemy_type, kill.enemy_id);
+                    }
+                }
+                let confirmed_kills = state_ref.network.take_enemy_kills_confirmed();
+                for kill in confirmed_kills {
                     if let Some(enemy_type) = net::EnemyType::from_u8(kill.enemy_type) {
                         state_ref.game.kill_enemy(enemy_type, kill.enemy_id);
                         if let Some(local_hash) = state_ref.network.local_peer_hash {
@@ -1712,13 +1876,21 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 }
                 for mut death in deaths {
                     let victim_hash = state_ref.network.local_peer_hash.unwrap_or(0);
+                    let event_id = make_event_id(
+                        victim_hash,
+                        death.killed_by_type as u64,
+                        death.killed_by_id as u64,
+                        state_ref.game.frame_count as u64,
+                    );
                     death.victim_hash = victim_hash;
+                    death.event_id = event_id;
                     state_ref.network.send_player_death(death);
                 }
 
-                // Process player deaths from other players
-                let remote_deaths = state_ref.network.take_player_deaths();
-                for (_peer_id, death) in remote_deaths {
+                // Process player deaths from other players (optimistic/confirmed)
+                let _optimistic_deaths = state_ref.network.take_player_deaths_optimistic();
+                let confirmed_deaths = state_ref.network.take_player_deaths_confirmed();
+                for death in confirmed_deaths {
                     if let Some(local_hash) = state_ref.network.local_peer_hash {
                         if death.victim_hash == local_hash {
                             continue;
@@ -1757,6 +1929,28 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     }
                 }
 
+                // Paid ability requests - build proof hash and send for verification
+                let paid_ability_requests = state_ref.game.take_paid_ability_requests();
+                for request in paid_ability_requests {
+                    let ability = state_ref.network.build_paid_ability(
+                        request.ability_type,
+                        request.x,
+                        request.y,
+                        request.radius,
+                        request.nonce,
+                    );
+                    if state_ref.network.room_code.is_empty() {
+                        state_ref.game.apply_paid_ability(ability, true);
+                        continue;
+                    }
+                    state_ref.game.store_paid_ability_candidate(ability);
+                    if state_ref.network.is_host {
+                        state_ref.network.send_paid_ability(ability);
+                    } else {
+                        state_ref.network.send_paid_ability_to_supernode(ability);
+                    }
+                }
+
                 let incoming_paid = state_ref.network.take_paid_obstacles();
                 for (sender, obstacle) in incoming_paid {
                     let from_supernode = state_ref.network.is_host
@@ -1780,7 +1974,10 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                             proof_hash: obstacle.proof_hash,
                         });
 
-                        if state_ref.network.paid_obstacle_confirmation_count(obstacle.proof_hash) >= 2 {
+                        let has_supernode_ack = state_ref.network.paid_obstacle_has_supernode_ack(obstacle.proof_hash);
+                        if has_supernode_ack
+                            && state_ref.network.paid_obstacle_confirmation_count(obstacle.proof_hash) >= 2
+                        {
                             state_ref.game.apply_paid_obstacle(obstacle);
                         } else {
                             state_ref.game.store_paid_obstacle_candidate(obstacle);
@@ -1791,6 +1988,54 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     }
                 }
 
+                let incoming_paid_abilities = state_ref.network.take_paid_abilities();
+                for (sender, ability) in incoming_paid_abilities {
+                    let from_supernode = state_ref.network.is_host
+                        || sender == "sync"
+                        || state_ref.network.supernode_id.is_none()
+                        || state_ref.network.is_supernode_sender(&sender);
+                    if !from_supernode {
+                        continue;
+                    }
+
+                    if let Some(peer_id) = state_ref.network.resolve_peer_id(&sender) {
+                        state_ref.network
+                            .record_paid_ability_confirmation(ability.proof_hash, peer_id);
+                    }
+
+                    let verified = state_ref.network.verify_paid_ability(&ability);
+                    if verified {
+                        if let Some(local_id) = state_ref.network.local_peer_id {
+                            state_ref.network
+                                .record_paid_ability_confirmation(ability.proof_hash, local_id);
+                        }
+                        state_ref.network.send_paid_ability_ack(net::PaidAbilityAck {
+                            proof_hash: ability.proof_hash,
+                        });
+
+                        let has_supernode_ack = state_ref
+                            .network
+                            .paid_ability_has_supernode_ack(ability.proof_hash);
+                        if has_supernode_ack
+                            && state_ref
+                                .network
+                                .paid_ability_confirmation_count(ability.proof_hash)
+                                >= 2
+                        {
+                            let is_local = state_ref
+                                .network
+                                .resolve_peer_id(&sender)
+                                .map(|id| Some(id) == state_ref.network.local_peer_id)
+                                .unwrap_or(false);
+                            state_ref.game.apply_paid_ability(ability, is_local);
+                        } else {
+                            state_ref.game.store_paid_ability_candidate(ability);
+                        }
+                    } else {
+                        state_ref.network.mark_supernode_bad(frame_count);
+                    }
+                }
+
                 let incoming_acks = state_ref.network.take_paid_obstacle_acks();
                 for (sender, ack) in incoming_acks {
                     if let Some(peer_id) = state_ref.network.resolve_peer_id(&sender) {
@@ -1798,11 +2043,32 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     }
                 }
 
+                let incoming_ability_acks = state_ref.network.take_paid_ability_acks();
+                for (sender, ack) in incoming_ability_acks {
+                    if let Some(peer_id) = state_ref.network.resolve_peer_id(&sender) {
+                        state_ref.network
+                            .record_paid_ability_confirmation(ack.proof_hash, peer_id);
+                    }
+                }
+
                 let pending_hashes = state_ref.game.pending_paid_obstacle_hashes();
                 for hash in pending_hashes {
-                    if state_ref.network.paid_obstacle_confirmation_count(hash) >= 2 {
+                    if state_ref.network.paid_obstacle_has_supernode_ack(hash)
+                        && state_ref.network.paid_obstacle_confirmation_count(hash) >= 2
+                    {
                         if let Some(obstacle) = state_ref.game.take_paid_obstacle_candidate(hash) {
                             state_ref.game.apply_paid_obstacle(obstacle);
+                        }
+                    }
+                }
+
+                let pending_ability_hashes = state_ref.game.pending_paid_ability_hashes();
+                for hash in pending_ability_hashes {
+                    if state_ref.network.paid_ability_has_supernode_ack(hash)
+                        && state_ref.network.paid_ability_confirmation_count(hash) >= 2
+                    {
+                        if let Some(ability) = state_ref.game.take_paid_ability_candidate(hash) {
+                            state_ref.game.apply_paid_ability(ability, true);
                         }
                     }
                 }
@@ -1877,8 +2143,14 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
             }
 
             // Send player state every 3 frames (~20 updates/sec at 60fps)
+            let congestion = state_ref.network.relay_congestion_level();
+            let player_send_stride = match congestion {
+                0 => 3,
+                1 => 4,
+                _ => 6,
+            };
             state_ref.send_counter += 1;
-            if state_ref.send_counter >= 3 {
+            if state_ref.send_counter >= player_send_stride {
                 state_ref.send_counter = 0;
                 let player = &state_ref.game.player;
                 let player_state = PlayerState::new(
@@ -1889,13 +2161,19 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     player.is_attacking(),
                     player.blocking,
                     player.is_phasing(),
+                    player.is_shielded(),
                 );
                 state_ref.network.send_player_state(player_state);
             }
 
             if in_multiplayer_room && state_ref.game.scene == Scene::Game {
+                let input_send_stride = match congestion {
+                    0 => 2,
+                    1 => 3,
+                    _ => 4,
+                };
                 state_ref.input_send_counter += 1;
-                if state_ref.input_send_counter >= 2 {
+                if state_ref.input_send_counter >= input_send_stride {
                     state_ref.input_send_counter = 0;
                     let frame = state_ref.game.frame_count;
                     let input_frame = net::InputFrame {
@@ -1904,6 +2182,10 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     };
                     state_ref.network.send_input_frame(input_frame);
                 }
+            }
+
+            if in_multiplayer_room {
+                state_ref.network.flush_relay_batches();
             }
         }
         {

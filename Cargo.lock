@@ -1237,8 +1237,6 @@ dependencies = [
 [[package]]
 name = "matchbox_socket"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96d47ab26c3bf1effd83e01a3f16b09f3cb05356fbb9dc77b7e7fb6950e6c4c7"
 dependencies = [
  "async-compat",
  "async-trait",
@@ -2008,6 +2006,7 @@ dependencies = [
  "rand",
  "rand_xoshiro",
  "sha2",
+ "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

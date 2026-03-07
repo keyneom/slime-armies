@@ -2,11 +2,17 @@ use crate::math::Vec2;
 use crate::world::ChunkManager;
 use rand::Rng;
 
-const SPEED_MAX: f32 = 3.0;
+const SPEED_MAX: f32 = 3.5;
+const BASE_SPEED_MAX: f32 = 2.0;
+const ACCEL_MULT: f32 = SPEED_MAX / BASE_SPEED_MAX;
+const SEGMENT_FOLLOW_GAIN: f32 = 0.01;
+const SEGMENT_DRAG: f32 = 0.98;
 
 #[derive(Debug, Clone)]
 pub struct Snake {
     pub id: usize,
+    pub chain_id: u16,
+    pub segment_index: u16,
     pub alive: bool,
     pub pos: Vec2,
     pub speed: Vec2,
@@ -28,10 +34,13 @@ impl Snake {
         };
 
         // Head is bigger, tail segments get smaller
-        let size = (17.0 - id as f32).max(9.0);
+        let segment_index = id as u16;
+        let size = (17.0 - segment_index as f32).max(9.0);
 
         Self {
             id,
+            chain_id: 0,
+            segment_index,
             alive: true,
             pos,
             speed: Vec2::ZERO,
@@ -56,10 +65,13 @@ impl Snake {
         };
 
         // Head is bigger, tail segments get smaller
-        let size = (17.0 - id as f32).max(9.0);
+        let segment_index = id as u16;
+        let size = (17.0 - segment_index as f32).max(9.0);
 
         Self {
             id,
+            chain_id: 0,
+            segment_index,
             alive: true,
             pos,
             speed: Vec2::ZERO,
@@ -100,10 +112,13 @@ impl Snake {
         };
 
         // Head is bigger, tail segments get smaller
-        let size = (17.0 - id as f32).max(9.0);
+        let segment_index = id as u16;
+        let size = (17.0 - segment_index as f32).max(9.0);
 
         Self {
             id,
+            chain_id: 0,
+            segment_index,
             alive: true,
             pos,
             speed: Vec2::ZERO,
@@ -114,14 +129,31 @@ impl Snake {
 
     pub fn new_at_position(id: usize, previous: Option<&Snake>, pos: Vec2) -> Self {
         let spawn_pos = if let Some(prev) = previous { prev.pos } else { pos };
-        let size = (17.0 - id as f32).max(9.0);
+        let segment_index = id as u16;
+        let size = (17.0 - segment_index as f32).max(9.0);
 
         Self {
             id,
+            chain_id: 0,
+            segment_index,
             alive: true,
             pos: spawn_pos,
             speed: Vec2::ZERO,
             dir: Vec2::new(0.0, -1.0),
+            size,
+        }
+    }
+
+    pub fn new_chain_segment(id: usize, chain_id: u16, segment_index: usize, pos: Vec2, dir: Vec2) -> Self {
+        let size = (17.0 - segment_index as f32).max(9.0);
+        Self {
+            id,
+            chain_id,
+            segment_index: segment_index as u16,
+            alive: true,
+            pos,
+            speed: Vec2::ZERO,
+            dir,
             size,
         }
     }
@@ -136,21 +168,31 @@ impl Snake {
             if prev.alive {
                 let target = prev.pos - self.pos;
                 let dist = target.length();
-                (target.normalize(), dist * dist * 0.025)
+                let desired = (self.size * 1.4).clamp(12.0, 32.0);
+                let gap = (dist - desired).max(0.0);
+                let accel = gap * gap * SEGMENT_FOLLOW_GAIN * ACCEL_MULT;
+                (target.normalize(), accel)
             } else {
                 let target = player_pos - self.pos;
                 let distance = target.length();
-                (target.normalize(), (100.0 - distance).max(0.05) * 0.003)
+                let accel = ((100.0 - distance) * 0.003).max(0.05) * ACCEL_MULT;
+                (target.normalize(), accel)
             }
         } else {
             // Head follows player
             let target = player_pos - self.pos;
             let distance = target.length();
-            (target.normalize(), (100.0 - distance).max(0.05) * 0.003)
+            let accel = ((100.0 - distance) * 0.003).max(0.05) * ACCEL_MULT;
+            (target.normalize(), accel)
         };
 
         self.speed.x += move_target.x * accel;
         self.speed.y += move_target.y * accel;
+
+        if previous.is_some() {
+            self.speed.x *= SEGMENT_DRAG;
+            self.speed.y *= SEGMENT_DRAG;
+        }
 
         if self.speed.x != 0.0 || self.speed.y != 0.0 {
             self.dir = self.speed.normalize();
