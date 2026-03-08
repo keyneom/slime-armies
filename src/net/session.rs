@@ -104,6 +104,8 @@ pub struct NetworkSession {
     desired_peer_set: HashSet<matchbox_socket::PeerId>,
     discovery_attached: bool,
     discovery_attach_frame: Option<u32>,
+    bootstrap_full_mesh_active: bool,
+    frames_without_peer_connection: u32,
     relay_epoch: u32,
     last_parent_switch_frame: u32,
     stale_parent_events: u32,
@@ -200,6 +202,8 @@ impl NetworkSession {
     const SUPERNODE_LINK_CAP: usize = 16;
     const ROOT_LINK_CAP: usize = 14;
     const DISCOVERY_MIN_ATTACH_FRAMES: u32 = 180;
+    const BOOTSTRAP_FULLMESH_TRIGGER_FRAMES: u32 = 120;
+    const BOOTSTRAP_PROBE_LINKS: usize = 8;
     const MAX_RELAY_INPUT_QUEUE: usize = 1024;
     const MAX_DOWNLINK_QUEUE: usize = 64;
     const MAX_BATCH_ENTRIES: usize = 512;
@@ -570,6 +574,8 @@ impl NetworkSession {
             desired_peer_set: HashSet::new(),
             discovery_attached: false,
             discovery_attach_frame: None,
+            bootstrap_full_mesh_active: false,
+            frames_without_peer_connection: 0,
             relay_epoch: 0,
             last_parent_switch_frame: 0,
             stale_parent_events: 0,
@@ -705,6 +711,8 @@ impl NetworkSession {
         self.desired_peer_set.clear();
         self.discovery_attached = true;
         self.discovery_attach_frame = None;
+        self.bootstrap_full_mesh_active = false;
+        self.frames_without_peer_connection = 0;
         self.state = NetworkState::WaitingForPeers;
 
         // Spawn the socket loop - when it completes, set the closed flag
@@ -736,6 +744,8 @@ impl NetworkSession {
         self.desired_peer_set.clear();
         self.discovery_attached = false;
         self.discovery_attach_frame = None;
+        self.bootstrap_full_mesh_active = false;
+        self.frames_without_peer_connection = 0;
         self.relay_epoch = 0;
         self.last_parent_switch_frame = 0;
         self.stale_parent_events = 0;
@@ -867,6 +877,12 @@ impl NetworkSession {
 
         if self.discovery_attached && self.discovery_attach_frame.is_none() && local_id.is_some() {
             self.discovery_attach_frame = Some(current_frame);
+        }
+        if connected_peers.is_empty() {
+            self.frames_without_peer_connection =
+                self.frames_without_peer_connection.saturating_add(1);
+        } else {
+            self.frames_without_peer_connection = 0;
         }
 
         let local_peer_str = local_id.map(|id| format!("{:?}", id));
@@ -1300,7 +1316,8 @@ impl NetworkSession {
             self.local_peer_id = Some(id);
         }
         self.maybe_failover_parent(current_frame);
-        self.update_desired_peers(&known_peers);
+        self.maybe_manage_bootstrap_full_mesh(&known_peers, &connected_peers);
+        self.update_desired_peers(&known_peers, &connected_peers);
         self.maybe_detach_discovery(current_frame, &connected_peers);
         if prev_supernode != self.supernode_id {
             web_sys::console::log_1(&format!("Supernode updated: {:?} -> {:?}", prev_supernode, self.supernode_id).into());
@@ -1326,6 +1343,71 @@ impl NetworkSession {
         self.log_telemetry_periodic(current_frame);
 
         true
+    }
+
+    fn maybe_manage_bootstrap_full_mesh(
+        &mut self,
+        known_peers: &[matchbox_socket::PeerId],
+        connected_peers: &[matchbox_socket::PeerId],
+    ) {
+        if !self.discovery_attached {
+            self.bootstrap_full_mesh_active = false;
+            return;
+        }
+
+        if self.bootstrap_full_mesh_active {
+            if connected_peers.is_empty() {
+                return;
+            }
+            self.bootstrap_full_mesh_active = false;
+            self.desired_peer_set.clear();
+            self.update_desired_peers(known_peers, connected_peers);
+            web_sys::console::log_1(&"Bootstrap probe mode disabled after first peer connection".into());
+            return;
+        }
+
+        if !connected_peers.is_empty() {
+            return;
+        }
+        if self.frames_without_peer_connection < Self::BOOTSTRAP_FULLMESH_TRIGGER_FRAMES {
+            return;
+        }
+        if known_peers.is_empty() {
+            return;
+        }
+
+        let mut probe = known_peers.to_vec();
+        probe.sort();
+        if let Some(local) = self.local_peer_id {
+            probe.retain(|id| *id != local);
+        }
+        if probe.is_empty() {
+            return;
+        }
+        let seed = self
+            .local_peer_id
+            .map(|id| Self::hash_peer_id(&format!("{:?}", id)) as usize)
+            .unwrap_or(0);
+        let rotate = (self.relay_epoch as usize).wrapping_add(seed) % probe.len();
+        probe.rotate_left(rotate);
+        let target = Self::BOOTSTRAP_PROBE_LINKS
+            .min(self.role_link_budget().max(2))
+            .min(probe.len());
+        let probe_set: HashSet<matchbox_socket::PeerId> = probe.into_iter().take(target).collect();
+
+        if let Some(socket) = &mut self.socket {
+            socket.set_desired_peers(probe_set.iter().copied());
+            self.bootstrap_full_mesh_active = true;
+            self.desired_peer_set = probe_set;
+            web_sys::console::log_1(
+                &format!(
+                    "Bootstrap probe mode enabled (known peers: {}, no links for {} frames)",
+                    known_peers.len().saturating_sub(1),
+                    self.frames_without_peer_connection
+                )
+                .into(),
+            );
+        }
     }
 
     fn maybe_detach_discovery(
@@ -1362,6 +1444,7 @@ impl NetworkSession {
         if let Some(socket) = &mut self.socket {
             socket.detach_signaling();
             self.discovery_attached = false;
+            self.bootstrap_full_mesh_active = false;
             web_sys::console::log_1(&"Discovery detached: using gameplay overlay links only".into());
         }
     }
@@ -1635,7 +1718,11 @@ impl NetworkSession {
         }
     }
 
-    fn desired_peer_links(&self, known_peers: &[matchbox_socket::PeerId]) -> HashSet<matchbox_socket::PeerId> {
+    fn desired_peer_links(
+        &self,
+        known_peers: &[matchbox_socket::PeerId],
+        connected_peers: &[matchbox_socket::PeerId],
+    ) -> HashSet<matchbox_socket::PeerId> {
         let mut desired = HashSet::new();
         let mut optional: Vec<matchbox_socket::PeerId> = Vec::new();
         let local_id = self.local_peer_id;
@@ -1682,6 +1769,31 @@ impl NetworkSession {
             }
         }
 
+        // Discovery admission window: supernodes/root keep a few spare candidate links
+        // so newly joining peers can latch onto the gameplay overlay quickly.
+        if self.discovery_attached && (self.is_host || self.local_is_supernode()) {
+            let connected: HashSet<matchbox_socket::PeerId> = connected_peers.iter().copied().collect();
+            let mut candidates: Vec<matchbox_socket::PeerId> = known_peers
+                .iter()
+                .copied()
+                .filter(|id| Some(*id) != local_id)
+                .filter(|id| !desired.contains(id))
+                .collect();
+            candidates.sort();
+            candidates.sort_by_key(|id| connected.contains(id));
+            if !candidates.is_empty() {
+                let local_seed = local_id
+                    .map(|id| Self::hash_peer_id(&format!("{:?}", id)) as usize)
+                    .unwrap_or(0);
+                let rotate = (self.relay_epoch as usize).wrapping_add(local_seed) % candidates.len();
+                candidates.rotate_left(rotate);
+                let admission_target = if self.is_host { 3 } else { 2 };
+                for peer in candidates.into_iter().take(admission_target) {
+                    optional.push(peer);
+                }
+            }
+        }
+
         for peer in optional {
             if desired.contains(&peer) {
                 continue;
@@ -1698,8 +1810,15 @@ impl NetworkSession {
         desired
     }
 
-    fn update_desired_peers(&mut self, known_peers: &[matchbox_socket::PeerId]) {
-        let desired = self.desired_peer_links(known_peers);
+    fn update_desired_peers(
+        &mut self,
+        known_peers: &[matchbox_socket::PeerId],
+        connected_peers: &[matchbox_socket::PeerId],
+    ) {
+        if self.bootstrap_full_mesh_active {
+            return;
+        }
+        let desired = self.desired_peer_links(known_peers, connected_peers);
         if desired == self.desired_peer_set {
             return;
         }
@@ -3454,7 +3573,7 @@ mod tests {
         leaf.relay_parent = Some(parent);
         leaf.relay_backup_parent = Some(backup);
         leaf.relay_children = Vec::new();
-        let leaf_links = leaf.desired_peer_links(&peers);
+        let leaf_links = leaf.desired_peer_links(&peers, &peers);
         assert!(leaf_links.contains(&parent));
         assert!(leaf_links.contains(&backup));
         assert!(leaf_links.len() <= NetworkSession::LEAF_LINK_CAP);
@@ -3466,7 +3585,7 @@ mod tests {
         supernode.relay_parent = Some(parent);
         supernode.relay_backup_parent = Some(backup);
         supernode.relay_children = peers[8..16].to_vec();
-        let super_links = supernode.desired_peer_links(&peers);
+        let super_links = supernode.desired_peer_links(&peers, &peers);
         assert!(super_links.contains(&parent));
         assert!(super_links.contains(&backup));
         for child in &supernode.relay_children {
@@ -3478,7 +3597,7 @@ mod tests {
         root.local_peer_id = Some(local);
         root.is_host = true;
         root.relay_children = peers[1..13].to_vec();
-        let root_links = root.desired_peer_links(&peers);
+        let root_links = root.desired_peer_links(&peers, &peers);
         for child in &root.relay_children {
             assert!(root_links.contains(child));
         }
@@ -3506,7 +3625,7 @@ mod tests {
             let mut max_links = 0usize;
             for i in 0..loops {
                 root.relay_epoch = i as u32;
-                let desired = root.desired_peer_links(&peers);
+                let desired = root.desired_peer_links(&peers, &peers);
                 max_links = max_links.max(desired.len());
             }
             let elapsed = start.elapsed();
