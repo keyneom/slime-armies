@@ -2830,15 +2830,19 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     for shot in cannon_shots {
                         state_ref.network.send_cannon_shot(shot);
                     }
-                } else {
-                    let cannon_shots = state_ref.network.take_cannon_shots();
-                    for shot in cannon_shots {
-                        state_ref.game.projectiles.spawn(
-                            crate::math::Vec2::new(shot.x, shot.y),
-                            crate::math::Vec2::new(shot.vx, shot.vy),
-                            80,
-                        );
-                    }
+                }
+                let cannon_shots = state_ref.network.take_cannon_shots();
+                for shot in cannon_shots {
+                    state_ref.game.spawn_projectile_from_shot(shot);
+                }
+
+                let projectile_reflections = state_ref.game.take_pending_projectile_reflections();
+                for reflection in projectile_reflections {
+                    state_ref.network.send_projectile_reflection(reflection);
+                }
+                let incoming_reflections = state_ref.network.take_projectile_reflections();
+                for reflection in incoming_reflections {
+                    state_ref.game.apply_projectile_reflection(reflection);
                 }
 
                 // AUTHORITATIVE HOST MODEL:

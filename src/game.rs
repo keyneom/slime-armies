@@ -125,6 +125,8 @@ pub struct Game {
     pending_paid_ability_candidates: HashMap<[u8; 32], crate::net::PaidAbility>,
     paid_ability_hashes: HashSet<[u8; 32]>,
     pub pending_cannon_shots: Vec<crate::net::CannonShot>,
+    pub pending_projectile_reflections: Vec<crate::net::ProjectileReflection>,
+    pending_projectile_reflection_candidates: HashMap<u32, crate::net::ProjectileReflection>,
     pub queued_join_room: bool,
     pub input_history: Vec<crate::net::InputFrame>,
     remote_simulations: HashMap<String, RemoteSimulation>,
@@ -549,6 +551,8 @@ impl Game {
             pending_paid_ability_candidates: HashMap::new(),
             paid_ability_hashes: HashSet::new(),
             pending_cannon_shots: Vec::new(),
+            pending_projectile_reflections: Vec::new(),
+            pending_projectile_reflection_candidates: HashMap::new(),
             queued_join_room: false,
             input_history: Vec::new(),
             remote_simulations: HashMap::new(),
@@ -754,6 +758,17 @@ impl Game {
             fallback
         };
         Self::normalized_or(current.lerp(desired, 0.25), desired)
+    }
+
+    fn collision_probe_on_motion(current: Vec2, velocity: Vec2, target: Vec2) -> Vec2 {
+        let start = current - velocity;
+        let segment = current - start;
+        let segment_len_sq = segment.length_squared();
+        if segment_len_sq <= f32::EPSILON {
+            return current;
+        }
+        let t = ((target - start).dot(segment) / segment_len_sq).clamp(0.0, 1.0);
+        start + segment * t
     }
 
     fn advance_enemy_interpolation(&mut self, run_enemy_ai: bool) {
@@ -1210,7 +1225,7 @@ impl Game {
         let mut killed_snakes: Vec<usize> = Vec::new();
         let mut killed_wisps: Vec<usize> = Vec::new();
         let mut killed_guardians: Vec<usize> = Vec::new();
-        let mut new_projectiles: Vec<(Vec2, Vec2, i32)> = Vec::new();
+        let mut new_projectiles: Vec<crate::net::CannonShot> = Vec::new();
         let mut spider_bumps: Vec<(usize, Vec2, f32)> = Vec::new();
         let mut cannon_bumps: Vec<(usize, Vec2, f32)> = Vec::new();
         let mut snake_bumps: Vec<(usize, Vec2, f32)> = Vec::new();
@@ -1252,20 +1267,30 @@ impl Game {
                 {
                     killed_spiders.push(i);
                     attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
-                } else if self
-                    .player
-                    .collide_block(spider.pos, (spider.radius() - 3.5) * CREATURE_SCALE)
-                {
-                    let distance = player_pos.distance(spider.pos);
-                    let bump = (11.0 * CREATURE_SCALE - distance).max(1.5 * CREATURE_SCALE);
-                    spider_bumps.push((i, player_look_dir, bump));
-                } else if self
-                    .player
-                    .collide_body(spider.pos, (spider.radius() - 3.5) * CREATURE_SCALE)
-                {
-                    player_killed = true;
-                    if player_killed_by.is_none() {
-                        player_killed_by = Some((0, spider.id as u16));
+                } else {
+                    let sweep_probe =
+                        Self::collision_probe_on_motion(spider.pos, spider.speed, player_pos);
+                    if self
+                        .player
+                        .collide_block(spider.pos, (spider.radius() - 3.5) * CREATURE_SCALE)
+                        || self
+                            .player
+                            .collide_block(sweep_probe, (spider.radius() - 3.5) * CREATURE_SCALE)
+                    {
+                        let distance = player_pos.distance(spider.pos);
+                        let bump = (11.0 * CREATURE_SCALE - distance).max(1.5 * CREATURE_SCALE);
+                        spider_bumps.push((i, player_look_dir, bump));
+                    } else if self
+                        .player
+                        .collide_body(spider.pos, (spider.radius() - 3.5) * CREATURE_SCALE)
+                        || self
+                            .player
+                            .collide_body(sweep_probe, (spider.radius() - 3.5) * CREATURE_SCALE)
+                    {
+                        player_killed = true;
+                        if player_killed_by.is_none() {
+                            player_killed_by = Some((0, spider.id as u16));
+                        }
                     }
                 }
             }
@@ -1301,20 +1326,30 @@ impl Game {
                 {
                     killed_wisps.push(i);
                     attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
-                } else if self
-                    .player
-                    .collide_block(wisp.pos, (wisp.radius() - 2.0) * CREATURE_SCALE)
-                {
-                    let distance = player_pos.distance(wisp.pos);
-                    let bump = (9.0 * CREATURE_SCALE - distance).max(1.0 * CREATURE_SCALE);
-                    wisp_bumps.push((i, player_look_dir, bump));
-                } else if self
-                    .player
-                    .collide_body(wisp.pos, (wisp.radius() - 2.0) * CREATURE_SCALE)
-                {
-                    player_killed = true;
-                    if player_killed_by.is_none() {
-                        player_killed_by = Some((4, wisp.id as u16));
+                } else {
+                    let sweep_probe =
+                        Self::collision_probe_on_motion(wisp.pos, wisp.dir * 2.6, player_pos);
+                    if self
+                        .player
+                        .collide_block(wisp.pos, (wisp.radius() - 2.0) * CREATURE_SCALE)
+                        || self
+                            .player
+                            .collide_block(sweep_probe, (wisp.radius() - 2.0) * CREATURE_SCALE)
+                    {
+                        let distance = player_pos.distance(wisp.pos);
+                        let bump = (9.0 * CREATURE_SCALE - distance).max(1.0 * CREATURE_SCALE);
+                        wisp_bumps.push((i, player_look_dir, bump));
+                    } else if self
+                        .player
+                        .collide_body(wisp.pos, (wisp.radius() - 2.0) * CREATURE_SCALE)
+                        || self
+                            .player
+                            .collide_body(sweep_probe, (wisp.radius() - 2.0) * CREATURE_SCALE)
+                    {
+                        player_killed = true;
+                        if player_killed_by.is_none() {
+                            player_killed_by = Some((4, wisp.id as u16));
+                        }
                     }
                 }
             }
@@ -1484,13 +1519,15 @@ impl Game {
                     if let Some(event) = event {
                         match event {
                             CannonEvent::Shoot { pos, speed } => {
-                                new_projectiles.push((pos, speed, 80));
-                                self.pending_cannon_shots.push(crate::net::CannonShot {
+                                let shot = crate::net::CannonShot {
+                                    id: self.projectiles.reserve_id(),
                                     x: pos.x,
                                     y: pos.y,
                                     vx: speed.x,
                                     vy: speed.y,
-                                });
+                                };
+                                new_projectiles.push(shot);
+                                self.pending_cannon_shots.push(shot);
                             }
                         }
                     }
@@ -1501,14 +1538,24 @@ impl Game {
                 } else if self.player.collide_attack(cannon.pos, cannon.radius()) {
                     killed_cannons.push(i);
                     attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
-                } else if self.player.collide_block(cannon.pos, cannon.radius() - 4.0) {
-                    let distance = player_pos.distance(cannon.pos);
-                    let bump = (11.5 - distance).max(1.5);
-                    cannon_bumps.push((i, player_look_dir, bump));
-                } else if self.player.collide_body(cannon.pos, cannon.radius() - 4.0) {
-                    player_killed = true;
-                    if player_killed_by.is_none() {
-                        player_killed_by = Some((1, cannon.id as u16));
+                } else {
+                    let sweep_probe =
+                        Self::collision_probe_on_motion(cannon.pos, cannon.speed, player_pos);
+                    if self.player.collide_block(cannon.pos, cannon.radius() - 4.0)
+                        || self
+                            .player
+                            .collide_block(sweep_probe, cannon.radius() - 4.0)
+                    {
+                        let distance = player_pos.distance(cannon.pos);
+                        let bump = (11.5 - distance).max(1.5);
+                        cannon_bumps.push((i, player_look_dir, bump));
+                    } else if self.player.collide_body(cannon.pos, cannon.radius() - 4.0)
+                        || self.player.collide_body(sweep_probe, cannon.radius() - 4.0)
+                    {
+                        player_killed = true;
+                        if player_killed_by.is_none() {
+                            player_killed_by = Some((1, cannon.id as u16));
+                        }
                     }
                 }
             }
@@ -1562,23 +1609,34 @@ impl Game {
                 {
                     killed_snakes.push(i);
                     attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
-                } else if self
-                    .player
-                    .collide_block(snake.pos, snake.radius() * CREATURE_SCALE)
-                {
-                    let distance = player_pos.distance(snake.pos);
-                    let bump = (8.5 * CREATURE_SCALE + snake.radius() * CREATURE_SCALE - distance)
-                        .max(1.5 * CREATURE_SCALE)
-                        / 2.0;
-                    snake_bumps.push((i, player_look_dir, bump));
-                    self.player.pos -= player_look_dir * bump;
-                } else if self
-                    .player
-                    .collide_body(snake.pos, snake.radius() * CREATURE_SCALE)
-                {
-                    player_killed = true;
-                    if player_killed_by.is_none() {
-                        player_killed_by = Some((2, snake.id as u16));
+                } else {
+                    let sweep_probe =
+                        Self::collision_probe_on_motion(snake.pos, snake.speed, player_pos);
+                    if self
+                        .player
+                        .collide_block(snake.pos, snake.radius() * CREATURE_SCALE)
+                        || self
+                            .player
+                            .collide_block(sweep_probe, snake.radius() * CREATURE_SCALE)
+                    {
+                        let distance = player_pos.distance(snake.pos);
+                        let bump = (8.5 * CREATURE_SCALE + snake.radius() * CREATURE_SCALE
+                            - distance)
+                            .max(1.5 * CREATURE_SCALE)
+                            / 2.0;
+                        snake_bumps.push((i, player_look_dir, bump));
+                        self.player.pos -= player_look_dir * bump;
+                    } else if self
+                        .player
+                        .collide_body(snake.pos, snake.radius() * CREATURE_SCALE)
+                        || self
+                            .player
+                            .collide_body(sweep_probe, snake.radius() * CREATURE_SCALE)
+                    {
+                        player_killed = true;
+                        if player_killed_by.is_none() {
+                            player_killed_by = Some((2, snake.id as u16));
+                        }
                     }
                 }
             }
@@ -1692,7 +1750,21 @@ impl Game {
             self.sound_events.push(SoundEvent::Attack);
         }
         for idx in projectiles_to_reflect {
-            self.projectiles.projectiles[idx].reflect(player_look_dir);
+            let Some(projectile) = self.projectiles.projectiles.get_mut(idx) else {
+                continue;
+            };
+            if !projectile.alive || !projectile.hostile {
+                continue;
+            }
+            projectile.reflect(player_look_dir);
+            self.pending_projectile_reflections
+                .push(crate::net::ProjectileReflection {
+                    id: projectile.id,
+                    x: projectile.pos.x,
+                    y: projectile.pos.y,
+                    vx: projectile.speed.x,
+                    vy: projectile.speed.y,
+                });
             self.sound_events.push(SoundEvent::Deflect);
         }
 
@@ -1780,8 +1852,8 @@ impl Game {
         }
 
         // Spawn cannon projectiles
-        for (pos, speed, duration) in new_projectiles {
-            self.projectiles.spawn(pos, speed, duration);
+        for shot in new_projectiles {
+            self.spawn_projectile_from_shot(shot);
         }
 
         // Kill player if needed
@@ -2877,6 +2949,46 @@ impl Game {
         std::mem::take(&mut self.pending_cannon_shots)
     }
 
+    pub fn take_pending_projectile_reflections(&mut self) -> Vec<crate::net::ProjectileReflection> {
+        std::mem::take(&mut self.pending_projectile_reflections)
+    }
+
+    pub fn spawn_projectile_from_shot(&mut self, shot: crate::net::CannonShot) {
+        self.projectiles.spawn_with_id(
+            shot.id,
+            Vec2::new(shot.x, shot.y),
+            Vec2::new(shot.vx, shot.vy),
+            80,
+        );
+        if let Some(reflection) = self
+            .pending_projectile_reflection_candidates
+            .remove(&shot.id)
+        {
+            let _ = self.projectiles.apply_reflection(
+                reflection.id,
+                Vec2::new(reflection.x, reflection.y),
+                Vec2::new(reflection.vx, reflection.vy),
+                true,
+            );
+        }
+    }
+
+    pub fn apply_projectile_reflection(&mut self, reflection: crate::net::ProjectileReflection) {
+        let applied = self.projectiles.apply_reflection(
+            reflection.id,
+            Vec2::new(reflection.x, reflection.y),
+            Vec2::new(reflection.vx, reflection.vy),
+            true,
+        );
+        if !applied {
+            if self.pending_projectile_reflection_candidates.len() >= 256 {
+                self.pending_projectile_reflection_candidates.clear();
+            }
+            self.pending_projectile_reflection_candidates
+                .insert(reflection.id, reflection);
+        }
+    }
+
     /// Respawn player in multiplayer - keeps enemies and wave, just revives player
     pub fn respawn_in_multiplayer(&mut self) {
         self.player = Player::new_at_position(Vec2::ZERO);
@@ -2933,6 +3045,8 @@ impl Game {
         self.pending_paid_ability_candidates.clear();
         self.paid_ability_hashes.clear();
         self.pending_cannon_shots.clear();
+        self.pending_projectile_reflections.clear();
+        self.pending_projectile_reflection_candidates.clear();
         self.queued_join_room = false;
         self.input_history.clear();
         self.remote_simulations.clear();
@@ -3011,6 +3125,8 @@ impl Game {
         self.pending_paid_ability_candidates.clear();
         self.paid_ability_hashes.clear();
         self.pending_cannon_shots.clear();
+        self.pending_projectile_reflections.clear();
+        self.pending_projectile_reflection_candidates.clear();
         self.queued_join_room = false;
         self.input_history.clear();
         self.remote_simulations.clear();

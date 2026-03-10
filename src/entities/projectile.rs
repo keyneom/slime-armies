@@ -3,6 +3,7 @@ use crate::world::ChunkManager;
 
 #[derive(Debug, Clone)]
 pub struct Projectile {
+    pub id: u32,
     pub alive: bool,
     pub pos: Vec2,
     pub speed: Vec2,
@@ -12,8 +13,9 @@ pub struct Projectile {
 }
 
 impl Projectile {
-    pub fn new(pos: Vec2, speed: Vec2, duration: i32) -> Self {
+    pub fn new(id: u32, pos: Vec2, speed: Vec2, duration: i32) -> Self {
         Self {
+            id,
             alive: true,
             pos,
             speed,
@@ -75,6 +77,7 @@ pub struct ProjectilePool {
     pub projectiles: Vec<Projectile>,
     next_index: usize,
     capacity: usize,
+    next_id: u32,
 }
 
 impl ProjectilePool {
@@ -83,11 +86,26 @@ impl ProjectilePool {
             projectiles: Vec::with_capacity(capacity),
             next_index: 0,
             capacity,
+            next_id: 1,
         }
     }
 
+    pub fn reserve_id(&mut self) -> u32 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        id
+    }
+
     pub fn spawn(&mut self, pos: Vec2, speed: Vec2, duration: i32) {
-        let projectile = Projectile::new(pos, speed, duration);
+        let id = self.reserve_id();
+        self.spawn_with_id(id, pos, speed, duration);
+    }
+
+    pub fn spawn_with_id(&mut self, id: u32, pos: Vec2, speed: Vec2, duration: i32) {
+        let projectile = Projectile::new(id, pos, speed, duration);
+        if id >= self.next_id {
+            self.next_id = id.wrapping_add(1).max(1);
+        }
 
         if self.projectiles.len() < self.capacity {
             self.projectiles.push(projectile);
@@ -95,6 +113,22 @@ impl ProjectilePool {
             self.projectiles[self.next_index] = projectile;
         }
         self.next_index = (self.next_index + 1) % self.capacity.max(1);
+    }
+
+    pub fn apply_reflection(&mut self, id: u32, pos: Vec2, speed: Vec2, reset_timer: bool) -> bool {
+        for projectile in &mut self.projectiles {
+            if !projectile.alive || projectile.id != id {
+                continue;
+            }
+            projectile.hostile = false;
+            projectile.pos = pos;
+            projectile.speed = speed;
+            if reset_timer {
+                projectile.timer = 0;
+            }
+            return true;
+        }
+        false
     }
 
     pub fn update(&mut self) {
@@ -125,5 +159,6 @@ impl ProjectilePool {
     pub fn clear(&mut self) {
         self.projectiles.clear();
         self.next_index = 0;
+        self.next_id = 1;
     }
 }

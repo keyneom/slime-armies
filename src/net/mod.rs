@@ -7,8 +7,8 @@ pub use protocol::{
     EnemyState, EnemySync, EnemyType, InputFrame, InputFrameBatch, InputFrameEntry, NetMessage,
     PaidAbility, PaidAbilityAck, PaidAbilityType, PaidNameAck, PaidNameReservation, PaidNameSync,
     PaidObstacle, PaidObstacleAck, PaidObstacleSync, Ping, PlayerDeath, PlayerState,
-    PlayerStateBatch, PlayerStateEntry, PlayerStatsSnapshot, Pong, SupernodeScore, TopologyUpdate,
-    VoteMute, WaveStart,
+    PlayerStateBatch, PlayerStateEntry, PlayerStatsSnapshot, Pong, ProjectileReflection,
+    SupernodeScore, TopologyUpdate, VoteMute, WaveStart,
 };
 pub use remote_player::RemotePlayer;
 pub use session::{IceConfig, NetworkSession, NetworkState, PlayerStats};

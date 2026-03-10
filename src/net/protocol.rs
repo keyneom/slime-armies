@@ -237,6 +237,7 @@ impl EnemyDamage {
 
 #[derive(Debug, Clone, Copy)]
 pub struct CannonShot {
+    pub id: u32,
     pub x: f32,
     pub y: f32,
     pub vx: f32,
@@ -244,24 +245,60 @@ pub struct CannonShot {
 }
 
 impl CannonShot {
-    pub fn to_bytes(&self) -> [u8; 16] {
-        let mut bytes = [0u8; 16];
-        bytes[0..4].copy_from_slice(&self.x.to_le_bytes());
-        bytes[4..8].copy_from_slice(&self.y.to_le_bytes());
-        bytes[8..12].copy_from_slice(&self.vx.to_le_bytes());
-        bytes[12..16].copy_from_slice(&self.vy.to_le_bytes());
+    pub fn to_bytes(&self) -> [u8; 20] {
+        let mut bytes = [0u8; 20];
+        bytes[0..4].copy_from_slice(&self.id.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.x.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.y.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.vx.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.vy.to_le_bytes());
         bytes
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 16 {
+        if bytes.len() < 20 {
             return None;
         }
         Some(Self {
-            x: f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-            y: f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-            vx: f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
-            vy: f32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+            id: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            x: f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            y: f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            vx: f32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+            vy: f32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ProjectileReflection {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub vx: f32,
+    pub vy: f32,
+}
+
+impl ProjectileReflection {
+    pub fn to_bytes(&self) -> [u8; 20] {
+        let mut bytes = [0u8; 20];
+        bytes[0..4].copy_from_slice(&self.id.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.x.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.y.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.vx.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.vy.to_le_bytes());
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 20 {
+            return None;
+        }
+        Some(Self {
+            id: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            x: f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            y: f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            vx: f32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+            vy: f32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
         })
     }
 }
@@ -1376,6 +1413,8 @@ pub enum NetMessage {
     PaidAbilityEvent(PaidAbility),
     /// Cannon shot event (host authoritative)
     CannonShotEvent(CannonShot),
+    /// Projectile reflection event (authoritative from reflecting player)
+    ProjectileReflectionEvent(ProjectileReflection),
     /// Paid obstacle verification ack
     PaidObstacleAckEvent(PaidObstacleAck),
     /// Paid ability verification ack
@@ -1481,6 +1520,11 @@ impl NetMessage {
                 bytes.extend_from_slice(&shot.to_bytes());
                 bytes
             }
+            NetMessage::ProjectileReflectionEvent(reflection) => {
+                let mut bytes = vec![28u8]; // Message type 28
+                bytes.extend_from_slice(&reflection.to_bytes());
+                bytes
+            }
             NetMessage::PaidObstacleAckEvent(ack) => {
                 let mut bytes = vec![15u8]; // Message type 15
                 bytes.extend_from_slice(&ack.to_bytes());
@@ -1578,6 +1622,8 @@ impl NetMessage {
             8 => PaidObstacle::from_bytes(&bytes[1..]).map(NetMessage::PaidObstacleEvent),
             9 => PaidObstacleSync::from_bytes(&bytes[1..]).map(NetMessage::PaidObstacleSyncEvent),
             10 => CannonShot::from_bytes(&bytes[1..]).map(NetMessage::CannonShotEvent),
+            28 => ProjectileReflection::from_bytes(&bytes[1..])
+                .map(NetMessage::ProjectileReflectionEvent),
             20 => PaidAbility::from_bytes(&bytes[1..]).map(NetMessage::PaidAbilityEvent),
             11 => InputFrame::from_bytes(&bytes[1..]).map(NetMessage::InputFrameEvent),
             12 => Ping::from_bytes(&bytes[1..]).map(NetMessage::PingEvent),
@@ -1613,6 +1659,42 @@ mod tests {
         let decoded = InputFrame::from_bytes(&bytes).expect("decode");
         assert_eq!(decoded.frame, frame.frame);
         assert_eq!(decoded.input, frame.input);
+    }
+
+    #[test]
+    fn cannon_shot_roundtrip_with_id() {
+        let shot = CannonShot {
+            id: 77,
+            x: 12.5,
+            y: -9.25,
+            vx: 1.75,
+            vy: -2.5,
+        };
+        let bytes = shot.to_bytes();
+        let decoded = CannonShot::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded.id, shot.id);
+        assert_eq!(decoded.x, shot.x);
+        assert_eq!(decoded.y, shot.y);
+        assert_eq!(decoded.vx, shot.vx);
+        assert_eq!(decoded.vy, shot.vy);
+    }
+
+    #[test]
+    fn projectile_reflection_roundtrip() {
+        let reflection = ProjectileReflection {
+            id: 91,
+            x: -11.0,
+            y: 4.5,
+            vx: -3.0,
+            vy: 2.0,
+        };
+        let bytes = reflection.to_bytes();
+        let decoded = ProjectileReflection::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded.id, reflection.id);
+        assert_eq!(decoded.x, reflection.x);
+        assert_eq!(decoded.y, reflection.y);
+        assert_eq!(decoded.vx, reflection.vx);
+        assert_eq!(decoded.vy, reflection.vy);
     }
 
     #[test]

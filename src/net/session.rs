@@ -4,8 +4,8 @@ use crate::net::{
     EnemySync, InputFrame, InputFrameBatch, InputFrameEntry, NetMessage, PaidAbility,
     PaidAbilityAck, PaidAbilityType, PaidNameAck, PaidNameReservation, PaidNameSync, PaidObstacle,
     PaidObstacleAck, PaidObstacleSync, Ping, PlayerDeath, PlayerState, PlayerStateBatch,
-    PlayerStateEntry, PlayerStatsSnapshot, Pong, RemotePlayer, SupernodeScore, TopologyUpdate,
-    VoteMute, WaveStart,
+    PlayerStateEntry, PlayerStatsSnapshot, Pong, ProjectileReflection, RemotePlayer,
+    SupernodeScore, TopologyUpdate, VoteMute, WaveStart,
 };
 use crate::world::CHUNK_SIZE;
 use js_sys;
@@ -174,6 +174,8 @@ pub struct NetworkSession {
     pending_paid_name_candidates: HashMap<[u8; 32], PaidNameReservation>,
     /// Received cannon shot events from host
     pub pending_cannon_shots: Vec<CannonShot>,
+    /// Received projectile reflection events from peers
+    pub pending_projectile_reflections: Vec<ProjectileReflection>,
     /// Received chat messages
     pending_chat_messages: Vec<ChatMessage>,
     /// Received vote mute events that reached threshold
@@ -648,6 +650,7 @@ impl NetworkSession {
             pending_paid_name_acks: Vec::new(),
             pending_paid_name_candidates: HashMap::new(),
             pending_cannon_shots: Vec::new(),
+            pending_projectile_reflections: Vec::new(),
             pending_chat_messages: Vec::new(),
             pending_vote_mutes: Vec::new(),
             muted_hashes: HashSet::new(),
@@ -855,6 +858,7 @@ impl NetworkSession {
         self.pending_paid_name_acks.clear();
         self.pending_paid_name_candidates.clear();
         self.pending_cannon_shots.clear();
+        self.pending_projectile_reflections.clear();
         self.latency_ms.clear();
         self.latency_samples.clear();
         self.supernode_scores.clear();
@@ -1064,6 +1068,7 @@ impl NetworkSession {
         let mut paid_names: Vec<(PeerId, u64, PaidNameReservation)> = Vec::new();
         let mut paid_name_acks: Vec<(PeerId, u64, PaidNameAck)> = Vec::new();
         let mut cannon_shots: Vec<(PeerId, u64, CannonShot)> = Vec::new();
+        let mut projectile_reflections: Vec<(PeerId, u64, ProjectileReflection)> = Vec::new();
         let mut chat_messages: Vec<(PeerId, u64, ChatMessage)> = Vec::new();
         let mut vote_mutes: Vec<(PeerId, u64, VoteMute)> = Vec::new();
         let mut player_stats_updates: Vec<(PeerId, u64, PlayerStatsSnapshot)> = Vec::new();
@@ -1142,6 +1147,9 @@ impl NetworkSession {
                 }
                 NetMessage::CannonShotEvent(shot) => {
                     cannon_shots.push((peer_id, origin_hash, shot));
+                }
+                NetMessage::ProjectileReflectionEvent(reflection) => {
+                    projectile_reflections.push((peer_id, origin_hash, reflection));
                 }
                 NetMessage::ChatMessageEvent(chat) => {
                     chat_messages.push((peer_id, origin_hash, chat));
@@ -1464,6 +1472,34 @@ impl NetworkSession {
             } else if from_child {
                 self.send_upstream_or_broadcast_routed(
                     NetMessage::CannonShotEvent(shot).to_bytes(),
+                    self.resolve_peer_id(&peer_id),
+                    Some(origin_hash),
+                );
+            }
+        }
+        for (peer_id, origin_hash, reflection) in projectile_reflections {
+            let from_parent = self.is_parent_sender(&peer_id);
+            let from_root = self.is_authoritative_sender(&peer_id);
+            let from_child = self.is_child_sender(&peer_id);
+            if self.is_host {
+                self.pending_projectile_reflections.push(reflection);
+                self.send_downstream_or_broadcast_routed(
+                    NetMessage::ProjectileReflectionEvent(reflection).to_bytes(),
+                    self.resolve_peer_id(&peer_id),
+                    Some(origin_hash),
+                );
+            } else if from_root || from_parent {
+                self.pending_projectile_reflections.push(reflection);
+                if from_parent && !self.relay_children.is_empty() {
+                    self.send_downstream_or_broadcast_routed(
+                        NetMessage::ProjectileReflectionEvent(reflection).to_bytes(),
+                        self.resolve_peer_id(&peer_id),
+                        Some(origin_hash),
+                    );
+                }
+            } else if from_child {
+                self.send_upstream_or_broadcast_routed(
+                    NetMessage::ProjectileReflectionEvent(reflection).to_bytes(),
                     self.resolve_peer_id(&peer_id),
                     Some(origin_hash),
                 );
@@ -4542,6 +4578,15 @@ impl NetworkSession {
         self.send_downstream_or_broadcast(msg, None);
     }
 
+    pub fn send_projectile_reflection(&mut self, reflection: ProjectileReflection) {
+        let msg = NetMessage::ProjectileReflectionEvent(reflection).to_bytes();
+        if self.is_host {
+            self.send_downstream_or_broadcast(msg, None);
+        } else {
+            self.send_upstream_or_broadcast(msg);
+        }
+    }
+
     pub fn send_input_frame(&mut self, frame: InputFrame) {
         if self.is_host {
             if let Some(hash) = self.local_peer_hash {
@@ -4760,6 +4805,10 @@ impl NetworkSession {
 
     pub fn take_cannon_shots(&mut self) -> Vec<CannonShot> {
         std::mem::take(&mut self.pending_cannon_shots)
+    }
+
+    pub fn take_projectile_reflections(&mut self) -> Vec<ProjectileReflection> {
+        std::mem::take(&mut self.pending_projectile_reflections)
     }
 
     pub fn take_input_frames(&mut self) -> Vec<(PeerId, InputFrame)> {
