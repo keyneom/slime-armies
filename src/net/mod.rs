@@ -1,15 +1,17 @@
-mod session;
 mod protocol;
 mod remote_player;
+mod session;
 
-pub use session::{IceConfig, NetworkSession, NetworkState, PlayerStats};
 pub use protocol::{
-    NetMessage, PlayerState, EnemyState, EnemySync, EnemyDamage, EnemyType, WaveStart, EnemyKill,
-    PlayerDeath, PaidObstacle, PaidObstacleSync, PaidObstacleAck, PaidAbility, PaidAbilityAck, PaidAbilityType,
-    CannonShot, InputFrame, Ping, Pong, SupernodeScore, ChatMessage, VoteMute, PlayerStateBatch,
-    PlayerStateEntry, InputFrameBatch, InputFrameEntry, TopologyUpdate, AreaAuthorityUpdate, AreaAuthorityEntry,
+    AreaAuthorityEntry, AreaAuthorityUpdate, CannonShot, ChatMessage, EnemyDamage, EnemyKill,
+    EnemyState, EnemySync, EnemyType, InputFrame, InputFrameBatch, InputFrameEntry, NetMessage,
+    PaidAbility, PaidAbilityAck, PaidAbilityType, PaidNameAck, PaidNameReservation, PaidNameSync,
+    PaidObstacle, PaidObstacleAck, PaidObstacleSync, Ping, PlayerDeath, PlayerState,
+    PlayerStateBatch, PlayerStateEntry, PlayerStatsSnapshot, Pong, SupernodeScore, TopologyUpdate,
+    VoteMute, WaveStart,
 };
 pub use remote_player::RemotePlayer;
+pub use session::{IceConfig, NetworkSession, NetworkState, PlayerStats};
 
 // Re-export for future use
 #[allow(unused_imports)]

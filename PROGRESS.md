@@ -9,6 +9,11 @@ Transform "One Slime Army" from a single-player WASM-4 game into a P2P multiplay
 
 ## Current Session - Enemy Sync Fix
 
+### Open Issues (Priority)
+- [ ] Multiplayer sync smoothness/regression: remote players and enemies can still appear jumpy/laggy under real device-to-device conditions.
+- [x] Title UI duplication: `SOLO PLAY`/`CREATE ROOM` were being rendered twice on start screen (low-res scene + overlay). Fixed by moving title text/UI rendering to overlay only.
+- [x] Root-cause freeze fix for post-detach sessions: `vendor/matchbox_socket` message loop no longer spins on a closed signaling event stream (`events_receiver.next() -> None`), which was starving gameplay data-channel processing after signaling detach.
+
 ## Current Session - Multi-Supernode Relay Tree (In Progress)
 
 ### Goal
@@ -40,7 +45,7 @@ Reduce centralized relay load and move from single-supernode fanout to a cascadi
 - [x] Parent handoff now uses a short duplex upstream window for smoother transitions.
 - [x] Forked `matchbox_socket` locally (server-protocol compatible) with selective desired-peer connectivity.
 - [x] Network session now feeds desired links (parent/backup/children/supernode+witness/bootstrap) to socket.
-- [x] Sparse-link mode is enabled immediately at room connect to avoid initial full-mesh offer storms.
+- [x] Bootstrap now starts with normal signaling connectivity, then converges to sparse desired links after peer discovery/topology assignment.
 - [x] Added explicit signaling detach control in socket fork (discovery can end while gameplay data channels stay up).
 - [x] `PeerLeft` no longer forcibly closes active data channels (supports discovery-leave + persistent gameplay overlay).
 - [x] Added session-level two-layer behavior:
@@ -48,6 +53,8 @@ Reduce centralized relay load and move from single-supernode fanout to a cascadi
   - after overlay parent/route stabilizes, they detach from signaling;
   - detached nodes keep using relayed topology instead of local re-election.
 - [x] Added optional TURN fallback configuration (runtime ICE override + TURN injection via `window.slime` APIs).
+- [x] Added bootstrap authority fallback for direct peers during early convergence (prevents early PlayerUpdate/EnemySync drops before topology routes settle).
+- [x] Stale-supernode detection now ignores pre-traffic bootstrap window to avoid premature supernode poisoning.
 - [~] Extended cascaded routing to additional event classes:
   - kill/death, paid obstacle/ability, paid acks, chat, vote-mute, cannon shots now use tree relay paths.
   - late-join state sync still uses direct host sends (kept for now).
@@ -125,6 +132,7 @@ CLIENT (joiner):
 - [x] Added paid abilities: Bubble Shield and Shockwave (network gated + supernode ack)
 - [x] Added Shrinefinder badge + shrine encounter at (67, 67)
 - [x] p2pago SDK bundled (UMD) + support gating hooks for paid abilities
+- [x] Added dedicated browser automation entry point (`window.slimeTest`) with input injection + runtime snapshot helpers for test harnesses (no gameplay/UI behavior changes for normal users)
 
 ## Build & Test
 ```bash
@@ -139,6 +147,14 @@ trunk serve  # Dev server on http://localhost:8080
 5. Host player's attacks should kill enemies visible to both
 6. Client player's attacks should also kill enemies (local collision still works)
 
+### Sync Testing (Automation-Friendly)
+1. Use isolated browser contexts so tabs do not share local storage.
+2. Create room in tab A; capture `room=...` from `window.slimeTest.net()`.
+3. In tab B: set `localStorage.setItem("slime_room_code", "<ROOM>")`, reload, then call `window.slimeTest.joinCurrentRoom()`.
+4. Start movement keepalive in both tabs (`window.slimeTest.keepAliveStart(360, 0.72)`) so slimes stay alive.
+5. Poll both tabs with `window.slimeTest.net()` + `window.slimeTest.state()` every 1s.
+6. Regression signature: one tab logs `Discovery detached: using gameplay overlay links only` then drops/freeze behavior; peer count eventually falls back to solo (`remote_players=0`).
+
 ## Requested Features
 - [x] Team scoring system that accounts for kills, deaths, and time played.
   - [x] Track kills, deaths, and time played per user.
@@ -146,6 +162,11 @@ trunk serve  # Dev server on http://localhost:8080
 - [~] Paid ability gating (e.g., pay to drop an obstacle at a chosen location) using x402 or on-chain proofs with host validation.
   - [x] Paid ability event + supernode ack flow (Bubble Shield, Shockwave)
   - [ ] On-chain or external receipt verification
+- [~] Player naming policy:
+  - [x] Room-level unique display names (deterministic suffixing for duplicates)
+  - [x] Paid in-room name reservation command (`/buyname [NAME]`) via existing payment-gated feature flow + supernode/2-of-N verification
+  - [x] Title-screen reserved-name guard: block create/join and warn if cached reservation belongs to a different local owner identity
+  - [ ] Optional paid global name reservation/ownership flow (ENS or contract-backed), without requiring payment for unreserved names
 - [ ] Define and deploy a generic immutable smart contract to verify paid unlocks and distribute tournament winnings; winner determination likely needs a separate consensus process.
 - [ ] Future upgrades (laser attack, stronger shields) and competitive crypto prizes (last-man-standing, PvP tournaments).
 - [ ] Mobile-friendly UX (touch controls, responsive HUD, safe areas for chat/map/player list).

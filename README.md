@@ -14,6 +14,7 @@ Inspired by the original "One Slime Army" (WASM-4).
 - **T**: Slow spawn (paid ability, default)
 - **G**: Speed boost (paid ability, default)
 - **Y**: Slime trail (paid ability, default)
+- **C**: Open chat (`/mute NAME`, `/buyname [NAME]`)
 - **F3**: Toggle network debug overlay (relay queue/traffic stats)
 - **M**: Open map (arrows pan, Z zoom in, X zoom out, type coords, Enter to teleport)
 
@@ -54,6 +55,61 @@ window.slime.set_ice_servers(
 // Reset to default STUN-only config:
 window.slime.reset_ice_servers();
 ```
+
+## Test Automation Entry Point
+
+For browser automation, the app exposes `window.slimeTest` (additive only; regular user controls are unchanged).
+
+```js
+// Key and text input (same internal input path as real events):
+window.slimeTest.keyDown("KeyW", "w");
+window.slimeTest.keyUp("KeyW");
+window.slimeTest.typeText("HELLO");
+
+// Canvas click in game coordinates:
+window.slimeTest.click(400, 300);
+
+// Reset queued synthetic inputs:
+window.slimeTest.resetInput();
+
+// Compact runtime snapshot:
+window.slimeTest.state();
+// "scene=game;network=connected;room=ABC123;players=2;map_open=false;player_list_open=false;chat_open=false"
+
+// Focused network diagnostics:
+window.slimeTest.net();
+// "network=connected;room=ABC123;remote_players=1;known_peers=2;desired_peers=3;discovery_attached=true;relay_epoch=4;is_host=false;local_name=KEY#1;rx=123;dropped=0;remote_ids=...;remote_names=..."
+```
+
+### Sync Testing (Automation-Friendly)
+
+Use this workflow to reproduce/validate multiplayer sync stability and freeze regressions.
+
+1. Open two isolated browser contexts (separate tabs with isolated storage/profile).
+2. In tab A, create a room (manual title action is fine).
+3. Read tab A room code from `window.slimeTest.net()` (`room=XXXXXX`).
+4. In tab B console, set room + reload + join:
+```js
+localStorage.setItem("slime_room_code", "ROOMCODE");
+location.reload();
+// after reload:
+window.slimeTest.joinCurrentRoom();
+```
+5. Immediately keep both slimes moving so they do not die during sync checks:
+```js
+window.slimeTest.keepAliveStart(360, 0.72);
+```
+6. Poll both tabs every 1s:
+```js
+window.slimeTest.net();
+window.slimeTest.state();
+```
+7. Healthy behavior: both tabs keep `remote_players=1` and remain responsive.
+8. Freeze regression signature: one tab logs `Discovery detached: using gameplay overlay links only`, then becomes unresponsive or drops; the other tab eventually reports `remote_players=0`.
+
+Notes:
+- Use `window.slimeTest` for automation. `window.slime` exposes low-level wasm exports and is not safe for direct string-argument automation calls.
+- Keep this as the default sync regression test until a fuller automated harness lands.
 
 ## Architecture
 
@@ -101,9 +157,12 @@ We could offer paid abilities (example: drop an obstacle at a chosen coordinate)
 - **Host-authoritative validation**: the host verifies a signed on-chain receipt/token before broadcasting the ability to all peers.
 - **On-chain capability NFT/token**: the ability is tied to a token; the host (or a lightweight validator) checks ownership on-chain.
 - **Commit-reveal**: player commits to a placement, reveals after payment confirmation; host confirms before applying.
+- **Username reservation (optional paid)**: names remain free by default; only globally reserved names require payment/proof of ownership.
 If we keep this backendless, the best practical guardrail is host-side verification plus on-chain proofs (e.g., tx hash or signed receipt in the event payload), but it is not cheat-proof without an authoritative server.
 
 We’ll need a generic, immutable smart contract that can verify paid unlocks for any feature (e.g., obstacle drops) without adding new methods per feature. It should also support prize payouts for tournaments and other competitive modes; winner determination likely needs its own consensus process, so contract hooks should expect externally agreed results.
+Room-level uniqueness should always be enforced regardless of reservation status (duplicate handles get deterministic suffixes like `#2`, `#3`).
+Current implementation includes an in-room paid reservation flow (`/buyname [NAME]`) with supernode + 2-of-N ack verification, plus title-screen blocking/warnings for cached reserved names owned by a different local identity. Global portable ownership still requires the on-chain contract layer.
 
 ### Crypto-Based Backend (Lightweight)
 

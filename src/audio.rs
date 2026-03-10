@@ -115,7 +115,8 @@ impl Audio {
         let freq = oscillator.frequency();
         freq.set_value_at_time(freq_start, current_time).ok();
         if (freq_end - freq_start).abs() > 1.0 {
-            freq.linear_ramp_to_value_at_time(freq_end, current_time + total_duration as f64).ok();
+            freq.linear_ramp_to_value_at_time(freq_end, current_time + total_duration as f64)
+                .ok();
         }
 
         // Create gain node for envelope
@@ -131,22 +132,22 @@ impl Audio {
         gain_param.set_value_at_time(0.0, current_time).ok();
 
         // Attack
-        gain_param.linear_ramp_to_value_at_time(
-            final_volume,
-            current_time + envelope.attack as f64
-        ).ok();
+        gain_param
+            .linear_ramp_to_value_at_time(final_volume, current_time + envelope.attack as f64)
+            .ok();
 
         // Decay to sustain
-        gain_param.linear_ramp_to_value_at_time(
-            final_volume * envelope.sustain,
-            current_time + envelope.attack as f64 + envelope.decay as f64
-        ).ok();
+        gain_param
+            .linear_ramp_to_value_at_time(
+                final_volume * envelope.sustain,
+                current_time + envelope.attack as f64 + envelope.decay as f64,
+            )
+            .ok();
 
         // Release
-        gain_param.linear_ramp_to_value_at_time(
-            0.0,
-            current_time + total_duration as f64
-        ).ok();
+        gain_param
+            .linear_ramp_to_value_at_time(0.0, current_time + total_duration as f64)
+            .ok();
 
         // Connect nodes
         oscillator.connect_with_audio_node(&gain).ok();
@@ -154,7 +155,9 @@ impl Audio {
 
         // Start and stop
         oscillator.start().ok();
-        oscillator.stop_with_when(current_time + total_duration as f64 + 0.1).ok();
+        oscillator
+            .stop_with_when(current_time + total_duration as f64 + 0.1)
+            .ok();
     }
 
     // ============ Game-specific sound effects ============
@@ -162,86 +165,140 @@ impl Audio {
     /// Player attack sound
     pub fn play_attack(&self) {
         self.play_tone(
-            150.0, 600.0,
+            150.0,
+            600.0,
             Channel::Noise,
-            Envelope { attack: 0.01, decay: 0.0, sustain: 1.0, release: 0.0 },
-            1.0
+            Envelope {
+                attack: 0.01,
+                decay: 0.0,
+                sustain: 1.0,
+                release: 0.0,
+            },
+            1.0,
         );
     }
 
     /// Player block sound
     pub fn play_block(&self) {
         self.play_tone(
-            100.0, 280.0,
+            100.0,
+            280.0,
             Channel::Pulse1,
-            Envelope { attack: 0.02, decay: 0.0, sustain: 1.0, release: 0.1 },
-            1.0
+            Envelope {
+                attack: 0.02,
+                decay: 0.0,
+                sustain: 1.0,
+                release: 0.1,
+            },
+            1.0,
         );
     }
 
     /// Successful block deflection
     pub fn play_deflect(&self) {
         self.play_tone(
-            250.0, 200.0,
+            250.0,
+            200.0,
             Channel::Noise,
-            Envelope { attack: 0.03, decay: 0.0, sustain: 1.0, release: 0.0 },
-            0.6
+            Envelope {
+                attack: 0.03,
+                decay: 0.0,
+                sustain: 1.0,
+                release: 0.0,
+            },
+            0.6,
         );
     }
 
     /// Phase/dodge sound
     pub fn play_phase(&self) {
         self.play_tone(
-            240.0, 20.0,
+            240.0,
+            20.0,
             Channel::Noise,
-            Envelope { attack: 0.0, decay: 0.0, sustain: 1.0, release: 0.1 },
-            1.0
+            Envelope {
+                attack: 0.0,
+                decay: 0.0,
+                sustain: 1.0,
+                release: 0.1,
+            },
+            1.0,
         );
         self.play_tone(
-            440.0, 440.0,
+            440.0,
+            440.0,
             Channel::Triangle,
-            Envelope { attack: 0.05, decay: 0.0, sustain: 1.0, release: 0.1 },
-            0.5
+            Envelope {
+                attack: 0.05,
+                decay: 0.0,
+                sustain: 1.0,
+                release: 0.1,
+            },
+            0.5,
         );
     }
 
     /// Enemy killed sound
     pub fn play_enemy_kill(&self) {
         self.play_tone(
-            300.0, 100.0,
+            300.0,
+            100.0,
             Channel::Pulse1,
-            Envelope { attack: 0.0, decay: 0.0, sustain: 1.0, release: 0.1 },
-            0.7
+            Envelope {
+                attack: 0.0,
+                decay: 0.0,
+                sustain: 1.0,
+                release: 0.1,
+            },
+            0.7,
         );
     }
 
     /// Player hit/damage sound
     pub fn play_hit(&self) {
         self.play_tone(
-            200.0, 60.0,
+            200.0,
+            60.0,
             Channel::Noise,
-            Envelope { attack: 0.0, decay: 0.0, sustain: 1.0, release: 0.2 },
-            1.0
+            Envelope {
+                attack: 0.0,
+                decay: 0.0,
+                sustain: 1.0,
+                release: 0.2,
+            },
+            1.0,
         );
     }
 
     /// Player death sound
     pub fn play_death(&self) {
         self.play_tone(
-            180.0, 50.0,
+            180.0,
+            50.0,
             Channel::Noise,
-            Envelope { attack: 0.0, decay: 0.0, sustain: 1.0, release: 0.3 },
-            1.0
+            Envelope {
+                attack: 0.0,
+                decay: 0.0,
+                sustain: 1.0,
+                release: 0.3,
+            },
+            1.0,
         );
     }
 
     /// Projectile hit/explosion
     pub fn play_explosion(&self) {
         self.play_tone(
-            170.0, 40.0,
+            170.0,
+            40.0,
             Channel::Noise,
-            Envelope { attack: 0.0, decay: 0.0, sustain: 1.0, release: 0.25 },
-            1.0
+            Envelope {
+                attack: 0.0,
+                decay: 0.0,
+                sustain: 1.0,
+                release: 0.25,
+            },
+            1.0,
         );
     }
 
@@ -252,20 +309,32 @@ impl Audio {
             return;
         }
         self.play_tone(
-            60.0, 60.0,
+            60.0,
+            60.0,
             Channel::Pulse2,
-            Envelope { attack: 0.01, decay: 0.0, sustain: 1.0, release: 0.05 },
-            volume * 0.5
+            Envelope {
+                attack: 0.01,
+                decay: 0.0,
+                sustain: 1.0,
+                release: 0.05,
+            },
+            volume * 0.5,
         );
     }
 
     /// Menu selection sound
     pub fn play_menu_select(&self) {
         self.play_tone(
-            440.0, 440.0,
+            440.0,
+            440.0,
             Channel::Triangle,
-            Envelope { attack: 0.0, decay: 0.0, sustain: 1.0, release: 0.02 },
-            0.5
+            Envelope {
+                attack: 0.0,
+                decay: 0.0,
+                sustain: 1.0,
+                release: 0.02,
+            },
+            0.5,
         );
     }
 
@@ -277,10 +346,16 @@ impl Audio {
             (200.0, 40.0)
         };
         self.play_tone(
-            freq_start, freq_end,
+            freq_start,
+            freq_end,
             Channel::Pulse1,
-            Envelope { attack: 0.0, decay: 0.0, sustain: 1.0, release: 0.01 },
-            0.5
+            Envelope {
+                attack: 0.0,
+                decay: 0.0,
+                sustain: 1.0,
+                release: 0.01,
+            },
+            0.5,
         );
     }
 }

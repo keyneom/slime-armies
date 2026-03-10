@@ -9,8 +9,8 @@ pub const CHUNK_SIZE: i32 = 512;
 pub enum Terrain {
     Empty,
     Grass,
-    Rock,      // Obstacle - blocks movement
-    Water,     // Slows movement (future)
+    Rock,  // Obstacle - blocks movement
+    Water, // Slows movement (future)
 }
 
 /// A single chunk of the infinite world
@@ -27,7 +27,7 @@ pub struct Chunk {
 pub struct Obstacle {
     pub pos: Vec2,
     pub radius: f32,
-    pub variant: u8,  // Visual variant
+    pub variant: u8, // Visual variant
 }
 
 impl Chunk {
@@ -119,10 +119,7 @@ impl Chunk {
 
     /// Get world position of chunk's top-left corner
     pub fn world_pos(&self) -> Vec2 {
-        Vec2::new(
-            (self.x * CHUNK_SIZE) as f32,
-            (self.y * CHUNK_SIZE) as f32,
-        )
+        Vec2::new((self.x * CHUNK_SIZE) as f32, (self.y * CHUNK_SIZE) as f32)
     }
 
     /// Check if a point collides with any obstacle in this chunk
@@ -159,7 +156,10 @@ impl ChunkManager {
     pub fn add_dynamic_obstacle(&mut self, obstacle: Obstacle) {
         let cx = (obstacle.pos.x / CHUNK_SIZE as f32).floor() as i32;
         let cy = (obstacle.pos.y / CHUNK_SIZE as f32).floor() as i32;
-        self.dynamic_obstacles.entry((cx, cy)).or_default().push(obstacle.clone());
+        self.dynamic_obstacles
+            .entry((cx, cy))
+            .or_default()
+            .push(obstacle.clone());
         if let Some(chunk) = self.chunks.get_mut(&(cx, cy)) {
             chunk.obstacles.push(obstacle);
         }
@@ -174,14 +174,14 @@ impl ChunkManager {
         }
 
         if let Some(chunk) = self.chunks.get_mut(&(cx, cy)) {
-            chunk.obstacles.retain(|entry| !Self::obstacle_matches(entry, obstacle));
+            chunk
+                .obstacles
+                .retain(|entry| !Self::obstacle_matches(entry, obstacle));
         }
     }
 
     fn obstacle_matches(a: &Obstacle, b: &Obstacle) -> bool {
-        a.variant == b.variant
-            && (a.radius - b.radius).abs() < 0.01
-            && a.pos.distance(b.pos) < 0.01
+        a.variant == b.variant && (a.radius - b.radius).abs() < 0.01 && a.pos.distance(b.pos) < 0.01
     }
 
     /// Update loaded chunks based on player position
@@ -227,7 +227,8 @@ impl ChunkManager {
             }
         }
 
-        self.chunks.retain(|&(cx, cy), _| keep_chunks.contains(&(cx, cy)));
+        self.chunks
+            .retain(|&(cx, cy), _| keep_chunks.contains(&(cx, cy)));
     }
 
     /// Get chunk at world position
@@ -256,7 +257,13 @@ impl ChunkManager {
     }
 
     /// Get all visible obstacles for rendering
-    pub fn visible_obstacles(&self, min_x: f32, min_y: f32, max_x: f32, max_y: f32) -> Vec<&Obstacle> {
+    pub fn visible_obstacles(
+        &self,
+        min_x: f32,
+        min_y: f32,
+        max_x: f32,
+        max_y: f32,
+    ) -> Vec<&Obstacle> {
         let mut result = Vec::new();
 
         let min_cx = (min_x / CHUNK_SIZE as f32).floor() as i32 - 1;

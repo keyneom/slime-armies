@@ -1,9 +1,9 @@
+mod camera;
 mod chunk;
 mod noise;
-mod camera;
 
-pub use chunk::ChunkManager;
 pub use camera::Camera;
+pub use chunk::ChunkManager;
 
 // Re-export for future use
 #[allow(unused_imports)]

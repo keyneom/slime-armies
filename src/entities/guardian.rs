@@ -101,7 +101,11 @@ impl Guardian {
         let mut desired_pos = if dist_from_home > LEASH_RADIUS {
             self.home_pos
         } else {
-            let bias = if self.strike_timer > 0 { STRIKE_BIAS } else { INTERCEPT_BIAS };
+            let bias = if self.strike_timer > 0 {
+                STRIKE_BIAS
+            } else {
+                INTERCEPT_BIAS
+            };
             self.home_pos + (target - self.home_pos) * bias
         };
 
@@ -250,7 +254,8 @@ impl Guardian {
 
         for (idx, tentacle) in self.tentacles.iter_mut().enumerate() {
             let anchor_angle = (idx as f32) * std::f32::consts::TAU / TENTACLE_COUNT as f32;
-            let anchor = self.pos + Vec2::new(anchor_angle.cos(), anchor_angle.sin()) * (BODY_RADIUS * 0.8);
+            let anchor =
+                self.pos + Vec2::new(anchor_angle.cos(), anchor_angle.sin()) * (BODY_RADIUS * 0.8);
             tentacle.joints[0] = anchor;
 
             let mode = tentacle.mode % 5;
@@ -280,7 +285,8 @@ impl Guardian {
             let dir_from_guardian = Self::safe_normalize(closest_player - self.pos);
 
             let target = if player_dist > MAX_TENTACLE_REACH * 1.2 {
-                self.pos + Vec2::new(anchor_angle.cos(), anchor_angle.sin()) * (MAX_TENTACLE_REACH * 0.6)
+                self.pos
+                    + Vec2::new(anchor_angle.cos(), anchor_angle.sin()) * (MAX_TENTACLE_REACH * 0.6)
             } else {
                 let rear = closest_player - player_dir * 24.0;
                 let front = closest_player + player_dir * 16.0;
@@ -292,12 +298,19 @@ impl Guardian {
                     _ => closest_player - perp * 12.0,
                 }
             };
-            let overshoot = closest_player + dir_from_guardian * (MAX_TENTACLE_REACH * TENTACLE_OVERSHOOT_FACTOR);
-            let wrap = closest_player - player_dir * TENTACLE_WRAP_DISTANCE + perp * (if mode == 2 { -22.0 } else { 22.0 });
+            let overshoot = closest_player
+                + dir_from_guardian * (MAX_TENTACLE_REACH * TENTACLE_OVERSHOOT_FACTOR);
+            let wrap = closest_player - player_dir * TENTACLE_WRAP_DISTANCE
+                + perp * (if mode == 2 { -22.0 } else { 22.0 });
             let curl_center = closest_player - player_dir * (TENTACLE_WRAP_DISTANCE + 8.0);
             let curl_angle = (_frame_count as f32 * 0.6) + (idx as f32 * 1.1);
-            let curl_target = curl_center + Vec2::new(curl_angle.cos(), curl_angle.sin()) * (MAX_TENTACLE_REACH * 0.35);
-            let mut seek_target = if tentacle.state == 0 { overshoot } else { target };
+            let curl_target = curl_center
+                + Vec2::new(curl_angle.cos(), curl_angle.sin()) * (MAX_TENTACLE_REACH * 0.35);
+            let mut seek_target = if tentacle.state == 0 {
+                overshoot
+            } else {
+                target
+            };
             if tentacle.state == 0 && mode % 2 == 0 {
                 seek_target = wrap;
             } else if tentacle.state == 2 {

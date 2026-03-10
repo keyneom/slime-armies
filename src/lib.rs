@@ -1,30 +1,32 @@
 // Allow dead code for items that will be used in future phases (GGRS, multiplayer, etc.)
 #![allow(dead_code)]
 
-use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
 use std::cell::RefCell;
 use std::rc::Rc;
+use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 
-mod math;
-mod input;
-mod render;
-mod game;
-mod entities;
-mod world;
-mod net;
 mod audio;
+mod entities;
+mod game;
+mod input;
+mod math;
+mod net;
 mod payment;
+mod render;
+mod world;
 
+use audio::Audio;
 use game::{Game, Scene};
 use input::Input;
+use net::{IceConfig, NetworkSession, NetworkState, PaidNameReservation, PlayerState};
 use render::Renderer;
-use net::{IceConfig, NetworkSession, NetworkState, PlayerState};
-use audio::Audio;
 
 // Default signaling server - using Johan Helsing's public matchbox server
 // This is the same server used by Extreme Bevy and other matchbox games
 const DEFAULT_SIGNALING_SERVER: &str = "wss://match-0-13.helsing.studio";
+const NAME_OWNER_SEED_KEY: &str = "slime_name_owner_seed_v1";
+const NAME_RESERVATIONS_KEY: &str = "slime_name_reservations_v1";
 
 // Configurable server URL (can be set via JS)
 thread_local! {
@@ -54,7 +56,7 @@ struct InputBuffer {
     escape: bool,
     enter: bool,
     tab: bool,
-    mute_toggle: bool,  // M key to toggle audio mute
+    mute_toggle: bool, // M key to toggle audio mute
     click: Option<(f64, f64)>,
 }
 
@@ -180,6 +182,55 @@ impl InputBuffer {
     }
 }
 
+fn queue_key_down(buffer: &mut InputBuffer, code: &str, key: &str) {
+    match code {
+        "Backspace" => buffer.backspace = true,
+        "Escape" => buffer.escape = true,
+        "Enter" => buffer.enter = true,
+        "Tab" => buffer.tab = true,
+        // Arrow keys and modifiers are gameplay/navigation keys only.
+        "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" | "ShiftLeft" | "ShiftRight"
+        | "ControlLeft" | "ControlRight" | "AltLeft" | "AltRight" | "MetaLeft" | "MetaRight" => {
+            buffer.keys_down.push(code.to_string());
+        }
+        _ => {
+            buffer.keys_down.push(code.to_string());
+            if key.len() == 1 {
+                if let Some(c) = key.chars().next() {
+                    if c.is_ascii() && !c.is_ascii_control() {
+                        buffer.chars.push(c);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn queue_key_up(buffer: &mut InputBuffer, code: &str) {
+    if !code.is_empty() {
+        buffer.keys_up.push(code.to_string());
+    }
+}
+
+fn automation_key_from_id(key_id: u32) -> Option<(&'static str, &'static str)> {
+    match key_id {
+        1 => Some(("ArrowUp", "ArrowUp")),
+        2 => Some(("ArrowDown", "ArrowDown")),
+        3 => Some(("ArrowLeft", "ArrowLeft")),
+        4 => Some(("ArrowRight", "ArrowRight")),
+        5 => Some(("KeyW", "w")),
+        6 => Some(("KeyA", "a")),
+        7 => Some(("KeyS", "s")),
+        8 => Some(("KeyD", "d")),
+        9 => Some(("Space", " ")),
+        10 => Some(("Enter", "Enter")),
+        11 => Some(("Backspace", "Backspace")),
+        12 => Some(("Tab", "Tab")),
+        13 => Some(("Escape", "Escape")),
+        _ => None,
+    }
+}
+
 fn load_saved_player_name() -> Option<String> {
     let window = web_sys::window()?;
     let storage = window.local_storage().ok()??;
@@ -208,6 +259,130 @@ fn save_room_code(code: &str) {
     }
 }
 
+fn load_or_create_name_owner_seed() -> String {
+    let seed_from_storage = web_sys::window()
+        .and_then(|window| window.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(NAME_OWNER_SEED_KEY).ok().flatten())
+        .filter(|seed| !seed.trim().is_empty());
+
+    if let Some(seed) = seed_from_storage {
+        return seed;
+    }
+
+    let now = js_sys::Date::now() as u64;
+    let rand_a = (js_sys::Math::random() * (u32::MAX as f64)) as u32;
+    let rand_b = (js_sys::Math::random() * (u32::MAX as f64)) as u32;
+    let seed = format!("slime-owner-{now:016x}-{rand_a:08x}-{rand_b:08x}");
+
+    if let Some(window) = web_sys::window() {
+        if let Ok(Some(storage)) = window.local_storage() {
+            let _ = storage.set_item(NAME_OWNER_SEED_KEY, &seed);
+        }
+    }
+
+    seed
+}
+
+fn load_or_create_name_owner_hash() -> u64 {
+    let seed = load_or_create_name_owner_seed();
+    NetworkSession::hash_name_owner_seed(&seed)
+}
+
+fn hash_to_hex(hash: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in hash {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn parse_hex32(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    let bytes = hex.as_bytes();
+    for i in 0..32 {
+        let hi = bytes[i * 2];
+        let lo = bytes[i * 2 + 1];
+        let hi = (hi as char).to_digit(16)? as u8;
+        let lo = (lo as char).to_digit(16)? as u8;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+fn encode_name_reservations(reservations: &[PaidNameReservation]) -> String {
+    let mut out = String::new();
+    for reservation in reservations {
+        let name = NetworkSession::normalize_player_name(&reservation.name_string());
+        if name.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "{}:{}:{}:{}",
+            name,
+            reservation.owner_hash,
+            reservation.nonce,
+            hash_to_hex(&reservation.proof_hash)
+        ));
+    }
+    out
+}
+
+fn decode_name_reservations(encoded: &str) -> Vec<PaidNameReservation> {
+    let mut out = Vec::new();
+    for line in encoded.lines() {
+        let mut parts = line.split(':');
+        let name = match parts.next() {
+            Some(v) => v.trim(),
+            None => continue,
+        };
+        let owner_hash = match parts.next().and_then(|v| v.parse::<u64>().ok()) {
+            Some(v) if v != 0 => v,
+            _ => continue,
+        };
+        let nonce = match parts.next().and_then(|v| v.parse::<u32>().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let proof_hash = match parts.next().and_then(parse_hex32) {
+            Some(v) => v,
+            None => continue,
+        };
+        if parts.next().is_some() {
+            continue;
+        }
+        let normalized = NetworkSession::normalize_player_name(name);
+        let reservation =
+            PaidNameReservation::from_name(owner_hash, &normalized, nonce, proof_hash);
+        out.push(reservation);
+    }
+    out
+}
+
+fn load_saved_name_reservations() -> Vec<PaidNameReservation> {
+    let raw = web_sys::window()
+        .and_then(|window| window.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(NAME_RESERVATIONS_KEY).ok().flatten())
+        .unwrap_or_default();
+    decode_name_reservations(&raw)
+}
+
+fn save_name_reservations(reservations: &[PaidNameReservation]) {
+    if let Some(window) = web_sys::window() {
+        if let Ok(Some(storage)) = window.local_storage() {
+            let encoded = encode_name_reservations(reservations);
+            let _ = storage.set_item(NAME_RESERVATIONS_KEY, &encoded);
+        }
+    }
+}
+
 #[wasm_bindgen(start)]
 pub fn main() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
@@ -230,9 +405,20 @@ pub fn main() -> Result<(), JsValue> {
     let input = Input::new();
     let mut game = Game::new(width, height);
     let mut network = NetworkSession::new();
+    network.set_local_name_owner_hash(load_or_create_name_owner_hash());
+    for reservation in load_saved_name_reservations() {
+        if network.verify_paid_name_reservation(&reservation) {
+            let _ = network.apply_paid_name_reservation(reservation);
+        }
+    }
+    persist_name_reservation_cache(&network);
     if let Some(saved_name) = load_saved_player_name() {
         game.player_name = saved_name.clone();
         network.set_player_name(&saved_name);
+    }
+    if let Some(updated) = network.ensure_local_name_not_reserved_by_other() {
+        game.player_name = updated;
+        save_player_name(&game.player_name);
     }
     if let Some(saved_room) = load_saved_room_code() {
         game.room_code_input = saved_room;
@@ -287,6 +473,9 @@ pub fn create_room() -> String {
     GAME_STATE.with(|gs| {
         if let Some(state) = gs.borrow().as_ref() {
             let mut state_ref = state.borrow_mut();
+            if !validate_title_name_for_room_action(&mut state_ref) {
+                return String::new();
+            }
             let server = signaling_server_url();
             let ice = ice_config();
             state_ref.network.create_room(&server, &ice)
@@ -302,6 +491,9 @@ pub fn join_room(room_code: &str) {
     GAME_STATE.with(|gs| {
         if let Some(state) = gs.borrow().as_ref() {
             let mut state_ref = state.borrow_mut();
+            if !validate_title_name_for_room_action(&mut state_ref) {
+                return;
+            }
             let server = signaling_server_url();
             let ice = ice_config();
             state_ref.network.join_room(&server, room_code, &ice);
@@ -535,6 +727,215 @@ pub fn send_debug_command(command: String) {
     });
 }
 
+fn scene_name(scene: Scene) -> &'static str {
+    match scene {
+        Scene::Title => "title",
+        Scene::Game => "game",
+        Scene::GameOver => "game_over",
+    }
+}
+
+fn network_state_name(state: &NetworkState) -> String {
+    match state {
+        NetworkState::Disconnected => "disconnected".to_string(),
+        NetworkState::Connecting => "connecting".to_string(),
+        NetworkState::WaitingForPeers => "waiting".to_string(),
+        NetworkState::Connected => "connected".to_string(),
+        NetworkState::Error(e) => format!("error:{e}"),
+    }
+}
+
+/// Testing automation entry point: enqueue one key-down event.
+/// Uses the same internal input path as browser events.
+#[wasm_bindgen]
+pub fn test_input_key_down(code: &str, key: &str) {
+    let key_text = if key.is_empty() { code } else { key };
+    INPUT_BUFFER.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        queue_key_down(&mut buf, code, key_text);
+    });
+}
+
+/// Testing automation entry point: enqueue one key-up event.
+#[wasm_bindgen]
+pub fn test_input_key_up(code: &str) {
+    INPUT_BUFFER.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        queue_key_up(&mut buf, code);
+    });
+}
+
+/// Testing automation entry point: enqueue ASCII text characters.
+#[wasm_bindgen]
+pub fn test_input_text(text: &str) {
+    INPUT_BUFFER.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        for c in text.chars() {
+            if c.is_ascii() && !c.is_ascii_control() {
+                buf.chars.push(c);
+            }
+        }
+    });
+}
+
+/// Testing automation entry point: enqueue one key-down event using numeric key ids.
+/// This avoids JS string ABI edge-cases when automation runs against raw wasm bindings.
+#[wasm_bindgen]
+pub fn test_input_key_id_down(key_id: u32) {
+    if let Some((code, key)) = automation_key_from_id(key_id) {
+        INPUT_BUFFER.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            queue_key_down(&mut buf, code, key);
+        });
+    }
+}
+
+/// Testing automation entry point: enqueue one key-up event using numeric key ids.
+#[wasm_bindgen]
+pub fn test_input_key_id_up(key_id: u32) {
+    if let Some((code, _)) = automation_key_from_id(key_id) {
+        INPUT_BUFFER.with(|buf| {
+            let mut buf = buf.borrow_mut();
+            queue_key_up(&mut buf, code);
+        });
+    }
+}
+
+/// Testing automation entry point: enqueue one printable ASCII character by codepoint.
+#[wasm_bindgen]
+pub fn test_input_ascii_char(codepoint: u32) {
+    if let Some(c) = char::from_u32(codepoint) {
+        if c.is_ascii() && !c.is_ascii_control() {
+            INPUT_BUFFER.with(|buf| {
+                let mut buf = buf.borrow_mut();
+                buf.chars.push(c);
+            });
+        }
+    }
+}
+
+/// Testing automation entry point: enqueue one click event in canvas coordinates.
+#[wasm_bindgen]
+pub fn test_input_click(x: f64, y: f64) {
+    INPUT_BUFFER.with(|buf| {
+        buf.borrow_mut().click = Some((x, y));
+    });
+}
+
+/// Clears pending buffered input/touch automation state.
+#[wasm_bindgen]
+pub fn test_input_reset() {
+    INPUT_BUFFER.with(|buf| {
+        buf.borrow_mut().clear();
+    });
+    TOUCH_STATE.with(|state| {
+        *state.borrow_mut() = TouchState::new();
+    });
+}
+
+/// Queues a room join from the current title-screen room input.
+/// Test-only automation helper to avoid fragile coordinate clicks.
+#[wasm_bindgen]
+pub fn test_join_current_room() {
+    GAME_STATE.with(|gs| {
+        if let Some(state) = gs.borrow().as_ref() {
+            let mut state_ref = state.borrow_mut();
+            if state_ref.game.scene == Scene::Title && state_ref.game.room_code_input.len() >= 4 {
+                state_ref.game.queued_join_room = true;
+                state_ref.game.text_input_active = false;
+            }
+        }
+    });
+}
+
+/// Compact runtime snapshot for automation assertions.
+/// Format: `scene=...;network=...;room=...;players=...;map_open=...;player_list_open=...;chat_open=...`
+#[wasm_bindgen]
+pub fn test_runtime_state() -> String {
+    GAME_STATE.with(|gs| {
+        if let Some(state) = gs.borrow().as_ref() {
+            let state_ref = state.borrow();
+            let scene = scene_name(state_ref.game.scene);
+            let net = network_state_name(&state_ref.network.state);
+            let room = state_ref.network.room_code.as_str();
+            let players = state_ref.network.peer_count() + 1;
+            let map_open = state_ref.game.map_open;
+            let player_list_open = state_ref.game.player_list_open;
+            let chat_open = state_ref.game.chat_open;
+            format!(
+                "scene={scene};network={net};room={room};players={players};map_open={map_open};player_list_open={player_list_open};chat_open={chat_open}"
+            )
+        } else {
+            "scene=uninitialized;network=uninitialized;room=;players=0;map_open=false;player_list_open=false;chat_open=false".to_string()
+        }
+    })
+}
+
+/// Focused network diagnostics for multi-device validation.
+/// Format:
+/// `network=...;room=...;remote_players=...;known_peers=...;desired_peers=...;discovery_attached=...;relay_epoch=...;is_host=...;local_peer=...;supernode=...;local_name=...;rx=...;dropped=...;remote_ids=...;remote_names=...`
+#[wasm_bindgen]
+pub fn test_network_diag() -> String {
+    GAME_STATE.with(|gs| {
+        if let Some(state) = gs.borrow().as_ref() {
+            let state_ref = state.borrow();
+            let net = network_state_name(&state_ref.network.state);
+            let room = state_ref.network.room_code.as_str();
+            let remote_players = state_ref.network.peer_count();
+            let known_peers = state_ref.network.known_peer_count();
+            let desired_peers = state_ref.network.desired_peer_count();
+            let discovery_attached = state_ref.network.discovery_attached();
+            let relay_epoch = state_ref.network.relay_epoch();
+            let is_host = state_ref.network.is_host;
+            let local_peer = state_ref
+                .network
+                .local_peer_id
+                .map(|id| format!("{:?}", id))
+                .unwrap_or_else(|| "none".to_string());
+            let supernode = state_ref
+                .network
+                .supernode_id
+                .map(|id| format!("{:?}", id))
+                .unwrap_or_else(|| "none".to_string());
+            let local_name = state_ref.network.local_display_name();
+            let rx = state_ref.network.relay_telemetry.recv_messages;
+            let dropped = state_ref.network.relay_telemetry.dropped_messages;
+            let mut remote_ids: Vec<String> = state_ref
+                .network
+                .remote_players
+                .keys()
+                .cloned()
+                .collect();
+            remote_ids.sort();
+            let remote_ids = if remote_ids.is_empty() {
+                "none".to_string()
+            } else {
+                remote_ids.join(",")
+            };
+            let mut remote_names: Vec<String> = state_ref
+                .network
+                .remote_players
+                .keys()
+                .map(|peer_id| {
+                    let display = state_ref.network.display_name_for_peer_id(peer_id);
+                    format!("{peer_id}:{display}")
+                })
+                .collect();
+            remote_names.sort();
+            let remote_names = if remote_names.is_empty() {
+                "none".to_string()
+            } else {
+                remote_names.join(",")
+            };
+            format!(
+                "network={net};room={room};remote_players={remote_players};known_peers={known_peers};desired_peers={desired_peers};discovery_attached={discovery_attached};relay_epoch={relay_epoch};is_host={is_host};local_peer={local_peer};supernode={supernode};local_name={local_name};rx={rx};dropped={dropped};remote_ids={remote_ids};remote_names={remote_names}"
+            )
+        } else {
+            "network=uninitialized;room=;remote_players=0;known_peers=0;desired_peers=0;discovery_attached=false;relay_epoch=0;is_host=false;local_peer=none;supernode=none;local_name=none;rx=0;dropped=0;remote_ids=none;remote_names=none".to_string()
+        }
+    })
+}
+
 fn make_event_id(seed: u64, a: u64, b: u64, c: u64) -> u64 {
     let mut x = seed ^ 0x9e3779b97f4a7c15;
     x = x.wrapping_add(a.wrapping_mul(0xbf58476d1ce4e5b9));
@@ -561,12 +962,64 @@ struct GameState {
     renderer: Renderer,
     network: NetworkSession,
     audio: Audio,
-    send_counter: u32, // Send network updates every N frames
+    send_counter: u32,       // Send network updates every N frames
     input_send_counter: u32, // Send input frames every N frames
     last_supernode_id: Option<matchbox_socket::PeerId>,
 }
 
-fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: &web_sys::HtmlCanvasElement) -> Result<(), JsValue> {
+fn persist_name_reservation_cache(network: &NetworkSession) {
+    let snapshot = network.paid_name_reservations_snapshot();
+    save_name_reservations(&snapshot);
+}
+
+fn title_name_reservation_block_reason(
+    state_ref: &GameState,
+    normalized: &str,
+    owner_hash: u64,
+) -> String {
+    let owner_name = state_ref.network.display_name_for_hash(owner_hash);
+    if owner_name.eq_ignore_ascii_case("player") {
+        format!(
+            "{} is reserved by another owner ({:016X}). Choose a different name.",
+            normalized, owner_hash
+        )
+    } else {
+        format!(
+            "{} is reserved by {} ({:016X}). Choose a different name.",
+            normalized, owner_name, owner_hash
+        )
+    }
+}
+
+fn validate_title_name_for_room_action(state_ref: &mut GameState) -> bool {
+    let normalized = NetworkSession::normalize_player_name(&state_ref.game.player_name);
+    if state_ref.game.player_name != normalized {
+        state_ref.game.player_name = normalized.clone();
+        save_player_name(&state_ref.game.player_name);
+    }
+    state_ref.network.set_player_name(&normalized);
+    let local_owner_hash = state_ref.network.local_name_owner_hash();
+    if local_owner_hash == 0 {
+        state_ref.game.title_warning =
+            "Name identity unavailable. Reload and try again.".to_string();
+        return false;
+    }
+    if let Some(owner_hash) = state_ref.network.reserved_name_owner_hash(&normalized) {
+        if owner_hash != local_owner_hash {
+            state_ref.game.title_warning =
+                title_name_reservation_block_reason(state_ref, &normalized, owner_hash);
+            return false;
+        }
+    }
+    state_ref.game.title_warning.clear();
+    true
+}
+
+fn setup_input(
+    window: &web_sys::Window,
+    state: Rc<RefCell<GameState>>,
+    canvas: &web_sys::HtmlCanvasElement,
+) -> Result<(), JsValue> {
     // Keydown handler - writes to INPUT_BUFFER instead of directly to state
     let keydown = Closure::<dyn FnMut(_)>::new(move |event: web_sys::KeyboardEvent| {
         let code = event.code();
@@ -576,34 +1029,7 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
 
         INPUT_BUFFER.with(|buf| {
             let mut buf = buf.borrow_mut();
-
-            // Special keys by code
-            match code.as_str() {
-                "Backspace" => buf.backspace = true,
-                "Escape" => buf.escape = true,
-                "Enter" => buf.enter = true,
-                "Tab" => buf.tab = true,
-                // Arrow keys and modifiers - only add to keys_down, no character
-                "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" |
-                "ShiftLeft" | "ShiftRight" | "ControlLeft" | "ControlRight" |
-                "AltLeft" | "AltRight" | "MetaLeft" | "MetaRight" => {
-                    buf.keys_down.push(code);
-                }
-                _ => {
-                    // Regular keys go to keys_down
-                    buf.keys_down.push(code);
-
-                    // Only capture single characters for text input
-                    // key.len() == 1 filters out special keys like "Shift", "ArrowUp", etc.
-                    if key.len() == 1 {
-                        if let Some(c) = key.chars().next() {
-                            if c.is_ascii() && !c.is_ascii_control() {
-                                buf.chars.push(c);
-                            }
-                        }
-                    }
-                }
-            }
+            queue_key_down(&mut buf, &code, &key);
         });
     });
     window.add_event_listener_with_callback("keydown", keydown.as_ref().unchecked_ref())?;
@@ -613,7 +1039,8 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
     let keyup = Closure::<dyn FnMut(_)>::new(move |event: web_sys::KeyboardEvent| {
         event.prevent_default();
         INPUT_BUFFER.with(|buf| {
-            buf.borrow_mut().keys_up.push(event.code());
+            let mut buf = buf.borrow_mut();
+            queue_key_up(&mut buf, &event.code());
         });
     });
     window.add_event_listener_with_callback("keyup", keyup.as_ref().unchecked_ref())?;
@@ -642,67 +1069,77 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
     if let Some(doc) = window.document() {
         if let Some(input_el) = doc.get_element_by_id("mobile-input") {
             if let Ok(input_el) = input_el.dyn_into::<web_sys::HtmlInputElement>() {
-                let input_listener = Closure::<dyn FnMut(_)>::new(move |event: web_sys::InputEvent| {
-                    event.prevent_default();
-                    let target = event.target().unwrap();
-                    let input_el: web_sys::HtmlInputElement = target.dyn_into().unwrap();
-                    let value = input_el.value();
-                    if value.is_empty() {
-                        let input_type = event.input_type();
-                        if input_type == "deleteContentBackward" || input_type == "deleteContentForward" {
-                            INPUT_BUFFER.with(|buf| {
-                                buf.borrow_mut().backspace = true;
-                            });
-                        }
-                        return;
-                    }
-                    INPUT_BUFFER.with(|buf| {
-                        let mut buf = buf.borrow_mut();
-                        for c in value.chars() {
-                            if c.is_ascii() && !c.is_ascii_control() {
-                                buf.chars.push(c);
+                let input_listener =
+                    Closure::<dyn FnMut(_)>::new(move |event: web_sys::InputEvent| {
+                        event.prevent_default();
+                        let target = event.target().unwrap();
+                        let input_el: web_sys::HtmlInputElement = target.dyn_into().unwrap();
+                        let value = input_el.value();
+                        if value.is_empty() {
+                            let input_type = event.input_type();
+                            if input_type == "deleteContentBackward"
+                                || input_type == "deleteContentForward"
+                            {
+                                INPUT_BUFFER.with(|buf| {
+                                    buf.borrow_mut().backspace = true;
+                                });
                             }
+                            return;
                         }
+                        INPUT_BUFFER.with(|buf| {
+                            let mut buf = buf.borrow_mut();
+                            for c in value.chars() {
+                                if c.is_ascii() && !c.is_ascii_control() {
+                                    buf.chars.push(c);
+                                }
+                            }
+                        });
+                        input_el.set_value("");
                     });
-                    input_el.set_value("");
-                });
-                input_el.add_event_listener_with_callback("input", input_listener.as_ref().unchecked_ref())?;
+                input_el.add_event_listener_with_callback(
+                    "input",
+                    input_listener.as_ref().unchecked_ref(),
+                )?;
                 input_listener.forget();
 
-                let key_listener = Closure::<dyn FnMut(_)>::new(move |event: web_sys::KeyboardEvent| {
-                    let handled = INPUT_BUFFER.with(|buf| {
-                        let mut buf = buf.borrow_mut();
-                        match event.code().as_str() {
-                            "Backspace" => {
-                                buf.backspace = true;
-                                true
+                let key_listener =
+                    Closure::<dyn FnMut(_)>::new(move |event: web_sys::KeyboardEvent| {
+                        let handled = INPUT_BUFFER.with(|buf| {
+                            let mut buf = buf.borrow_mut();
+                            match event.code().as_str() {
+                                "Backspace" => {
+                                    buf.backspace = true;
+                                    true
+                                }
+                                "Enter" => {
+                                    buf.enter = true;
+                                    true
+                                }
+                                "Escape" => {
+                                    buf.escape = true;
+                                    true
+                                }
+                                "Tab" => {
+                                    buf.tab = true;
+                                    true
+                                }
+                                _ => false,
                             }
-                            "Enter" => {
-                                buf.enter = true;
-                                true
-                            }
-                            "Escape" => {
-                                buf.escape = true;
-                                true
-                            }
-                            "Tab" => {
-                                buf.tab = true;
-                                true
-                            }
-                            _ => false,
+                        });
+                        if !handled && event.key() == "Enter" {
+                            INPUT_BUFFER.with(|buf| {
+                                buf.borrow_mut().enter = true;
+                            });
+                        }
+                        if handled || event.key() == "Enter" {
+                            event.prevent_default();
+                            event.stop_propagation();
                         }
                     });
-                    if !handled && event.key() == "Enter" {
-                        INPUT_BUFFER.with(|buf| {
-                            buf.borrow_mut().enter = true;
-                        });
-                    }
-                    if handled || event.key() == "Enter" {
-                        event.prevent_default();
-                        event.stop_propagation();
-                    }
-                });
-                input_el.add_event_listener_with_callback("keydown", key_listener.as_ref().unchecked_ref())?;
+                input_el.add_event_listener_with_callback(
+                    "keydown",
+                    key_listener.as_ref().unchecked_ref(),
+                )?;
                 key_listener.forget();
             }
         }
@@ -748,20 +1185,33 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                             let join_x = center_x + 20.0;
                             let join_y = 260.0 - 14.0;
 
-                            if x >= name_box_x && x <= name_box_x + 180.0 && y >= name_box_y && y <= name_box_y + 22.0 {
+                            if x >= name_box_x
+                                && x <= name_box_x + 180.0
+                                && y >= name_box_y
+                                && y <= name_box_y + 22.0
+                            {
                                 state_ref.game.activate_text_input(0);
                                 handled_ui = true;
                                 focus_input = true;
-                            } else if x >= code_box_x && x <= code_box_x + 100.0 && y >= code_box_y && y <= code_box_y + 22.0 {
+                            } else if x >= code_box_x
+                                && x <= code_box_x + 100.0
+                                && y >= code_box_y
+                                && y <= code_box_y + 22.0
+                            {
                                 state_ref.game.activate_text_input(1);
                                 handled_ui = true;
                                 focus_input = true;
-                            } else if x >= join_x && x <= join_x + 70.0 && y >= join_y && y <= join_y + 22.0 {
+                            } else if x >= join_x
+                                && x <= join_x + 70.0
+                                && y >= join_y
+                                && y <= join_y + 22.0
+                            {
                                 state_ref.game.queued_join_room = true;
                                 state_ref.game.text_input_active = false;
                                 handled_ui = true;
                             }
-                        } else if (state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver)
+                        } else if (state_ref.game.scene == Scene::Game
+                            || state_ref.game.scene == Scene::GameOver)
                             && state_ref.game.map_open
                         {
                             let in_circle = |center: crate::math::Vec2, radius: f64| {
@@ -794,21 +1244,34 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                                 let button_h = 20.0;
                                 let button_x = map_left + map_size - button_w - 10.0;
                                 let button_y = input_y - 28.0;
-                                if x >= button_x && x <= button_x + button_w && y >= button_y && y <= button_y + button_h {
+                                if x >= button_x
+                                    && x <= button_x + button_w
+                                    && y >= button_y
+                                    && y <= button_y + button_h
+                                {
                                     state_ref.game.confirm_map_teleport();
                                     handled_ui = true;
-                                } else if x >= input_x && x <= input_x + 140.0 && y >= input_y - 14.0 && y <= input_y + 8.0 {
+                                } else if x >= input_x
+                                    && x <= input_x + 140.0
+                                    && y >= input_y - 14.0
+                                    && y <= input_y + 8.0
+                                {
                                     state_ref.game.activate_map_input(0);
                                     handled_ui = true;
                                     focus_input = true;
-                                } else if x >= input_x + 170.0 && x <= input_x + 310.0 && y >= input_y - 14.0 && y <= input_y + 8.0 {
+                                } else if x >= input_x + 170.0
+                                    && x <= input_x + 310.0
+                                    && y >= input_y - 14.0
+                                    && y <= input_y + 8.0
+                                {
                                     state_ref.game.activate_map_input(1);
                                     handled_ui = true;
                                     focus_input = true;
                                 }
                             }
                         } else if state_ref.game.mobile_mode
-                            && (state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver)
+                            && (state_ref.game.scene == Scene::Game
+                                || state_ref.game.scene == Scene::GameOver)
                         {
                             let in_circle = |center: crate::math::Vec2, radius: f64| {
                                 let dx = pos.x as f64 - center.x as f64;
@@ -823,24 +1286,34 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                                 handled_ui = true;
                                 focus_input = state_ref.game.chat_open;
                             } else if !state_ref.game.map_open && !state_ref.game.player_list_open {
-                            let map_size = 120.0;
-                            let map_padding = 10.0;
-                            let map_left = (state_ref.game.width as f64) - map_size - map_padding;
-                            let portrait = state_ref.game.viewport_height > state_ref.game.viewport_width;
-                            let map_top = if state_ref.game.mobile_mode || portrait { 130.0 } else { (state_ref.game.height as f64) - map_size - map_padding };
-                            if x >= map_left && x <= map_left + map_size && y >= map_top && y <= map_top + map_size {
-                                state_ref.game.toggle_map();
-                                handled_ui = true;
-                            } else {
-                                let right = state_ref.game.width as f64 - 10.0;
-                                let left = right - 240.0;
-                                let top = 35.0;
-                                let bottom = 110.0;
-                                if x >= left && x <= right && y >= top && y <= bottom {
-                                    state_ref.game.toggle_player_list();
+                                let map_size = 120.0;
+                                let map_padding = 10.0;
+                                let map_left =
+                                    (state_ref.game.width as f64) - map_size - map_padding;
+                                let portrait =
+                                    state_ref.game.viewport_height > state_ref.game.viewport_width;
+                                let map_top = if state_ref.game.mobile_mode || portrait {
+                                    130.0
+                                } else {
+                                    (state_ref.game.height as f64) - map_size - map_padding
+                                };
+                                if x >= map_left
+                                    && x <= map_left + map_size
+                                    && y >= map_top
+                                    && y <= map_top + map_size
+                                {
+                                    state_ref.game.toggle_map();
                                     handled_ui = true;
+                                } else {
+                                    let right = state_ref.game.width as f64 - 10.0;
+                                    let left = right - 240.0;
+                                    let top = 35.0;
+                                    let bottom = 110.0;
+                                    if x >= left && x <= right && y >= top && y <= bottom {
+                                        state_ref.game.toggle_player_list();
+                                        handled_ui = true;
+                                    }
                                 }
-                            }
                             } else if state_ref.game.player_list_open {
                                 let overlay_w = 480.0;
                                 let _overlay_h = 360.0;
@@ -848,10 +1321,18 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                                 let top = 70.0;
                                 let close_x = left + overlay_w - 26.0;
                                 let close_y = top + 8.0;
-                                if x >= close_x && x <= close_x + 18.0 && y >= close_y && y <= close_y + 18.0 {
+                                if x >= close_x
+                                    && x <= close_x + 18.0
+                                    && y >= close_y
+                                    && y <= close_y + 18.0
+                                {
                                     state_ref.game.toggle_player_list();
                                     handled_ui = true;
-                                } else if x >= left && x <= left + overlay_w && y >= top && y <= top + 360.0 {
+                                } else if x >= left
+                                    && x <= left + overlay_w
+                                    && y >= top
+                                    && y <= top + 360.0
+                                {
                                     handled_ui = true;
                                     start_list_drag = true;
                                 } else {
@@ -891,17 +1372,23 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                     };
 
                     if allow_controls {
-                        if state.joystick_id.is_none() && in_circle(layout.stick_center, layout.stick_radius * 1.3) {
+                        if state.joystick_id.is_none()
+                            && in_circle(layout.stick_center, layout.stick_radius * 1.3)
+                        {
                             state.joystick_id = Some(id);
                             state.joystick_center = pos;
                             state.joystick_axis = crate::math::Vec2::ZERO;
                             return;
                         }
-                        if state.attack_id.is_none() && in_circle(layout.attack_center, layout.button_radius) {
+                        if state.attack_id.is_none()
+                            && in_circle(layout.attack_center, layout.button_radius)
+                        {
                             state.attack_id = Some(id);
                             return;
                         }
-                        if state.phase_id.is_none() && in_circle(layout.phase_center, layout.button_radius) {
+                        if state.phase_id.is_none()
+                            && in_circle(layout.phase_center, layout.button_radius)
+                        {
                             state.phase_id = Some(id);
                             return;
                         }
@@ -928,7 +1415,10 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                     }
 
                     if let Some((map_left, map_top, map_size)) = map_rect {
-                        let within = x >= map_left && x <= map_left + map_size && y >= map_top && y <= map_top + map_size;
+                        let within = x >= map_left
+                            && x <= map_left + map_size
+                            && y >= map_top
+                            && y <= map_top + map_size;
                         let within_margin = x >= map_left - map_margin
                             && x <= map_left + map_size + map_margin
                             && y >= map_top - map_margin
@@ -952,7 +1442,8 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                             } else {
                                 y
                             };
-                            state.map_tap_pos = crate::math::Vec2::new(clamped_x as f32, clamped_y as f32);
+                            state.map_tap_pos =
+                                crate::math::Vec2::new(clamped_x as f32, clamped_y as f32);
                         }
                     }
                 });
@@ -988,7 +1479,11 @@ fn setup_input(window: &web_sys::Window, state: Rc<RefCell<GameState>>, canvas: 
                         if len > max && len > 0.0 {
                             axis = axis * (max / len);
                         }
-                        state.joystick_axis = if max > 0.0 { axis / max } else { crate::math::Vec2::ZERO };
+                        state.joystick_axis = if max > 0.0 {
+                            axis / max
+                        } else {
+                            crate::math::Vec2::ZERO
+                        };
                     }
                     if state.map_drag_id == Some(id) {
                         let delta = pos - state.map_drag_last;
@@ -1093,10 +1588,19 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 .inner_width()
                 .ok()
                 .and_then(|w| w.as_f64())
-                .unwrap_or(0.0) <= 900.0;
+                .unwrap_or(0.0)
+                <= 900.0;
             state_ref.game.set_mobile_mode(is_mobile);
-            let viewport_w = window_clone.inner_width().ok().and_then(|w| w.as_f64()).unwrap_or(state_ref.game.width as f64);
-            let viewport_h = window_clone.inner_height().ok().and_then(|h| h.as_f64()).unwrap_or(state_ref.game.height as f64);
+            let viewport_w = window_clone
+                .inner_width()
+                .ok()
+                .and_then(|w| w.as_f64())
+                .unwrap_or(state_ref.game.width as f64);
+            let viewport_h = window_clone
+                .inner_height()
+                .ok()
+                .and_then(|h| h.as_f64())
+                .unwrap_or(state_ref.game.height as f64);
             state_ref.game.set_viewport_size(viewport_w, viewport_h);
 
             // Process input buffer - transfer events from buffer to game state
@@ -1243,10 +1747,76 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                                             state_ref.game.push_chat_line("System".to_string(), msg);
                                         }
                                     } else {
+                                        let matches = state_ref.network.matching_display_names(target);
+                                        if !matches.is_empty() {
+                                            state_ref.game.push_chat_line(
+                                                "System".to_string(),
+                                                format!(
+                                                    "Name is ambiguous. Use exact name: {}",
+                                                    matches.join(", ")
+                                                ),
+                                            );
+                                        } else {
+                                            state_ref.game.push_chat_line(
+                                                "System".to_string(),
+                                                format!("No player named '{}'.", target),
+                                            );
+                                        }
+                                    }
+                                } else if trimmed.to_ascii_lowercase().starts_with("/buyname") {
+                                    let requested = trimmed.splitn(2, ' ').nth(1).unwrap_or("").trim();
+                                    let owner_hash = state_ref.network.local_name_owner_hash();
+                                    if state_ref.network.room_code.is_empty() {
                                         state_ref.game.push_chat_line(
                                             "System".to_string(),
-                                            format!("No player named '{}'.", target),
+                                            "Join a room first before reserving a name.".to_string(),
                                         );
+                                    } else if owner_hash == 0 {
+                                        state_ref.game.push_chat_line(
+                                            "System".to_string(),
+                                            "Chat is still initializing.".to_string(),
+                                        );
+                                    } else if !payment::support_valid() {
+                                        payment::prompt_support();
+                                        state_ref.game.push_chat_line(
+                                            "System".to_string(),
+                                            "Payment required for name reservation. Press 4 to open payments.".to_string(),
+                                        );
+                                    } else {
+                                        let base_name = if requested.is_empty() {
+                                            state_ref.game.player_name.clone()
+                                        } else {
+                                            requested.to_string()
+                                        };
+                                        let normalized = net::NetworkSession::normalize_player_name(&base_name);
+                                        if state_ref.network.is_name_reserved_by_self(&normalized, owner_hash) {
+                                            state_ref.game.push_chat_line(
+                                                "System".to_string(),
+                                                format!("{} is already reserved by you.", normalized),
+                                            );
+                                        } else if let Some(owner_hash) = state_ref.network.reserved_name_owner_hash(&normalized) {
+                                            let owner_name = state_ref.network.display_name_for_hash(owner_hash);
+                                            state_ref.game.push_chat_line(
+                                                "System".to_string(),
+                                                format!("{} is already reserved by {}.", normalized, owner_name),
+                                            );
+                                        } else {
+                                            let reservation = state_ref.network.build_paid_name_reservation(
+                                                owner_hash,
+                                                &normalized,
+                                                state_ref.game.frame_count,
+                                            );
+                                            state_ref.network.store_paid_name_candidate(reservation);
+                                            if state_ref.network.is_host {
+                                                state_ref.network.send_paid_name_reservation(reservation);
+                                            } else {
+                                                state_ref.network.send_paid_name_reservation_to_supernode(reservation);
+                                            }
+                                            state_ref.game.push_chat_line(
+                                                "System".to_string(),
+                                                format!("Reservation request sent for {}.", normalized),
+                                            );
+                                        }
                                     }
                                 } else if local_hash == 0 && !state_ref.network.room_code.is_empty() {
                                     state_ref.game.push_chat_line(
@@ -1254,7 +1824,7 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                                         "Chat is still initializing.".to_string(),
                                     );
                                 } else {
-                                    let name = state_ref.game.player_name.clone();
+                                    let name = state_ref.network.local_display_name();
                                     state_ref.game.push_chat_line(name.clone(), trimmed.to_string());
                                     if !state_ref.network.room_code.is_empty() {
                                         state_ref.network.send_chat_message(net::ChatMessage {
@@ -1577,7 +2147,9 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     state_ref.input.set_touch_state(axis, down_mask);
 
                     if state.map_tap_frames > 0 {
-                        if state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver {
+                        if state_ref.game.scene == Scene::Game
+                            || state_ref.game.scene == Scene::GameOver
+                        {
                             state_ref.game.toggle_map();
                         }
                         state.map_tap_frames = 0;
@@ -1616,16 +2188,24 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                             state.map_drag_delta = crate::math::Vec2::ZERO;
                         }
                         if state.map_drag_delta.x != 0.0 || state.map_drag_delta.y != 0.0 {
-                            let pan_dx = if state_ref.game.mobile_mode { -state.map_drag_delta.x } else { state.map_drag_delta.x };
-                            let pan_dy = if state_ref.game.mobile_mode { -state.map_drag_delta.y } else { state.map_drag_delta.y };
-                            state_ref.game.pan_map_by_screen_delta(
-                                pan_dx,
-                                pan_dy,
-                            );
+                            let pan_dx = if state_ref.game.mobile_mode {
+                                -state.map_drag_delta.x
+                            } else {
+                                state.map_drag_delta.x
+                            };
+                            let pan_dy = if state_ref.game.mobile_mode {
+                                -state.map_drag_delta.y
+                            } else {
+                                state.map_drag_delta.y
+                            };
+                            state_ref.game.pan_map_by_screen_delta(pan_dx, pan_dy);
                             state.map_drag_delta = crate::math::Vec2::ZERO;
                         }
                         if state.map_tap_candidate && state.map_drag_distance < 8.0 {
-                            state_ref.game.handle_map_click(state.map_tap_pos.x as f64, state.map_tap_pos.y as f64);
+                            state_ref.game.handle_map_click(
+                                state.map_tap_pos.x as f64,
+                                state.map_tap_pos.y as f64,
+                            );
                             state.map_tap_candidate = false;
                         }
                     } else if state_ref.game.player_list_open {
@@ -1647,7 +2227,8 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
 
             MOBILE_INPUT.with(|cell| {
                 if let Some(input_el) = cell.borrow().as_ref() {
-                    let wants_text = state_ref.game.scene == Scene::Title && state_ref.game.text_input_active
+                    let wants_text = state_ref.game.scene == Scene::Title
+                        && state_ref.game.text_input_active
                         || state_ref.game.is_chat_input_active()
                         || state_ref.game.is_map_input_active();
                     if wants_text {
@@ -1662,44 +2243,46 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
             let input_snapshot = state_ref.input.clone();
 
             // Process debug commands (from JS/console)
-            let commands: Vec<String> = DEBUG_COMMANDS.with(|queue| queue.borrow_mut().drain(..).collect());
+            let commands: Vec<String> =
+                DEBUG_COMMANDS.with(|queue| queue.borrow_mut().drain(..).collect());
             for command in commands {
                 match state_ref.game.apply_debug_command(&command) {
                     Ok(message) => web_sys::console::log_1(&format!("[debug] {}", message).into()),
-                    Err(err) => web_sys::console::warn_1(&format!("[debug] {} -> {}", command, err).into()),
+                    Err(err) => {
+                        web_sys::console::warn_1(&format!("[debug] {} -> {}", command, err).into())
+                    }
                 }
             }
 
             // Check for menu actions before updating game
-            let (create_room, join_room, room_code) = state_ref.game.get_menu_action(&input_snapshot);
+            let (create_room, join_room, room_code) =
+                state_ref.game.get_menu_action(&input_snapshot);
 
             // Handle network actions
             if create_room {
-                // Sync player name to network before creating room
-                let player_name = state_ref.game.player_name.clone();
-                state_ref.network.set_player_name(&player_name);
-                let server = signaling_server_url();
-                let ice = ice_config();
-                let code = state_ref.network.create_room(&server, &ice);
-                // Store the room code so it displays in the UI
-                state_ref.game.room_code_input = code;
-                // Don't start game yet - wait for connection on title screen
+                if validate_title_name_for_room_action(&mut state_ref) {
+                    let server = signaling_server_url();
+                    let ice = ice_config();
+                    let code = state_ref.network.create_room(&server, &ice);
+                    // Store the room code so it displays in the UI
+                    state_ref.game.room_code_input = code;
+                    // Don't start game yet - wait for connection on title screen
+                }
             } else if join_room {
-                // Sync player name to network before joining room
-                let player_name = state_ref.game.player_name.clone();
-                state_ref.network.set_player_name(&player_name);
-                let server = signaling_server_url();
-                let ice = ice_config();
-                state_ref.network.join_room(&server, &room_code, &ice);
-                // Don't start game yet - wait for connection on title screen
+                if validate_title_name_for_room_action(&mut state_ref) {
+                    let server = signaling_server_url();
+                    let ice = ice_config();
+                    state_ref.network.join_room(&server, &room_code, &ice);
+                    // Don't start game yet - wait for connection on title screen
+                }
             }
 
             // Update network (safely - returns false on connection failure)
             let frame_count = state_ref.game.frame_count;
             let network_ok = state_ref.network.update(frame_count);
             let supernode_id = state_ref.network.supernode_id;
-            let became_host = state_ref.network.is_host
-                && state_ref.last_supernode_id != supernode_id;
+            let became_host =
+                state_ref.network.is_host && state_ref.last_supernode_id != supernode_id;
             state_ref.last_supernode_id = supernode_id;
 
             // Check if we should transition to game based on network state
@@ -1734,9 +2317,9 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
             }
 
             // Update game - use multiplayer version when in a room (Connected or WaitingForPeers)
-            let in_multiplayer_room = !state_ref.network.room_code.is_empty() &&
-                (state_ref.network.state == NetworkState::Connected ||
-                 state_ref.network.state == NetworkState::WaitingForPeers);
+            let in_multiplayer_room = !state_ref.network.room_code.is_empty()
+                && (state_ref.network.state == NetworkState::Connected
+                    || state_ref.network.state == NetworkState::WaitingForPeers);
 
             if in_multiplayer_room && state_ref.game.scene == Scene::Game {
                 let incoming_inputs = state_ref.network.take_input_frames();
@@ -1758,17 +2341,18 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 // Clone remote players to avoid borrow conflict
                 let remote_players = state_ref.network.remote_players.clone();
                 let is_host = state_ref.network.is_host;
-                state_ref.game.update_multiplayer(
-                    &input_snapshot,
-                    &remote_players,
-                    is_host,
-                );
+                state_ref
+                    .game
+                    .update_multiplayer(&input_snapshot, &remote_players, is_host);
             } else {
                 state_ref.game.update(&input_snapshot);
             }
             state_ref.input.end_frame();
 
-            if prev_scene != Scene::Game && state_ref.game.scene == Scene::Game && in_multiplayer_room {
+            if prev_scene != Scene::Game
+                && state_ref.game.scene == Scene::Game
+                && in_multiplayer_room
+            {
                 state_ref.network.reset_stats();
             }
 
@@ -1783,13 +2367,18 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 let enemy_sync = state_ref.game.create_enemy_sync();
                 state_ref.network.send_enemy_sync(enemy_sync);
                 let paid_obstacles = state_ref.game.paid_obstacles.clone();
-                state_ref.network.send_paid_obstacles_to_all(&paid_obstacles);
+                state_ref
+                    .network
+                    .send_paid_obstacles_to_all(&paid_obstacles);
+                let paid_names = state_ref.network.paid_name_reservations_snapshot();
+                state_ref.network.send_paid_names_to_all(&paid_names);
             }
 
             // Multiplayer sync logic (only during gameplay with network)
-            if state_ref.game.scene == Scene::Game &&
-               (state_ref.network.state == NetworkState::Connected || state_ref.network.state == NetworkState::WaitingForPeers) {
-
+            if state_ref.game.scene == Scene::Game
+                && (state_ref.network.state == NetworkState::Connected
+                    || state_ref.network.state == NetworkState::WaitingForPeers)
+            {
                 // Wave start sync - broadcast wave spawns so all clients spawn identically
                 if state_ref.network.is_host {
                     // Host: Broadcast wave start when a new wave spawns
@@ -1801,13 +2390,21 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     if state_ref.network.has_new_peers_needing_state() {
                         let new_peers = state_ref.network.take_new_peers_needing_state();
                         if let Some(wave_start) = state_ref.game.last_wave_start {
-                            state_ref.network.send_wave_start_to_peers(&wave_start, &new_peers);
+                            state_ref
+                                .network
+                                .send_wave_start_to_peers(&wave_start, &new_peers);
                         }
                         // Also send enemy sync so late joiners see current enemy state (alive/dead)
                         let enemy_sync = state_ref.game.create_enemy_sync();
                         state_ref.network.send_enemy_sync(enemy_sync);
                         let paid_obstacles = state_ref.game.paid_obstacles.clone();
-                        state_ref.network.send_paid_obstacles_to_peers(&paid_obstacles, &new_peers);
+                        state_ref
+                            .network
+                            .send_paid_obstacles_to_peers(&paid_obstacles, &new_peers);
+                        let paid_names = state_ref.network.paid_name_reservations_snapshot();
+                        state_ref
+                            .network
+                            .send_paid_names_to_peers(&paid_names, &new_peers);
                     }
                 } else {
                     // Client: Apply wave start from host to spawn enemies deterministically
@@ -1841,10 +2438,21 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
 
                 let (attack_attempts, attack_hits) = state_ref.game.take_pending_attack_stats();
                 if attack_attempts > 0 {
-                    state_ref.network.record_local_attack_attempts(attack_attempts);
+                    state_ref
+                        .network
+                        .record_local_attack_attempts(attack_attempts);
                 }
                 if attack_hits > 0 {
                     state_ref.network.record_local_attack_hits(attack_hits);
+                }
+
+                let stats_sync_stride = match state_ref.network.relay_congestion_level() {
+                    0 => 30,
+                    1 => 60,
+                    _ => 90,
+                };
+                if state_ref.game.frame_count % stats_sync_stride == 0 {
+                    state_ref.network.send_player_stats_snapshot();
                 }
 
                 // Process enemy kills from other players (optimistic first)
@@ -1863,7 +2471,9 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                                 continue;
                             }
                         }
-                        if let Some(remote_id) = state_ref.network.resolve_peer_hash(kill.killer_hash) {
+                        if let Some(remote_id) =
+                            state_ref.network.resolve_peer_hash(kill.killer_hash)
+                        {
                             state_ref.network.record_remote_kill(&remote_id, enemy_type);
                         }
                     }
@@ -1896,7 +2506,8 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                             continue;
                         }
                     }
-                    if let Some(remote_id) = state_ref.network.resolve_peer_hash(death.victim_hash) {
+                    if let Some(remote_id) = state_ref.network.resolve_peer_hash(death.victim_hash)
+                    {
                         state_ref.network.record_remote_death(&remote_id, 1);
                     }
                 }
@@ -1915,7 +2526,8 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                         }
                     }
                     let target_name = state_ref.network.display_name_for_hash(vote.target_hash);
-                    state_ref.game
+                    state_ref
+                        .game
                         .push_chat_line("System".to_string(), format!("Muted {}.", target_name));
                 }
 
@@ -1962,21 +2574,32 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     }
 
                     if let Some(peer_id) = state_ref.network.resolve_peer_id(&sender) {
-                        state_ref.network.record_paid_obstacle_confirmation(obstacle.proof_hash, peer_id);
+                        state_ref
+                            .network
+                            .record_paid_obstacle_confirmation(obstacle.proof_hash, peer_id);
                     }
 
                     let verified = state_ref.network.verify_paid_obstacle(&obstacle);
                     if verified {
                         if let Some(local_id) = state_ref.network.local_peer_id {
-                            state_ref.network.record_paid_obstacle_confirmation(obstacle.proof_hash, local_id);
+                            state_ref
+                                .network
+                                .record_paid_obstacle_confirmation(obstacle.proof_hash, local_id);
                         }
-                        state_ref.network.send_paid_obstacle_ack(net::PaidObstacleAck {
-                            proof_hash: obstacle.proof_hash,
-                        });
+                        state_ref
+                            .network
+                            .send_paid_obstacle_ack(net::PaidObstacleAck {
+                                proof_hash: obstacle.proof_hash,
+                            });
 
-                        let has_supernode_ack = state_ref.network.paid_obstacle_has_supernode_ack(obstacle.proof_hash);
+                        let has_supernode_ack = state_ref
+                            .network
+                            .paid_obstacle_has_supernode_ack(obstacle.proof_hash);
                         if has_supernode_ack
-                            && state_ref.network.paid_obstacle_confirmation_count(obstacle.proof_hash) >= 2
+                            && state_ref
+                                .network
+                                .paid_obstacle_confirmation_count(obstacle.proof_hash)
+                                >= 2
                         {
                             state_ref.game.apply_paid_obstacle(obstacle);
                         } else {
@@ -1999,19 +2622,23 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     }
 
                     if let Some(peer_id) = state_ref.network.resolve_peer_id(&sender) {
-                        state_ref.network
+                        state_ref
+                            .network
                             .record_paid_ability_confirmation(ability.proof_hash, peer_id);
                     }
 
                     let verified = state_ref.network.verify_paid_ability(&ability);
                     if verified {
                         if let Some(local_id) = state_ref.network.local_peer_id {
-                            state_ref.network
+                            state_ref
+                                .network
                                 .record_paid_ability_confirmation(ability.proof_hash, local_id);
                         }
-                        state_ref.network.send_paid_ability_ack(net::PaidAbilityAck {
-                            proof_hash: ability.proof_hash,
-                        });
+                        state_ref
+                            .network
+                            .send_paid_ability_ack(net::PaidAbilityAck {
+                                proof_hash: ability.proof_hash,
+                            });
 
                         let has_supernode_ack = state_ref
                             .network
@@ -2036,18 +2663,103 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     }
                 }
 
+                let incoming_paid_names = state_ref.network.take_paid_names();
+                for (sender, reservation) in incoming_paid_names {
+                    let from_supernode = state_ref.network.is_host
+                        || sender == "sync"
+                        || state_ref.network.supernode_id.is_none()
+                        || state_ref.network.is_supernode_sender(&sender);
+                    if !from_supernode {
+                        continue;
+                    }
+
+                    if let Some(peer_id) = state_ref.network.resolve_peer_id(&sender) {
+                        state_ref
+                            .network
+                            .record_paid_name_confirmation(reservation.proof_hash, peer_id);
+                    }
+
+                    let verified = state_ref.network.verify_paid_name_reservation(&reservation);
+                    if verified {
+                        if let Some(local_id) = state_ref.network.local_peer_id {
+                            state_ref
+                                .network
+                                .record_paid_name_confirmation(reservation.proof_hash, local_id);
+                        }
+                        state_ref.network.send_paid_name_ack(net::PaidNameAck {
+                            proof_hash: reservation.proof_hash,
+                        });
+
+                        let has_supernode_ack = state_ref
+                            .network
+                            .paid_name_has_supernode_ack(reservation.proof_hash);
+                        if has_supernode_ack
+                            && state_ref
+                                .network
+                                .paid_name_confirmation_count(reservation.proof_hash)
+                                >= 2
+                        {
+                            let requested_name = reservation.name_string();
+                            if state_ref.network.apply_paid_name_reservation(reservation) {
+                                persist_name_reservation_cache(&state_ref.network);
+                                if state_ref.network.local_name_owner_hash()
+                                    == reservation.owner_hash
+                                {
+                                    state_ref.network.set_player_name(&requested_name);
+                                    state_ref.game.player_name = requested_name.clone();
+                                    state_ref.network.broadcast_local_player_name();
+                                    save_player_name(&state_ref.game.player_name);
+                                    state_ref.game.push_chat_line(
+                                        "System".to_string(),
+                                        format!("Reserved name {}.", requested_name),
+                                    );
+                                } else if let Some(new_name) =
+                                    state_ref.network.ensure_local_name_not_reserved_by_other()
+                                {
+                                    state_ref.game.player_name = new_name.clone();
+                                    state_ref.network.broadcast_local_player_name();
+                                    save_player_name(&state_ref.game.player_name);
+                                    state_ref.game.push_chat_line(
+                                        "System".to_string(),
+                                        format!(
+                                            "That name was reserved by another player. Switched to {}.",
+                                            new_name
+                                        ),
+                                    );
+                                }
+                            }
+                        } else {
+                            state_ref.network.store_paid_name_candidate(reservation);
+                        }
+                    } else {
+                        state_ref.network.mark_supernode_bad(frame_count);
+                    }
+                }
+
                 let incoming_acks = state_ref.network.take_paid_obstacle_acks();
                 for (sender, ack) in incoming_acks {
                     if let Some(peer_id) = state_ref.network.resolve_peer_id(&sender) {
-                        state_ref.network.record_paid_obstacle_confirmation(ack.proof_hash, peer_id);
+                        state_ref
+                            .network
+                            .record_paid_obstacle_confirmation(ack.proof_hash, peer_id);
                     }
                 }
 
                 let incoming_ability_acks = state_ref.network.take_paid_ability_acks();
                 for (sender, ack) in incoming_ability_acks {
                     if let Some(peer_id) = state_ref.network.resolve_peer_id(&sender) {
-                        state_ref.network
+                        state_ref
+                            .network
                             .record_paid_ability_confirmation(ack.proof_hash, peer_id);
+                    }
+                }
+
+                let incoming_name_acks = state_ref.network.take_paid_name_acks();
+                for (sender, ack) in incoming_name_acks {
+                    if let Some(peer_id) = state_ref.network.resolve_peer_id(&sender) {
+                        state_ref
+                            .network
+                            .record_paid_name_confirmation(ack.proof_hash, peer_id);
                     }
                 }
 
@@ -2073,6 +2785,46 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     }
                 }
 
+                let pending_name_hashes = state_ref.network.pending_paid_name_hashes();
+                for hash in pending_name_hashes {
+                    if state_ref.network.paid_name_has_supernode_ack(hash)
+                        && state_ref.network.paid_name_confirmation_count(hash) >= 2
+                    {
+                        if let Some(reservation) = state_ref.network.take_paid_name_candidate(hash)
+                        {
+                            let requested_name = reservation.name_string();
+                            if state_ref.network.apply_paid_name_reservation(reservation) {
+                                persist_name_reservation_cache(&state_ref.network);
+                                if state_ref.network.local_name_owner_hash()
+                                    == reservation.owner_hash
+                                {
+                                    state_ref.network.set_player_name(&requested_name);
+                                    state_ref.game.player_name = requested_name.clone();
+                                    state_ref.network.broadcast_local_player_name();
+                                    save_player_name(&state_ref.game.player_name);
+                                    state_ref.game.push_chat_line(
+                                        "System".to_string(),
+                                        format!("Reserved name {}.", requested_name),
+                                    );
+                                } else if let Some(new_name) =
+                                    state_ref.network.ensure_local_name_not_reserved_by_other()
+                                {
+                                    state_ref.game.player_name = new_name.clone();
+                                    state_ref.network.broadcast_local_player_name();
+                                    save_player_name(&state_ref.game.player_name);
+                                    state_ref.game.push_chat_line(
+                                        "System".to_string(),
+                                        format!(
+                                            "That name was reserved by another player. Switched to {}.",
+                                            new_name
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if state_ref.network.is_host {
                     let cannon_shots = state_ref.game.take_pending_cannon_shots();
                     for shot in cannon_shots {
@@ -2093,26 +2845,28 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 // Host runs the enemy simulation and sends positions to all clients.
                 // Clients do NOT run enemy AI - they only receive and interpolate positions.
                 // This ensures all players see enemies in the same locations.
-                //
-                // VISUAL CONSISTENCY: Both host and client snapshot enemy positions at sync rate
-                // so they see the same "choppiness" - no unfair advantage for host
+                let congestion = state_ref.network.relay_congestion_level();
+                let room_players = state_ref.network.peer_count() + 1;
+                let low_fanout_room = room_players <= 8;
 
                 if state_ref.network.is_host {
-                    // Host: Send enemy positions every 6 frames (~10 updates/sec)
-                    // This is the authoritative state that all clients will use
-                    if frame_count % 6 == 0 {
+                    // Host: increase cadence in small rooms for smoother remote motion,
+                    // then back off under congestion.
+                    let enemy_sync_stride = match congestion {
+                        0 if low_fanout_room => 4,
+                        0 => 5,
+                        1 => 6,
+                        _ => 8,
+                    };
+                    if frame_count % enemy_sync_stride == 0 {
                         let enemy_sync = state_ref.game.create_enemy_sync();
                         state_ref.network.send_enemy_sync(enemy_sync);
-                        // Also snapshot for local rendering at same rate
-                        state_ref.game.snapshot_enemies_for_render();
                     }
                 } else {
                     // Client: Always apply enemy sync from host (this IS the authoritative state)
                     if let Some(sync) = state_ref.network.take_enemy_sync() {
                         state_ref.game.apply_enemy_sync(&sync);
                         state_ref.game.clear_respawn_sync();
-                        // Snapshot the received positions for rendering
-                        state_ref.game.snapshot_enemies_for_render();
                         state_ref.network.mark_enemy_sync_received(frame_count);
                     }
                 }
@@ -2142,10 +2896,15 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 }
             }
 
-            // Send player state every 3 frames (~20 updates/sec at 60fps)
+            // Send player/input updates with adaptive cadence.
             let congestion = state_ref.network.relay_congestion_level();
+            let room_players = state_ref.network.peer_count() + 1;
+            let low_fanout_room = room_players <= 8;
+            let very_small_room = room_players <= 4;
             let player_send_stride = match congestion {
+                0 if low_fanout_room => 2,
                 0 => 3,
+                1 if low_fanout_room => 3,
                 1 => 4,
                 _ => 6,
             };
@@ -2154,6 +2913,7 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 state_ref.send_counter = 0;
                 let player = &state_ref.game.player;
                 let player_state = PlayerState::new(
+                    frame_count,
                     player.pos,
                     player.look_dir,
                     player.move_dir,
@@ -2168,6 +2928,7 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
 
             if in_multiplayer_room && state_ref.game.scene == Scene::Game {
                 let input_send_stride = match congestion {
+                    0 if very_small_room => 1,
                     0 => 2,
                     1 => 3,
                     _ => 4,
@@ -2190,7 +2951,9 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
         }
         {
             let state_ref = state.borrow();
-            state_ref.renderer.render(&state_ref.game, &state_ref.network);
+            state_ref
+                .renderer
+                .render(&state_ref.game, &state_ref.network);
         }
 
         window_clone

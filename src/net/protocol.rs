@@ -30,14 +30,14 @@ impl EnemyType {
 /// Used for all enemy types - some fields may be unused for certain types
 #[derive(Debug, Clone, Copy)]
 pub struct EnemyState {
-    pub id: u16,           // Enemy ID (2 bytes)
-    pub enemy_type: u8,    // EnemyType (1 byte)
-    pub flags: u8,         // alive flag + other bits (1 byte)
-    pub x: f32,            // Position X (4 bytes)
-    pub y: f32,            // Position Y (4 bytes)
-    pub dir_x: f32,        // Direction/look_dir X (4 bytes)
-    pub dir_y: f32,        // Direction/look_dir Y (4 bytes)
-    pub extra: u8,         // Snake size / cannon shoot timer low bits (1 byte)
+    pub id: u16,        // Enemy ID (2 bytes)
+    pub enemy_type: u8, // EnemyType (1 byte)
+    pub flags: u8,      // alive flag + other bits (1 byte)
+    pub x: f32,         // Position X (4 bytes)
+    pub y: f32,         // Position Y (4 bytes)
+    pub dir_x: f32,     // Direction/look_dir X (4 bytes)
+    pub dir_y: f32,     // Direction/look_dir Y (4 bytes)
+    pub extra: u8,      // Snake size / cannon shoot timer low bits (1 byte)
 }
 
 impl EnemyState {
@@ -159,6 +159,7 @@ impl EnemyState {
 /// Full enemy sync message - sent periodically by host
 #[derive(Debug, Clone)]
 pub struct EnemySync {
+    pub tick: u32,
     pub wave: u32,
     pub enemies: Vec<EnemyState>,
 }
@@ -166,6 +167,7 @@ pub struct EnemySync {
 impl EnemySync {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
+        bytes.extend_from_slice(&self.tick.to_le_bytes());
         bytes.extend_from_slice(&self.wave.to_le_bytes());
         bytes.extend_from_slice(&(self.enemies.len() as u16).to_le_bytes());
         for enemy in &self.enemies {
@@ -175,14 +177,15 @@ impl EnemySync {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 6 {
+        if bytes.len() < 10 {
             return None;
         }
-        let wave = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+        let tick = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let wave = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let count = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
 
         let mut enemies = Vec::with_capacity(count);
-        let mut offset = 6;
+        let mut offset = 10;
         for _ in 0..count {
             if offset + 21 > bytes.len() {
                 break;
@@ -193,7 +196,11 @@ impl EnemySync {
             offset += 21;
         }
 
-        Some(Self { wave, enemies })
+        Some(Self {
+            tick,
+            wave,
+            enemies,
+        })
     }
 }
 
@@ -486,6 +493,127 @@ impl PaidAbilityAck {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PaidNameReservation {
+    pub owner_hash: u64,
+    pub nonce: u32,
+    pub name: [u8; 20],
+    pub proof_hash: [u8; 32],
+}
+
+impl PaidNameReservation {
+    pub fn from_name(owner_hash: u64, name: &str, nonce: u32, proof_hash: [u8; 32]) -> Self {
+        let mut name_bytes = [0u8; 20];
+        let normalized: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(20)
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
+        let bytes = normalized.as_bytes();
+        let len = bytes.len().min(20);
+        name_bytes[..len].copy_from_slice(&bytes[..len]);
+        Self {
+            owner_hash,
+            nonce,
+            name: name_bytes,
+            proof_hash,
+        }
+    }
+
+    pub fn name_string(&self) -> String {
+        let end = self
+            .name
+            .iter()
+            .position(|b| *b == 0)
+            .unwrap_or(self.name.len());
+        String::from_utf8_lossy(&self.name[..end]).to_string()
+    }
+
+    pub fn to_bytes(&self) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        bytes[0..8].copy_from_slice(&self.owner_hash.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.nonce.to_le_bytes());
+        bytes[12..32].copy_from_slice(&self.name);
+        bytes[32..64].copy_from_slice(&self.proof_hash);
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 64 {
+            return None;
+        }
+        let mut name = [0u8; 20];
+        let mut proof_hash = [0u8; 32];
+        name.copy_from_slice(&bytes[12..32]);
+        proof_hash.copy_from_slice(&bytes[32..64]);
+        Some(Self {
+            owner_hash: u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]),
+            nonce: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            name,
+            proof_hash,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PaidNameSync {
+    pub reservations: Vec<PaidNameReservation>,
+}
+
+impl PaidNameSync {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(self.reservations.len() as u16).to_le_bytes());
+        for reservation in &self.reservations {
+            bytes.extend_from_slice(&reservation.to_bytes());
+        }
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 2 {
+            return None;
+        }
+        let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        let mut reservations = Vec::with_capacity(count);
+        let mut offset = 2;
+        for _ in 0..count {
+            if offset + 64 > bytes.len() {
+                break;
+            }
+            if let Some(reservation) = PaidNameReservation::from_bytes(&bytes[offset..offset + 64])
+            {
+                reservations.push(reservation);
+            }
+            offset += 64;
+        }
+        Some(Self { reservations })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PaidNameAck {
+    pub proof_hash: [u8; 32],
+}
+
+impl PaidNameAck {
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.proof_hash
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 32 {
+            return None;
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&bytes[0..32]);
+        Some(Self { proof_hash: hash })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PaidObstacleSync {
     pub obstacles: Vec<PaidObstacle>,
@@ -576,7 +704,9 @@ impl WaveStart {
         }
         Some(Self {
             wave: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-            rng_seed: u64::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11]]),
+            rng_seed: u64::from_le_bytes([
+                bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+            ]),
             spider_count: u16::from_le_bytes([bytes[12], bytes[13]]),
             cannon_count: u16::from_le_bytes([bytes[14], bytes[15]]),
             snake_count: u16::from_le_bytes([bytes[16], bytes[17]]),
@@ -592,7 +722,7 @@ impl WaveStart {
 pub struct EnemyKill {
     pub enemy_type: u8,
     pub enemy_id: u16,
-    pub killer_x: f32,  // Position where kill happened (for verification)
+    pub killer_x: f32, // Position where kill happened (for verification)
     pub killer_y: f32,
     pub killer_hash: u64,
     pub event_id: u64,
@@ -620,12 +750,12 @@ impl EnemyKill {
             killer_x: f32::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]),
             killer_y: f32::from_le_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]),
             killer_hash: u64::from_le_bytes([
-                bytes[11], bytes[12], bytes[13], bytes[14],
-                bytes[15], bytes[16], bytes[17], bytes[18],
+                bytes[11], bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17],
+                bytes[18],
             ]),
             event_id: u64::from_le_bytes([
-                bytes[19], bytes[20], bytes[21], bytes[22],
-                bytes[23], bytes[24], bytes[25], bytes[26],
+                bytes[19], bytes[20], bytes[21], bytes[22], bytes[23], bytes[24], bytes[25],
+                bytes[26],
             ]),
         })
     }
@@ -636,7 +766,7 @@ impl EnemyKill {
 pub struct PlayerDeath {
     pub death_x: f32,
     pub death_y: f32,
-    pub killed_by_type: u8,  // 0=spider, 1=cannon, 2=snake, 3=projectile, 4=wisp
+    pub killed_by_type: u8, // 0=spider, 1=cannon, 2=snake, 3=projectile, 4=wisp
     pub killed_by_id: u16,
     pub victim_hash: u64,
     pub event_id: u64,
@@ -664,15 +794,17 @@ impl ChatMessage {
             return None;
         }
         let hash = u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]);
         let len = bytes[8] as usize;
         if bytes.len() < 9 + len {
             return None;
         }
         let text = String::from_utf8(bytes[9..9 + len].to_vec()).ok()?;
-        Some(Self { sender_hash: hash, text })
+        Some(Self {
+            sender_hash: hash,
+            text,
+        })
     }
 }
 
@@ -697,12 +829,11 @@ impl VoteMute {
         }
         Some(Self {
             target_hash: u64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
             ]),
             voter_hash: u64::from_le_bytes([
-                bytes[8], bytes[9], bytes[10], bytes[11],
-                bytes[12], bytes[13], bytes[14], bytes[15],
+                bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                bytes[15],
             ]),
         })
     }
@@ -729,33 +860,86 @@ impl PlayerDeath {
             killed_by_type: bytes[8],
             killed_by_id: u16::from_le_bytes([bytes[9], bytes[10]]),
             victim_hash: u64::from_le_bytes([
-                bytes[11], bytes[12], bytes[13], bytes[14],
-                bytes[15], bytes[16], bytes[17], bytes[18],
+                bytes[11], bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17],
+                bytes[18],
             ]),
             event_id: u64::from_le_bytes([
-                bytes[19], bytes[20], bytes[21], bytes[22],
-                bytes[23], bytes[24], bytes[25], bytes[26],
+                bytes[19], bytes[20], bytes[21], bytes[22], bytes[23], bytes[24], bytes[25],
+                bytes[26],
             ]),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlayerStatsSnapshot {
+    pub player_hash: u64,
+    pub kills: u32,
+    pub spider_kills: u32,
+    pub cannon_kills: u32,
+    pub snake_kills: u32,
+    pub wisp_kills: u32,
+    pub attack_attempts: u32,
+    pub attack_hits: u32,
+    pub deaths: u32,
+    pub time_played_frames: u32,
+}
+
+impl PlayerStatsSnapshot {
+    pub fn to_bytes(&self) -> [u8; 44] {
+        let mut bytes = [0u8; 44];
+        bytes[0..8].copy_from_slice(&self.player_hash.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.kills.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.spider_kills.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.cannon_kills.to_le_bytes());
+        bytes[20..24].copy_from_slice(&self.snake_kills.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.wisp_kills.to_le_bytes());
+        bytes[28..32].copy_from_slice(&self.attack_attempts.to_le_bytes());
+        bytes[32..36].copy_from_slice(&self.attack_hits.to_le_bytes());
+        bytes[36..40].copy_from_slice(&self.deaths.to_le_bytes());
+        bytes[40..44].copy_from_slice(&self.time_played_frames.to_le_bytes());
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 44 {
+            return None;
+        }
+        Some(Self {
+            player_hash: u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]),
+            kills: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            spider_kills: u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+            cannon_kills: u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
+            snake_kills: u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]),
+            wisp_kills: u32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]),
+            attack_attempts: u32::from_le_bytes([bytes[28], bytes[29], bytes[30], bytes[31]]),
+            attack_hits: u32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]),
+            deaths: u32::from_le_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]),
+            time_played_frames: u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]),
         })
     }
 }
 
 // ============ Player State ============
 
-/// Compact player state for network transmission (25 bytes)
+/// Compact player state for network transmission (29 bytes)
 #[derive(Debug, Clone, Copy)]
 pub struct PlayerState {
+    pub sim_frame: u32,
     pub x: f32,
     pub y: f32,
     pub look_dir_x: f32,
     pub look_dir_y: f32,
-    pub move_dir_x: f32,  // For tail animation
+    pub move_dir_x: f32, // For tail animation
     pub move_dir_y: f32,
     pub flags: u8, // alive|attacking|blocking|phasing|shielded|_|_|_
 }
 
 impl PlayerState {
     pub fn new(
+        sim_frame: u32,
         pos: Vec2,
         look_dir: Vec2,
         move_dir: Vec2,
@@ -772,6 +956,7 @@ impl PlayerState {
             | ((shielded as u8) << 4);
 
         Self {
+            sim_frame,
             x: pos.x,
             y: pos.y,
             look_dir_x: look_dir.x,
@@ -780,6 +965,10 @@ impl PlayerState {
             move_dir_y: move_dir.y,
             flags,
         }
+    }
+
+    pub fn sim_frame(&self) -> u32 {
+        self.sim_frame
     }
 
     pub fn pos(&self) -> Vec2 {
@@ -814,30 +1003,32 @@ impl PlayerState {
         (self.flags & 16) != 0
     }
 
-    pub fn to_bytes(&self) -> [u8; 25] {
-        let mut bytes = [0u8; 25];
-        bytes[0..4].copy_from_slice(&self.x.to_le_bytes());
-        bytes[4..8].copy_from_slice(&self.y.to_le_bytes());
-        bytes[8..12].copy_from_slice(&self.look_dir_x.to_le_bytes());
-        bytes[12..16].copy_from_slice(&self.look_dir_y.to_le_bytes());
-        bytes[16..20].copy_from_slice(&self.move_dir_x.to_le_bytes());
-        bytes[20..24].copy_from_slice(&self.move_dir_y.to_le_bytes());
-        bytes[24] = self.flags;
+    pub fn to_bytes(&self) -> [u8; 29] {
+        let mut bytes = [0u8; 29];
+        bytes[0..4].copy_from_slice(&self.sim_frame.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.x.to_le_bytes());
+        bytes[8..12].copy_from_slice(&self.y.to_le_bytes());
+        bytes[12..16].copy_from_slice(&self.look_dir_x.to_le_bytes());
+        bytes[16..20].copy_from_slice(&self.look_dir_y.to_le_bytes());
+        bytes[20..24].copy_from_slice(&self.move_dir_x.to_le_bytes());
+        bytes[24..28].copy_from_slice(&self.move_dir_y.to_le_bytes());
+        bytes[28] = self.flags;
         bytes
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 25 {
+        if bytes.len() < 29 {
             return None;
         }
         Some(Self {
-            x: f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-            y: f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-            look_dir_x: f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
-            look_dir_y: f32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
-            move_dir_x: f32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
-            move_dir_y: f32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]),
-            flags: bytes[24],
+            sim_frame: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            x: f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            y: f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            look_dir_x: f32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+            look_dir_y: f32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
+            move_dir_x: f32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]),
+            move_dir_y: f32::from_le_bytes([bytes[24], bytes[25], bytes[26], bytes[27]]),
+            flags: bytes[28],
         })
     }
 }
@@ -876,7 +1067,7 @@ impl PlayerStateBatch {
         let mut entries = Vec::with_capacity(count);
         let mut offset = 2;
         for _ in 0..count {
-            if offset + 8 + 4 + 25 > bytes.len() {
+            if offset + 8 + 4 + 29 > bytes.len() {
                 break;
             }
             let peer_hash = u64::from_le_bytes([
@@ -897,9 +1088,13 @@ impl PlayerStateBatch {
                 bytes[offset + 3],
             ]);
             offset += 4;
-            let state = PlayerState::from_bytes(&bytes[offset..offset + 25])?;
-            offset += 25;
-            entries.push(PlayerStateEntry { peer_hash, area_id, state });
+            let state = PlayerState::from_bytes(&bytes[offset..offset + 29])?;
+            offset += 29;
+            entries.push(PlayerStateEntry {
+                peer_hash,
+                area_id,
+                state,
+            });
         }
         Some(Self { entries })
     }
@@ -960,7 +1155,11 @@ impl InputFrameBatch {
             offset += 4;
             let frame = InputFrame::from_bytes(&bytes[offset..offset + 6])?;
             offset += 6;
-            entries.push(InputFrameEntry { peer_hash, area_id, frame });
+            entries.push(InputFrameEntry {
+                peer_hash,
+                area_id,
+                frame,
+            });
         }
         Some(Self { entries })
     }
@@ -1002,8 +1201,7 @@ impl TopologyUpdate {
         }
         let epoch = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let super_root_hash = u64::from_le_bytes([
-            bytes[4], bytes[5], bytes[6], bytes[7],
-            bytes[8], bytes[9], bytes[10], bytes[11],
+            bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
         ]);
         let mut offset = 12;
         let super_count = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) as usize;
@@ -1135,7 +1333,10 @@ impl AreaAuthorityUpdate {
                 bytes[offset + 10],
                 bytes[offset + 11],
             ]);
-            entries.push(AreaAuthorityEntry { area_id, authority_hash });
+            entries.push(AreaAuthorityEntry {
+                area_id,
+                authority_hash,
+            });
             offset += 12;
         }
         Some(Self { epoch, entries })
@@ -1165,6 +1366,8 @@ pub enum NetMessage {
     ChatMessageEvent(ChatMessage),
     /// Vote mute request
     VoteMuteEvent(VoteMute),
+    /// Authoritative per-player stats snapshot
+    PlayerStatsEvent(PlayerStatsSnapshot),
     /// Paid obstacle placement event
     PaidObstacleEvent(PaidObstacle),
     /// Paid obstacle sync (for late joiners)
@@ -1177,6 +1380,12 @@ pub enum NetMessage {
     PaidObstacleAckEvent(PaidObstacleAck),
     /// Paid ability verification ack
     PaidAbilityAckEvent(PaidAbilityAck),
+    /// Paid name reservation event
+    PaidNameReservationEvent(PaidNameReservation),
+    /// Paid name reservation sync for late joiners
+    PaidNameSyncEvent(PaidNameSync),
+    /// Paid name reservation verification ack
+    PaidNameAckEvent(PaidNameAck),
     /// Input frame event (future rollback netcode)
     InputFrameEvent(InputFrame),
     /// Latency ping (for supernode selection)
@@ -1247,6 +1456,11 @@ impl NetMessage {
                 bytes.extend_from_slice(&vote.to_bytes());
                 bytes
             }
+            NetMessage::PlayerStatsEvent(stats) => {
+                let mut bytes = vec![27u8]; // Message type 27
+                bytes.extend_from_slice(&stats.to_bytes());
+                bytes
+            }
             NetMessage::PaidObstacleEvent(obstacle) => {
                 let mut bytes = vec![8u8]; // Message type 8
                 bytes.extend_from_slice(&obstacle.to_bytes());
@@ -1274,6 +1488,21 @@ impl NetMessage {
             }
             NetMessage::PaidAbilityAckEvent(ack) => {
                 let mut bytes = vec![21u8]; // Message type 21
+                bytes.extend_from_slice(&ack.to_bytes());
+                bytes
+            }
+            NetMessage::PaidNameReservationEvent(reservation) => {
+                let mut bytes = vec![24u8]; // Message type 24
+                bytes.extend_from_slice(&reservation.to_bytes());
+                bytes
+            }
+            NetMessage::PaidNameSyncEvent(sync) => {
+                let mut bytes = vec![25u8]; // Message type 25
+                bytes.extend_from_slice(&sync.to_bytes());
+                bytes
+            }
+            NetMessage::PaidNameAckEvent(ack) => {
+                let mut bytes = vec![26u8]; // Message type 26
                 bytes.extend_from_slice(&ack.to_bytes());
                 bytes
             }
@@ -1345,6 +1574,7 @@ impl NetMessage {
             7 => PlayerDeath::from_bytes(&bytes[1..]).map(NetMessage::PlayerDeathEvent),
             16 => ChatMessage::from_bytes(&bytes[1..]).map(NetMessage::ChatMessageEvent),
             17 => VoteMute::from_bytes(&bytes[1..]).map(NetMessage::VoteMuteEvent),
+            27 => PlayerStatsSnapshot::from_bytes(&bytes[1..]).map(NetMessage::PlayerStatsEvent),
             8 => PaidObstacle::from_bytes(&bytes[1..]).map(NetMessage::PaidObstacleEvent),
             9 => PaidObstacleSync::from_bytes(&bytes[1..]).map(NetMessage::PaidObstacleSyncEvent),
             10 => CannonShot::from_bytes(&bytes[1..]).map(NetMessage::CannonShotEvent),
@@ -1355,10 +1585,15 @@ impl NetMessage {
             14 => SupernodeScore::from_bytes(&bytes[1..]).map(NetMessage::SupernodeScoreEvent),
             15 => PaidObstacleAck::from_bytes(&bytes[1..]).map(NetMessage::PaidObstacleAckEvent),
             21 => PaidAbilityAck::from_bytes(&bytes[1..]).map(NetMessage::PaidAbilityAckEvent),
+            24 => PaidNameReservation::from_bytes(&bytes[1..])
+                .map(NetMessage::PaidNameReservationEvent),
+            25 => PaidNameSync::from_bytes(&bytes[1..]).map(NetMessage::PaidNameSyncEvent),
+            26 => PaidNameAck::from_bytes(&bytes[1..]).map(NetMessage::PaidNameAckEvent),
             18 => PlayerStateBatch::from_bytes(&bytes[1..]).map(NetMessage::PlayerStateBatchEvent),
             19 => InputFrameBatch::from_bytes(&bytes[1..]).map(NetMessage::InputFrameBatchEvent),
             22 => TopologyUpdate::from_bytes(&bytes[1..]).map(NetMessage::TopologyUpdateEvent),
-            23 => AreaAuthorityUpdate::from_bytes(&bytes[1..]).map(NetMessage::AreaAuthorityUpdateEvent),
+            23 => AreaAuthorityUpdate::from_bytes(&bytes[1..])
+                .map(NetMessage::AreaAuthorityUpdateEvent),
             _ => None,
         }
     }
@@ -1370,7 +1605,10 @@ mod tests {
 
     #[test]
     fn input_frame_roundtrip_u16() {
-        let frame = InputFrame { frame: 42, input: 0b1010_1010_1111_0000 };
+        let frame = InputFrame {
+            frame: 42,
+            input: 0b1010_1010_1111_0000,
+        };
         let bytes = frame.to_bytes();
         let decoded = InputFrame::from_bytes(&bytes).expect("decode");
         assert_eq!(decoded.frame, frame.frame);
@@ -1397,5 +1635,18 @@ mod tests {
         assert_eq!(decoded.radius, ability.radius);
         assert_eq!(decoded.nonce, ability.nonce);
         assert_eq!(decoded.proof_hash, ability.proof_hash);
+    }
+
+    #[test]
+    fn paid_name_roundtrip() {
+        let mut hash = [0u8; 32];
+        hash[0] = 7;
+        let reservation = PaidNameReservation::from_name(42, "KEYSLIME", 99, hash);
+        let bytes = reservation.to_bytes();
+        let decoded = PaidNameReservation::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded.owner_hash, 42);
+        assert_eq!(decoded.nonce, 99);
+        assert_eq!(decoded.name_string(), "KEYSLIME".to_string());
+        assert_eq!(decoded.proof_hash, hash);
     }
 }

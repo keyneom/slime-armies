@@ -1,5 +1,5 @@
-use crate::math::Vec2;
 use crate::input::{Input, BUTTON_ATTACK, BUTTON_PHASE};
+use crate::math::Vec2;
 use crate::world::ChunkManager;
 
 // Timer constants from original game
@@ -178,13 +178,16 @@ impl Player {
         }
 
         // Block
-        self.blocking = self.attack_timer <= 0
-            && self.phase_timer <= 0
-            && input.is_down(BUTTON_ATTACK);
+        self.blocking =
+            self.attack_timer <= 0 && self.phase_timer <= 0 && input.is_down(BUTTON_ATTACK);
     }
 
     fn get_speed(&self) -> f32 {
-        let base = if self.phase_timer > 0 { PHASE_SPEED } else { self.move_speed };
+        let base = if self.phase_timer > 0 {
+            PHASE_SPEED
+        } else {
+            self.move_speed
+        };
         if self.speed_boost_timer > 0 {
             base * SPEED_BOOST_MULTIPLIER
         } else {

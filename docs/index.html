@@ -117,8 +117,8 @@
     
     
 <script type="module">
-import init, * as bindings from '/slime-armies/slime-armies-cb17e8d07284075c.js';
-const wasm = await init({ module_or_path: '/slime-armies/slime-armies-cb17e8d07284075c_bg.wasm' });
+import init, * as bindings from '/slime-armies/slime-armies-9f96b15b918ae527.js';
+const wasm = await init({ module_or_path: '/slime-armies/slime-armies-9f96b15b918ae527_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -163,6 +163,12 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
                 costUsd: 0.25,
                 description: "Leave a lethal trail",
             },
+            {
+                id: "name_reservation",
+                name: "Name Reservation",
+                costUsd: 1.0,
+                description: "Reserve your handle with /buyname",
+            },
         ];
 
         let paymentModal = null;
@@ -188,8 +194,8 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             paymentModal.id = "payment-modal";
             paymentModal.innerHTML = `
                 <div class="payment-card">
-                    <h2>Paid Abilities</h2>
-                    <p>Payments unlock paid abilities. Each use costs the amount below.</p>
+                    <h2>Paid Features</h2>
+                    <p>Payments unlock paid abilities and username reservations.</p>
                     <div class="payment-list" id="payment-list"></div>
                     <div class="payment-actions">
                         <button id="payment-close">Close</button>
@@ -333,7 +339,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
             refreshPaymentStatus();
         };
     </script>
-<link rel="modulepreload" href="/slime-armies/slime-armies-cb17e8d07284075c.js" crossorigin="anonymous" integrity="sha384-PTMHv74BJqhNKmZScasrYh3W2S7jqkz9m13NXzklNIo7uXEACHsRivf0cggiIbl5"><link rel="preload" href="/slime-armies/slime-armies-cb17e8d07284075c_bg.wasm" crossorigin="anonymous" integrity="sha384-MVASh20M5jCeCX9naAXDqOd0GzaavBKkUBpLDwrA+uisMgU2eORJk113H0ULWWmA" as="fetch" type="application/wasm"></head>
+<link rel="modulepreload" href="/slime-armies/slime-armies-9f96b15b918ae527.js" crossorigin="anonymous" integrity="sha384-gakcLQiqk6qoo1YBNzkJflLRhp9CIcbp9m7v2Rd3Flj2c7f25XFo4eQ8HDdjouIf"><link rel="preload" href="/slime-armies/slime-armies-9f96b15b918ae527_bg.wasm" crossorigin="anonymous" integrity="sha384-Nzo/rvozeMa+X9hYqO+F3BaAc4xDVZ4bbf+1AVgDGgLOUxS16k7/eD/wq4Y0dz5/" as="fetch" type="application/wasm"></head>
 <body>
     <canvas id="canvas" tabindex="0"></canvas>
     <input id="mobile-input" type="text" tabindex="-1" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-hidden="true" />
@@ -342,10 +348,179 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         // Access via window.slime and window.slimeDebug after TrunkApplicationStarted event
         addEventListener("TrunkApplicationStarted", (e) => {
             const bindings = e.detail.wasm;
+            const textDecoder = new TextDecoder("utf-8");
+            const getMemoryU8 = () => new Uint8Array(bindings.memory.buffer);
+            const movementKeys = ["KeyW", "KeyA", "KeyS", "KeyD", "ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight"];
+            const movementPattern = [
+                { code: "KeyD", key: "d" },
+                { code: "KeyS", key: "s" },
+                { code: "KeyA", key: "a" },
+                { code: "KeyW", key: "w" },
+            ];
+            let keepAliveTimer = null;
+            let keepAliveReleaseTimer = null;
+            let keepAliveStep = 0;
+            const keyFromCode = (code) => {
+                switch (code) {
+                    case "ArrowUp": return "ArrowUp";
+                    case "ArrowDown": return "ArrowDown";
+                    case "ArrowLeft": return "ArrowLeft";
+                    case "ArrowRight": return "ArrowRight";
+                    case "Space": return " ";
+                    case "Enter": return "Enter";
+                    case "Escape": return "Escape";
+                    default:
+                        if (code.startsWith("Key") && code.length === 4) {
+                            return code.slice(3).toLowerCase();
+                        }
+                        return "";
+                }
+            };
+            const keyIdFromCode = (code) => {
+                switch (code) {
+                    case "ArrowUp": return 1;
+                    case "ArrowDown": return 2;
+                    case "ArrowLeft": return 3;
+                    case "ArrowRight": return 4;
+                    case "KeyW": return 5;
+                    case "KeyA": return 6;
+                    case "KeyS": return 7;
+                    case "KeyD": return 8;
+                    case "Space": return 9;
+                    case "Enter": return 10;
+                    case "Backspace": return 11;
+                    case "Tab": return 12;
+                    case "Escape": return 13;
+                    default: return 0;
+                }
+            };
+            const dispatchKey = (type, code, key = keyFromCode(code)) => {
+                const event = new KeyboardEvent(type, {
+                    key,
+                    code,
+                    bubbles: true,
+                    cancelable: true,
+                });
+                window.dispatchEvent(event);
+                document.dispatchEvent(event);
+                const canvas = document.getElementById("canvas");
+                if (canvas) {
+                    canvas.dispatchEvent(event);
+                }
+            };
+            const enqueueKeyDown = (code, key = keyFromCode(code)) => {
+                try {
+                    const keyId = keyIdFromCode(code);
+                    if (keyId && bindings.test_input_key_id_down) {
+                        bindings.test_input_key_id_down(keyId);
+                    } else {
+                        dispatchKey("keydown", code, key);
+                    }
+                } catch (_err) {
+                    dispatchKey("keydown", code, key);
+                }
+            };
+            const enqueueKeyUp = (code) => {
+                try {
+                    const keyId = keyIdFromCode(code);
+                    if (keyId && bindings.test_input_key_id_up) {
+                        bindings.test_input_key_id_up(keyId);
+                    } else {
+                        dispatchKey("keyup", code, keyFromCode(code));
+                    }
+                } catch (_err) {
+                    dispatchKey("keyup", code, keyFromCode(code));
+                }
+            };
+            const enqueueText = (text) => {
+                try {
+                    for (const ch of String(text ?? "")) {
+                        const cp = ch.codePointAt(0) ?? 0;
+                        if (bindings.test_input_ascii_char) {
+                            bindings.test_input_ascii_char(cp);
+                        } else {
+                            const isAlpha = /^[a-z]$/i.test(ch);
+                            const code = isAlpha ? `Key${ch.toUpperCase()}` : "Unidentified";
+                            dispatchKey("keydown", code, ch);
+                            dispatchKey("keyup", code, ch);
+                        }
+                    }
+                } catch (_err) {
+                    for (const ch of String(text ?? "")) {
+                        const isAlpha = /^[a-z]$/i.test(ch);
+                        const code = isAlpha ? `Key${ch.toUpperCase()}` : "Unidentified";
+                        dispatchKey("keydown", code, ch);
+                        dispatchKey("keyup", code, ch);
+                    }
+                }
+            };
+            const releaseMovementKeys = () => {
+                for (const code of movementKeys) {
+                    enqueueKeyUp(code);
+                }
+            };
+            const stopKeepAlive = () => {
+                if (keepAliveTimer !== null) {
+                    clearInterval(keepAliveTimer);
+                    keepAliveTimer = null;
+                }
+                if (keepAliveReleaseTimer !== null) {
+                    clearTimeout(keepAliveReleaseTimer);
+                    keepAliveReleaseTimer = null;
+                }
+                keepAliveStep = 0;
+                releaseMovementKeys();
+            };
+            const startKeepAlive = (stepMs = 420, holdRatio = 0.78) => {
+                stopKeepAlive();
+                const tick = Math.max(180, Number(stepMs) || 420);
+                const holdMs = Math.max(80, Math.floor(tick * Math.min(0.95, Math.max(0.2, Number(holdRatio) || 0.78))));
+                keepAliveTimer = setInterval(() => {
+                    const step = movementPattern[keepAliveStep % movementPattern.length];
+                    keepAliveStep += 1;
+                    releaseMovementKeys();
+                    enqueueKeyDown(step.code, step.key);
+                    if (keepAliveReleaseTimer !== null) {
+                        clearTimeout(keepAliveReleaseTimer);
+                    }
+                    keepAliveReleaseTimer = setTimeout(() => {
+                        enqueueKeyUp(step.code);
+                    }, holdMs);
+                }, tick);
+            };
+            const decodeRustString = (value) => {
+                if (typeof value === "string") {
+                    return value;
+                }
+                if (Array.isArray(value) && value.length === 2 && bindings.memory) {
+                    const ptr = value[0] >>> 0;
+                    const len = value[1] >>> 0;
+                    if (len === 0) {
+                        return "";
+                    }
+                    const bytes = getMemoryU8().subarray(ptr, ptr + len);
+                    return textDecoder.decode(bytes);
+                }
+                return String(value ?? "");
+            };
             window.slime = bindings;
             window.slimeDebug = {
                 send: (cmd) => bindings.send_debug_command(cmd),
                 help: () => bindings.send_debug_command("help"),
+            };
+            // Automation surface for browser-driven tests.
+            // This is additive and does not replace normal user controls.
+            window.slimeTest = {
+                keyDown: (code, key = "") => enqueueKeyDown(code, key || keyFromCode(code)),
+                keyUp: (code) => enqueueKeyUp(code),
+                typeText: (text) => enqueueText(text),
+                click: (x, y) => bindings.test_input_click(x, y),
+                resetInput: () => bindings.test_input_reset(),
+                joinCurrentRoom: () => bindings.test_join_current_room(),
+                state: () => decodeRustString(bindings.test_runtime_state()),
+                net: () => decodeRustString(bindings.test_network_diag()),
+                keepAliveStart: (stepMs = 420, holdRatio = 0.78) => startKeepAlive(stepMs, holdRatio),
+                keepAliveStop: () => stopKeepAlive(),
             };
         });
     </script>

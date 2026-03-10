@@ -1,12 +1,14 @@
+use crate::entities::{
+    Cannon, CannonEvent, ExplosionPool, Guardian, Player, ProjectilePool, Snake, Spider, Wisp,
+};
 use crate::input::Input;
-use crate::entities::{Player, ExplosionPool, Spider, Cannon, Snake, Wisp, Guardian, ProjectilePool, CannonEvent};
 use crate::math::Vec2;
 use crate::net::PlayerState;
-use crate::world::{Camera, ChunkManager};
 use crate::payment;
-use rand::{SeedableRng, Rng, RngCore};
-use rand_xoshiro::Xoshiro256PlusPlus;
+use crate::world::{Camera, ChunkManager};
 use js_sys;
+use rand::{Rng, RngCore, SeedableRng};
+use rand_xoshiro::Xoshiro256PlusPlus;
 use std::collections::{HashMap, HashSet};
 
 // Camera zoom (>1.0 zooms in to show less world)
@@ -36,7 +38,7 @@ const SPAWN_FRONT_DOT_LIMIT: f32 = 0.6;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Scene {
-    Title,      // Main menu with options
+    Title, // Main menu with options
     Game,
     GameOver,
 }
@@ -157,8 +159,9 @@ pub struct Game {
     pub menu_selection: MenuSelection,
     pub player_name: String,
     pub room_code_input: String,
-    pub text_input_active: bool,  // True when typing in a text field
-    pub active_input_field: u8,   // 0 = name, 1 = room code
+    pub title_warning: String,
+    pub text_input_active: bool, // True when typing in a text field
+    pub active_input_field: u8,  // 0 = name, 1 = room code
     // Sound events to be played
     pub sound_events: Vec<SoundEvent>,
     /// Enemy kills that need to be reported to network (for non-host clients)
@@ -179,6 +182,9 @@ pub struct Game {
     /// Snapshot of enemy positions for consistent rendering (updated at sync rate)
     /// This ensures host and client see enemies at the same visual update rate
     pub enemy_render_snapshot: Option<EnemyRenderSnapshot>,
+    last_enemy_sync_tick: u32,
+    enemy_sync_age_frames: u32,
+    enemy_interp: EnemyInterpCache,
     pub shockwave_cooldown: i32,
     pub shockwave_timer: i32,
     pub slow_spawn_timer: i32,
@@ -200,11 +206,30 @@ pub struct Game {
 /// Snapshot of enemy positions for rendering (separate from simulation)
 #[derive(Clone)]
 pub struct EnemyRenderSnapshot {
-    pub spider_positions: Vec<(Vec2, Vec2, bool)>,  // (pos, dir, alive)
-    pub cannon_positions: Vec<(Vec2, Vec2, Vec2, bool)>,  // (pos, dir, look_dir, alive)
-    pub snake_positions: Vec<(Vec2, Vec2, f32, bool)>,  // (pos, dir, size, alive)
-    pub wisp_positions: Vec<(Vec2, Vec2, bool)>,  // (pos, dir, alive)
-    pub guardian_positions: Vec<(Vec2, Vec2, bool, bool, Vec2)>,  // (pos, dir, alive, strike_active, strike_pos)
+    pub spider_positions: Vec<(Vec2, Vec2, bool)>, // (pos, dir, alive)
+    pub cannon_positions: Vec<(Vec2, Vec2, Vec2, bool)>, // (pos, dir, look_dir, alive)
+    pub snake_positions: Vec<(Vec2, Vec2, f32, bool)>, // (pos, dir, size, alive)
+    pub wisp_positions: Vec<(Vec2, Vec2, bool)>,   // (pos, dir, alive)
+    pub guardian_positions: Vec<(Vec2, Vec2, bool, bool, Vec2)>, // (pos, dir, alive, strike_active, strike_pos)
+}
+
+#[derive(Clone, Copy, Default)]
+struct EnemyInterpState {
+    initialized: bool,
+    target_pos: Vec2,
+    target_dir: Vec2,
+    target_size: f32,
+    velocity: Vec2,
+}
+
+#[derive(Default)]
+struct EnemyInterpCache {
+    spiders: Vec<EnemyInterpState>,
+    cannons: Vec<EnemyInterpState>,
+    snakes: Vec<EnemyInterpState>,
+    wisps: Vec<EnemyInterpState>,
+    guardians: Vec<EnemyInterpState>,
+    window_frames: f32,
 }
 
 pub struct ChatLine {
@@ -268,7 +293,10 @@ struct RemoteSimulation {
 impl Game {
     fn default_ability_keymap() -> HashMap<String, crate::net::PaidAbilityType> {
         let mut map = HashMap::new();
-        map.insert("KeyR".to_string(), crate::net::PaidAbilityType::BubbleShield);
+        map.insert(
+            "KeyR".to_string(),
+            crate::net::PaidAbilityType::BubbleShield,
+        );
         map.insert("KeyF".to_string(), crate::net::PaidAbilityType::Shockwave);
         map.insert("KeyT".to_string(), crate::net::PaidAbilityType::SlowSpawn);
         map.insert("KeyG".to_string(), crate::net::PaidAbilityType::SpeedBoost);
@@ -278,9 +306,18 @@ impl Game {
 
     pub fn ability_entries(&self) -> Vec<(crate::net::PaidAbilityType, String)> {
         vec![
-            (crate::net::PaidAbilityType::BubbleShield, "Bubble".to_string()),
-            (crate::net::PaidAbilityType::Shockwave, "Shockwave".to_string()),
-            (crate::net::PaidAbilityType::SlowSpawn, "Time Slow".to_string()),
+            (
+                crate::net::PaidAbilityType::BubbleShield,
+                "Bubble".to_string(),
+            ),
+            (
+                crate::net::PaidAbilityType::Shockwave,
+                "Shockwave".to_string(),
+            ),
+            (
+                crate::net::PaidAbilityType::SlowSpawn,
+                "Time Slow".to_string(),
+            ),
             (crate::net::PaidAbilityType::SpeedBoost, "Speed".to_string()),
             (crate::net::PaidAbilityType::SlimeTrail, "Trail".to_string()),
         ]
@@ -322,24 +359,36 @@ impl Game {
 
         entries
             .into_iter()
-            .map(|(ability, label, description, cost_usd)| AbilityCatalogEntry {
-                ability,
-                label: label.to_string(),
-                description: description.to_string(),
-                cost_usd,
-                key: self.ability_key_for(ability).unwrap_or_else(|| "".to_string()),
-                ready: self.ability_ready(ability),
-            })
+            .map(
+                |(ability, label, description, cost_usd)| AbilityCatalogEntry {
+                    ability,
+                    label: label.to_string(),
+                    description: description.to_string(),
+                    cost_usd,
+                    key: self
+                        .ability_key_for(ability)
+                        .unwrap_or_else(|| "".to_string()),
+                    ready: self.ability_ready(ability),
+                },
+            )
             .collect()
     }
 
     fn ability_ready(&self, ability: crate::net::PaidAbilityType) -> bool {
         match ability {
-            crate::net::PaidAbilityType::BubbleShield => self.player.shield_cooldown <= 0 && self.player.shield_timer <= 0,
+            crate::net::PaidAbilityType::BubbleShield => {
+                self.player.shield_cooldown <= 0 && self.player.shield_timer <= 0
+            }
             crate::net::PaidAbilityType::Shockwave => self.shockwave_cooldown <= 0,
-            crate::net::PaidAbilityType::SlowSpawn => self.slow_spawn_cooldown <= 0 && self.slow_spawn_timer <= 0,
-            crate::net::PaidAbilityType::SpeedBoost => self.speed_boost_cooldown <= 0 && self.speed_boost_timer <= 0,
-            crate::net::PaidAbilityType::SlimeTrail => self.trail_cooldown <= 0 && self.trail_timer <= 0,
+            crate::net::PaidAbilityType::SlowSpawn => {
+                self.slow_spawn_cooldown <= 0 && self.slow_spawn_timer <= 0
+            }
+            crate::net::PaidAbilityType::SpeedBoost => {
+                self.speed_boost_cooldown <= 0 && self.speed_boost_timer <= 0
+            }
+            crate::net::PaidAbilityType::SlimeTrail => {
+                self.trail_cooldown <= 0 && self.trail_timer <= 0
+            }
         }
     }
 
@@ -356,7 +405,9 @@ impl Game {
         let mut out = Vec::new();
         for (i, (ability, label)) in entries.into_iter().enumerate() {
             let x = start_x + i as f64 * (width + gap);
-            let key = self.ability_key_for(ability).unwrap_or_else(|| "".to_string());
+            let key = self
+                .ability_key_for(ability)
+                .unwrap_or_else(|| "".to_string());
             out.push(AbilityUiEntry {
                 ability,
                 label,
@@ -532,6 +583,7 @@ impl Game {
             menu_selection: MenuSelection::Play,
             player_name: Self::generate_default_name(),
             room_code_input: String::new(),
+            title_warning: String::new(),
             text_input_active: false,
             active_input_field: 0,
             sound_events: Vec::new(),
@@ -544,6 +596,9 @@ impl Game {
             last_wave_start: None,
             pending_respawn: false,
             enemy_render_snapshot: None,
+            last_enemy_sync_tick: 0,
+            enemy_sync_age_frames: 0,
+            enemy_interp: EnemyInterpCache::default(),
             shockwave_cooldown: 0,
             shockwave_timer: 0,
             slow_spawn_timer: 0,
@@ -565,9 +620,10 @@ impl Game {
 
     pub fn queue_remote_inputs(&mut self, inputs: &[(String, crate::net::InputFrame)]) {
         for (peer_id, input_frame) in inputs {
-            let sim = self.remote_simulations.entry(peer_id.clone()).or_insert_with(|| {
-                RemoteSimulation::new_placeholder(self.frame_count)
-            });
+            let sim = self
+                .remote_simulations
+                .entry(peer_id.clone())
+                .or_insert_with(|| RemoteSimulation::new_placeholder(self.frame_count));
             sim.queue_input(input_frame.frame, input_frame.input);
         }
     }
@@ -581,27 +637,35 @@ impl Game {
         self.viewport_height = height;
     }
 
-    pub fn update_remote_predictions(&mut self, remote_players: &HashMap<String, crate::net::RemotePlayer>) {
+    pub fn update_remote_predictions(
+        &mut self,
+        remote_players: &HashMap<String, crate::net::RemotePlayer>,
+    ) {
         self.remote_predictions.clear();
 
         for (peer_id, remote) in remote_players {
-            let sim = self.remote_simulations.entry(peer_id.clone()).or_insert_with(|| {
-                let state = PlayerState::new(
-                    remote.pos,
-                    remote.look_dir,
-                    remote.move_dir,
-                    remote.alive,
-                    remote.attacking,
-                    remote.blocking,
-                    remote.phasing,
-                    remote.shielded,
-                );
-                RemoteSimulation::new_from_state(&state, remote.last_update_frame())
-            });
+            let sim = self
+                .remote_simulations
+                .entry(peer_id.clone())
+                .or_insert_with(|| {
+                    let state = PlayerState::new(
+                        remote.last_update_frame(),
+                        remote.pos,
+                        remote.look_dir,
+                        remote.move_dir,
+                        remote.alive,
+                        remote.attacking,
+                        remote.blocking,
+                        remote.phasing,
+                        remote.shielded,
+                    );
+                    RemoteSimulation::new_from_state(&state, remote.last_update_frame())
+                });
 
             let authoritative_frame = remote.last_update_frame();
             if authoritative_frame > sim.last_authoritative_frame {
                 let state = PlayerState::new(
+                    authoritative_frame,
                     remote.pos,
                     remote.look_dir,
                     remote.move_dir,
@@ -615,10 +679,12 @@ impl Game {
             }
 
             sim.simulate_to(self.frame_count, &self.chunks);
-            self.remote_predictions.insert(peer_id.clone(), sim.predicted_state());
+            self.remote_predictions
+                .insert(peer_id.clone(), sim.predicted_state());
         }
 
-        self.remote_simulations.retain(|peer_id, _| remote_players.contains_key(peer_id));
+        self.remote_simulations
+            .retain(|peer_id, _| remote_players.contains_key(peer_id));
     }
 
     pub fn remote_predictions(&self) -> &HashMap<String, PlayerState> {
@@ -628,19 +694,25 @@ impl Game {
     /// Create a snapshot of current enemy positions for rendering
     /// Called at sync rate (every 6 frames) for consistent visuals between host and client
     pub fn snapshot_enemies_for_render(&mut self) {
-        let spider_positions: Vec<_> = self.spiders.iter()
+        let spider_positions: Vec<_> = self
+            .spiders
+            .iter()
             .map(|s| (s.pos, s.dir, s.alive))
             .collect();
-        let cannon_positions: Vec<_> = self.cannons.iter()
+        let cannon_positions: Vec<_> = self
+            .cannons
+            .iter()
             .map(|c| (c.pos, c.dir, c.look_dir, c.alive))
             .collect();
-        let snake_positions: Vec<_> = self.snakes.iter()
+        let snake_positions: Vec<_> = self
+            .snakes
+            .iter()
             .map(|s| (s.pos, s.dir, s.size, s.alive))
             .collect();
-        let wisp_positions: Vec<_> = self.wisps.iter()
-            .map(|w| (w.pos, w.dir, w.alive))
-            .collect();
-        let guardian_positions: Vec<_> = self.guardians.iter()
+        let wisp_positions: Vec<_> = self.wisps.iter().map(|w| (w.pos, w.dir, w.alive)).collect();
+        let guardian_positions: Vec<_> = self
+            .guardians
+            .iter()
             .map(|g| (g.pos, g.dir, g.alive, g.strike_active(), g.strike_pos()))
             .collect();
 
@@ -653,9 +725,158 @@ impl Game {
         });
     }
 
+    fn ensure_interp_slot(slots: &mut Vec<EnemyInterpState>, id: usize) -> &mut EnemyInterpState {
+        while slots.len() <= id {
+            slots.push(EnemyInterpState::default());
+        }
+        &mut slots[id]
+    }
+
+    fn normalized_or(v: Vec2, fallback: Vec2) -> Vec2 {
+        if v.length_squared() > 0.0001 {
+            v.normalize()
+        } else {
+            fallback
+        }
+    }
+
+    fn blend_direction(current: Vec2, target: Vec2, velocity: Vec2) -> Vec2 {
+        let fallback = if current.length_squared() > 0.0001 {
+            current.normalize()
+        } else {
+            Vec2::new(0.0, -1.0)
+        };
+        let desired = if target.length_squared() > 0.0001 {
+            target.normalize()
+        } else if velocity.length_squared() > 0.0001 {
+            velocity.normalize()
+        } else {
+            fallback
+        };
+        Self::normalized_or(current.lerp(desired, 0.25), desired)
+    }
+
+    fn advance_enemy_interpolation(&mut self, run_enemy_ai: bool) {
+        if run_enemy_ai {
+            self.enemy_sync_age_frames = 0;
+            return;
+        }
+
+        self.enemy_sync_age_frames = self.enemy_sync_age_frames.saturating_add(1);
+        let window = self.enemy_interp.window_frames.max(2.0);
+        let base_blend = (1.2 / window).clamp(0.12, 0.35);
+        let stale_frames = (self.enemy_sync_age_frames as f32 - window).max(0.0);
+        let extrap_frames = stale_frames.min(4.0) * 0.35;
+
+        for (id, spider) in self.spiders.iter_mut().enumerate() {
+            let Some(slot) = self.enemy_interp.spiders.get_mut(id) else {
+                continue;
+            };
+            if !slot.initialized {
+                continue;
+            }
+            let mut target_pos = slot.target_pos;
+            if extrap_frames > 0.0 {
+                target_pos += slot.velocity * extrap_frames;
+            }
+            spider.pos = spider.pos.lerp(target_pos, base_blend);
+            spider.dir = Self::blend_direction(spider.dir, slot.target_dir, slot.velocity);
+            spider.speed = slot.velocity;
+        }
+
+        for (id, cannon) in self.cannons.iter_mut().enumerate() {
+            let Some(slot) = self.enemy_interp.cannons.get_mut(id) else {
+                continue;
+            };
+            if !slot.initialized {
+                continue;
+            }
+            let mut target_pos = slot.target_pos;
+            if extrap_frames > 0.0 {
+                target_pos += slot.velocity * extrap_frames;
+            }
+            let prev_pos = cannon.pos;
+            cannon.pos = cannon.pos.lerp(target_pos, base_blend);
+            cannon.look_dir =
+                Self::blend_direction(cannon.look_dir, slot.target_dir, slot.velocity);
+            let delta = cannon.pos - prev_pos;
+            if delta.length_squared() > 0.0001 {
+                cannon.dir = delta.normalize();
+                cannon.speed = delta;
+            } else {
+                cannon.dir = Self::blend_direction(cannon.dir, slot.target_dir, slot.velocity);
+                cannon.speed = slot.velocity;
+            }
+        }
+
+        for (id, snake) in self.snakes.iter_mut().enumerate() {
+            let Some(slot) = self.enemy_interp.snakes.get_mut(id) else {
+                continue;
+            };
+            if !slot.initialized {
+                continue;
+            }
+            let mut target_pos = slot.target_pos;
+            if extrap_frames > 0.0 {
+                target_pos += slot.velocity * extrap_frames;
+            }
+            let prev_pos = snake.pos;
+            snake.pos = snake.pos.lerp(target_pos, base_blend);
+            snake.dir = Self::blend_direction(snake.dir, slot.target_dir, slot.velocity);
+            snake.size += (slot.target_size - snake.size) * 0.25;
+            let delta = snake.pos - prev_pos;
+            snake.speed = if delta.length_squared() > 0.0001 {
+                delta
+            } else {
+                slot.velocity
+            };
+        }
+
+        for (id, wisp) in self.wisps.iter_mut().enumerate() {
+            let Some(slot) = self.enemy_interp.wisps.get_mut(id) else {
+                continue;
+            };
+            if !slot.initialized {
+                continue;
+            }
+            let mut target_pos = slot.target_pos;
+            if extrap_frames > 0.0 {
+                target_pos += slot.velocity * extrap_frames;
+            }
+            wisp.pos = wisp.pos.lerp(target_pos, base_blend);
+            wisp.dir = Self::blend_direction(wisp.dir, slot.target_dir, slot.velocity);
+        }
+
+        for (id, guardian) in self.guardians.iter_mut().enumerate() {
+            let Some(slot) = self.enemy_interp.guardians.get_mut(id) else {
+                continue;
+            };
+            if !slot.initialized {
+                continue;
+            }
+            let mut target_pos = slot.target_pos;
+            if extrap_frames > 0.0 {
+                target_pos += slot.velocity * extrap_frames;
+            }
+            let prev_pos = guardian.pos;
+            guardian.pos = guardian.pos.lerp(target_pos, base_blend);
+            guardian.dir = Self::blend_direction(guardian.dir, slot.target_dir, slot.velocity);
+            let delta = guardian.pos - prev_pos;
+            guardian.speed = if delta.length_squared() > 0.0001 {
+                delta
+            } else {
+                slot.velocity
+            };
+        }
+    }
+
     fn generate_default_name() -> String {
-        let adjectives = ["SWIFT", "BRAVE", "SLY", "BOLD", "KEEN", "WILD", "COOL", "RAD"];
-        let nouns = ["SLIME", "BLOB", "GOO", "OOZE", "JELLY", "GLOB", "PUDDLE", "DROP"];
+        let adjectives = [
+            "SWIFT", "BRAVE", "SLY", "BOLD", "KEEN", "WILD", "COOL", "RAD",
+        ];
+        let nouns = [
+            "SLIME", "BLOB", "GOO", "OOZE", "JELLY", "GLOB", "PUDDLE", "DROP",
+        ];
 
         let now = js_sys::Date::now() as u64;
         let adj_idx = (now % adjectives.len() as u64) as usize;
@@ -681,6 +902,7 @@ impl Game {
         if c.is_alphanumeric() && input.len() < max_len {
             // Always uppercase for consistency
             input.push(c.to_ascii_uppercase());
+            self.title_warning.clear();
         }
     }
 
@@ -697,6 +919,7 @@ impl Game {
         };
 
         input.pop();
+        self.title_warning.clear();
     }
 
     /// Check if text input is currently active
@@ -718,7 +941,12 @@ impl Game {
     }
 
     /// Update with multiplayer support - enemies target closest of all players
-    pub fn update_multiplayer(&mut self, input: &Input, remote_players: &std::collections::HashMap<String, crate::net::RemotePlayer>, is_host: bool) {
+    pub fn update_multiplayer(
+        &mut self,
+        input: &Input,
+        remote_players: &std::collections::HashMap<String, crate::net::RemotePlayer>,
+        is_host: bool,
+    ) {
         self.frame_count += 1;
         // Clear sound events from previous frame
         self.sound_events.clear();
@@ -732,7 +960,7 @@ impl Game {
     }
 
     fn update_title(&mut self, input: &Input) {
-        use crate::input::{BUTTON_ATTACK, BUTTON_UP, BUTTON_DOWN, BUTTON_LEFT, BUTTON_RIGHT};
+        use crate::input::{BUTTON_ATTACK, BUTTON_DOWN, BUTTON_LEFT, BUTTON_RIGHT, BUTTON_UP};
 
         // If text input is active, don't process menu navigation
         if self.text_input_active {
@@ -819,7 +1047,12 @@ impl Game {
     /// - Host runs enemy AI and sends positions to clients
     /// - Clients do NOT run enemy AI, they receive positions from host
     /// - All players run local collision detection for responsive gameplay
-    pub fn update_game_multiplayer(&mut self, input: &Input, remote_players: &std::collections::HashMap<String, crate::net::RemotePlayer>, is_host: bool) {
+    pub fn update_game_multiplayer(
+        &mut self,
+        input: &Input,
+        remote_players: &std::collections::HashMap<String, crate::net::RemotePlayer>,
+        is_host: bool,
+    ) {
         // Build list of all player positions for enemy targeting (host uses this for AI)
         let mut target_positions = vec![self.player.pos];
         let mut remote_ids: Vec<_> = remote_players.keys().collect();
@@ -845,7 +1078,13 @@ impl Game {
         self.update_game_with_targets(input, &target_positions, run_enemy_ai, player_count);
     }
 
-    fn update_game_with_targets(&mut self, input: &Input, target_positions: &[Vec2], run_enemy_ai: bool, player_count: usize) {
+    fn update_game_with_targets(
+        &mut self,
+        input: &Input,
+        target_positions: &[Vec2],
+        run_enemy_ai: bool,
+        player_count: usize,
+    ) {
         let player_pos = self.player.pos;
         let player_look_dir = self.player.look_dir;
         let frame_count = self.frame_count;
@@ -895,7 +1134,8 @@ impl Game {
             frame: self.frame_count,
             input: input.get_raw(),
         });
-        self.input_history.retain(|entry| self.frame_count.saturating_sub(entry.frame) <= ROLLBACK_WINDOW_FRAMES);
+        self.input_history
+            .retain(|entry| self.frame_count.saturating_sub(entry.frame) <= ROLLBACK_WINDOW_FRAMES);
 
         // Update chunks around all active players (host uses all for enemy AI)
         self.chunks.update_for_positions(target_positions);
@@ -909,7 +1149,10 @@ impl Game {
         if self.player.pos.distance(SHRINE_POS) < SHRINE_TRIGGER_DISTANCE {
             if !self.shrine_badge_unlocked {
                 self.shrine_badge_unlocked = true;
-                self.push_chat_line("System".to_string(), "Badge unlocked: Shrinefinder".to_string());
+                self.push_chat_line(
+                    "System".to_string(),
+                    "Badge unlocked: Shrinefinder".to_string(),
+                );
             }
         }
 
@@ -956,6 +1199,9 @@ impl Game {
         // Get visible bounds (for future culling optimizations)
         let _visible_bounds = self.camera.visible_bounds();
 
+        // On clients, move enemies smoothly between authoritative sync packets.
+        self.advance_enemy_interpolation(run_enemy_ai);
+
         // Collect actions to avoid borrow conflicts
         let mut player_killed = false;
         let mut player_killed_by: Option<(u8, u16)> = None;
@@ -994,16 +1240,29 @@ impl Game {
                     }
                 }
 
-                if Self::trail_hits_enemy_segments(trail_segments, spider.pos, spider.radius() * CREATURE_SCALE) {
+                if Self::trail_hits_enemy_segments(
+                    trail_segments,
+                    spider.pos,
+                    spider.radius() * CREATURE_SCALE,
+                ) {
                     killed_spiders.push(i);
-                } else if self.player.collide_attack(spider.pos, spider.radius() * CREATURE_SCALE) {
+                } else if self
+                    .player
+                    .collide_attack(spider.pos, spider.radius() * CREATURE_SCALE)
+                {
                     killed_spiders.push(i);
                     attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
-                } else if self.player.collide_block(spider.pos, (spider.radius() - 3.5) * CREATURE_SCALE) {
+                } else if self
+                    .player
+                    .collide_block(spider.pos, (spider.radius() - 3.5) * CREATURE_SCALE)
+                {
                     let distance = player_pos.distance(spider.pos);
                     let bump = (11.0 * CREATURE_SCALE - distance).max(1.5 * CREATURE_SCALE);
                     spider_bumps.push((i, player_look_dir, bump));
-                } else if self.player.collide_body(spider.pos, (spider.radius() - 3.5) * CREATURE_SCALE) {
+                } else if self
+                    .player
+                    .collide_body(spider.pos, (spider.radius() - 3.5) * CREATURE_SCALE)
+                {
                     player_killed = true;
                     if player_killed_by.is_none() {
                         player_killed_by = Some((0, spider.id as u16));
@@ -1030,16 +1289,29 @@ impl Game {
                     }
                 }
 
-                if Self::trail_hits_enemy_segments(trail_segments, wisp.pos, wisp.radius() * CREATURE_SCALE) {
+                if Self::trail_hits_enemy_segments(
+                    trail_segments,
+                    wisp.pos,
+                    wisp.radius() * CREATURE_SCALE,
+                ) {
                     killed_wisps.push(i);
-                } else if self.player.collide_attack(wisp.pos, wisp.radius() * CREATURE_SCALE) {
+                } else if self
+                    .player
+                    .collide_attack(wisp.pos, wisp.radius() * CREATURE_SCALE)
+                {
                     killed_wisps.push(i);
                     attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
-                } else if self.player.collide_block(wisp.pos, (wisp.radius() - 2.0) * CREATURE_SCALE) {
+                } else if self
+                    .player
+                    .collide_block(wisp.pos, (wisp.radius() - 2.0) * CREATURE_SCALE)
+                {
                     let distance = player_pos.distance(wisp.pos);
                     let bump = (9.0 * CREATURE_SCALE - distance).max(1.0 * CREATURE_SCALE);
                     wisp_bumps.push((i, player_look_dir, bump));
-                } else if self.player.collide_body(wisp.pos, (wisp.radius() - 2.0) * CREATURE_SCALE) {
+                } else if self
+                    .player
+                    .collide_body(wisp.pos, (wisp.radius() - 2.0) * CREATURE_SCALE)
+                {
                     player_killed = true;
                     if player_killed_by.is_none() {
                         player_killed_by = Some((4, wisp.id as u16));
@@ -1070,7 +1342,8 @@ impl Game {
                     let home = guardian.home_pos;
                     let dist_from_home = guardian.pos.distance(home);
                     let leash_strength = (dist_from_home / 200.0).clamp(0.0, 1.0);
-                    let target = weighted_target * (0.7 - 0.3 * leash_strength) + home * (0.3 + 0.3 * leash_strength);
+                    let target = weighted_target * (0.7 - 0.3 * leash_strength)
+                        + home * (0.3 + 0.3 * leash_strength);
                     let prev_pos = guardian.pos;
                     let prev_speed = guardian.speed;
                     guardian.update_infinite(target, &self.chunks);
@@ -1084,18 +1357,29 @@ impl Game {
                     }
                 }
                 let strike_dir = (closest_target - guardian.pos).normalize();
-                let strike_dir = if strike_dir.length() == 0.0 { Vec2::new(0.0, -1.0) } else { strike_dir };
+                let strike_dir = if strike_dir.length() == 0.0 {
+                    Vec2::new(0.0, -1.0)
+                } else {
+                    strike_dir
+                };
                 guardian.update_strike(closest_target, strike_dir);
                 guardian.update_tentacles(target_positions, &self.chunks, frame_count);
 
-                if Self::trail_hits_enemy_segments(trail_segments, guardian.pos, guardian.radius() * CREATURE_SCALE) {
+                if Self::trail_hits_enemy_segments(
+                    trail_segments,
+                    guardian.pos,
+                    guardian.radius() * CREATURE_SCALE,
+                ) {
                     if !guardian_damaged[i] {
                         if guardian.take_damage(1) {
                             killed_guardians.push(i);
                         }
                         guardian_damaged[i] = true;
                     }
-                } else if self.player.collide_attack(guardian.pos, guardian.radius() * CREATURE_SCALE) {
+                } else if self
+                    .player
+                    .collide_attack(guardian.pos, guardian.radius() * CREATURE_SCALE)
+                {
                     if !guardian_damaged[i] {
                         if guardian.take_damage(1) {
                             killed_guardians.push(i);
@@ -1103,21 +1387,30 @@ impl Game {
                         attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
                         guardian_damaged[i] = true;
                     }
-                } else if self.player.collide_block(guardian.pos, guardian.radius() * CREATURE_SCALE) {
+                } else if self
+                    .player
+                    .collide_block(guardian.pos, guardian.radius() * CREATURE_SCALE)
+                {
                     let distance = player_pos.distance(guardian.pos);
                     let bump = (14.0 * CREATURE_SCALE - distance).max(2.0 * CREATURE_SCALE);
                     guardian_bumps.push((i, player_look_dir, bump));
                 } else {
                     for (tent_idx, tip_pos) in guardian.tentacle_tip_positions() {
-                        if self.player.collide_block(tip_pos, crate::entities::Guardian::tentacle_hit_radius() * CREATURE_SCALE) {
+                        if self.player.collide_block(
+                            tip_pos,
+                            crate::entities::Guardian::tentacle_hit_radius() * CREATURE_SCALE,
+                        ) {
                             let normal = (tip_pos - self.player.pos).normalize();
                             guardian.bounce_tentacle(tent_idx, normal);
                         }
                     }
                     let mut bounce_requests: Vec<(usize, Vec2)> = Vec::new();
-                    let tentacle_radius = crate::entities::Guardian::tentacle_hit_radius() * CREATURE_SCALE;
+                    let tentacle_radius =
+                        crate::entities::Guardian::tentacle_hit_radius() * CREATURE_SCALE;
                     let body_radius = 4.5 * CREATURE_SCALE + tentacle_radius;
-                    let body_vulnerable = self.player.alive && !self.player.is_phasing() && !self.player.is_shielded();
+                    let body_vulnerable = self.player.alive
+                        && !self.player.is_phasing()
+                        && !self.player.is_shielded();
                     for tentacle in guardian.tentacle_paths() {
                         for seg_idx in 1..tentacle.joints.len() {
                             let a = tentacle.joints[seg_idx - 1];
@@ -1128,7 +1421,10 @@ impl Game {
                                 bounce_requests.push((tentacle.mode as usize, normal));
                                 continue;
                             }
-                            if body_vulnerable && Self::distance_point_to_segment(self.player.pos, a, b) <= body_radius {
+                            if body_vulnerable
+                                && Self::distance_point_to_segment(self.player.pos, a, b)
+                                    <= body_radius
+                            {
                                 player_killed = true;
                                 if player_killed_by.is_none() {
                                     player_killed_by = Some((5, guardian.id as u16));
@@ -1141,13 +1437,19 @@ impl Game {
                     }
                     if guardian.strike_active()
                         && guardian.pos.distance(self.player.pos) <= guardian.strike_range() * 1.25
-                        && guardian.strike_points().iter().any(|pos| self.player.collide_body(*pos, 6.0 * CREATURE_SCALE))
+                        && guardian
+                            .strike_points()
+                            .iter()
+                            .any(|pos| self.player.collide_body(*pos, 6.0 * CREATURE_SCALE))
                     {
                         player_killed = true;
                         if player_killed_by.is_none() {
                             player_killed_by = Some((5, guardian.id as u16));
                         }
-                    } else if self.player.collide_body(guardian.pos, guardian.radius() * CREATURE_SCALE) {
+                    } else if self
+                        .player
+                        .collide_body(guardian.pos, guardian.radius() * CREATURE_SCALE)
+                    {
                         player_killed = true;
                         if player_killed_by.is_none() {
                             player_killed_by = Some((5, guardian.id as u16));
@@ -1169,7 +1471,8 @@ impl Game {
                             && cannon.pos.y - 50.0 <= target.y + half_h
                     });
                     let target = Self::find_closest_target(cannon.pos, target_positions);
-                    let mut event = cannon.update_infinite(target, frame_count, on_screen, &self.chunks);
+                    let mut event =
+                        cannon.update_infinite(target, frame_count, on_screen, &self.chunks);
                     if self.slow_spawn_timer > 0 {
                         let dist = cannon.pos.distance(self.player.pos);
                         let falloff = (1.0 - dist / max_slow_dist).clamp(0.0, 1.0);
@@ -1247,19 +1550,32 @@ impl Game {
         // Check snake collisions separately
         for (i, snake) in self.snakes.iter().enumerate() {
             if snake.alive {
-                if Self::trail_hits_enemy_segments(trail_segments, snake.pos, snake.radius() * CREATURE_SCALE) {
+                if Self::trail_hits_enemy_segments(
+                    trail_segments,
+                    snake.pos,
+                    snake.radius() * CREATURE_SCALE,
+                ) {
                     killed_snakes.push(i);
-                } else if self.player.collide_attack(snake.pos, snake.radius() * CREATURE_SCALE) {
+                } else if self
+                    .player
+                    .collide_attack(snake.pos, snake.radius() * CREATURE_SCALE)
+                {
                     killed_snakes.push(i);
                     attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
-                } else if self.player.collide_block(snake.pos, snake.radius() * CREATURE_SCALE) {
+                } else if self
+                    .player
+                    .collide_block(snake.pos, snake.radius() * CREATURE_SCALE)
+                {
                     let distance = player_pos.distance(snake.pos);
                     let bump = (8.5 * CREATURE_SCALE + snake.radius() * CREATURE_SCALE - distance)
                         .max(1.5 * CREATURE_SCALE)
                         / 2.0;
                     snake_bumps.push((i, player_look_dir, bump));
                     self.player.pos -= player_look_dir * bump;
-                } else if self.player.collide_body(snake.pos, snake.radius() * CREATURE_SCALE) {
+                } else if self
+                    .player
+                    .collide_body(snake.pos, snake.radius() * CREATURE_SCALE)
+                {
                     player_killed = true;
                     if player_killed_by.is_none() {
                         player_killed_by = Some((2, snake.id as u16));
@@ -1276,7 +1592,9 @@ impl Game {
 
         if attack_hits_this_frame > 0 {
             self.attack_hits = self.attack_hits.saturating_add(attack_hits_this_frame);
-            self.pending_attack_hits = self.pending_attack_hits.saturating_add(attack_hits_this_frame);
+            self.pending_attack_hits = self
+                .pending_attack_hits
+                .saturating_add(attack_hits_this_frame);
         }
 
         // Update projectiles (with obstacle collision)
@@ -1299,11 +1617,20 @@ impl Game {
                     continue;
                 }
                 // Original uses radius 3 for attack/block, radius 1 for body
-                if self.player.collide_attack(projectile.pos, 3.0 * CREATURE_SCALE) {
+                if self
+                    .player
+                    .collide_attack(projectile.pos, 3.0 * CREATURE_SCALE)
+                {
                     projectiles_to_kill.push(idx);
-                } else if self.player.collide_block(projectile.pos, 3.0 * CREATURE_SCALE) {
+                } else if self
+                    .player
+                    .collide_block(projectile.pos, 3.0 * CREATURE_SCALE)
+                {
                     projectiles_to_reflect.push(idx);
-                } else if self.player.collide_body(projectile.pos, 1.0 * CREATURE_SCALE) {
+                } else if self
+                    .player
+                    .collide_body(projectile.pos, 1.0 * CREATURE_SCALE)
+                {
                     player_killed = true;
                     if player_killed_by.is_none() {
                         player_killed_by = Some((3, 0));
@@ -1312,27 +1639,42 @@ impl Game {
             } else {
                 // Reflected projectiles can kill enemies
                 for (i, spider) in self.spiders.iter().enumerate() {
-                    if spider.alive && projectile.pos.distance(spider.pos) < 5.0 * CREATURE_SCALE && !killed_spiders.contains(&i) {
+                    if spider.alive
+                        && projectile.pos.distance(spider.pos) < 5.0 * CREATURE_SCALE
+                        && !killed_spiders.contains(&i)
+                    {
                         killed_spiders.push(i);
                     }
                 }
                 for (i, cannon) in self.cannons.iter().enumerate() {
-                    if cannon.alive && projectile.pos.distance(cannon.pos) < 6.0 * CREATURE_SCALE && !killed_cannons.contains(&i) {
+                    if cannon.alive
+                        && projectile.pos.distance(cannon.pos) < 6.0 * CREATURE_SCALE
+                        && !killed_cannons.contains(&i)
+                    {
                         killed_cannons.push(i);
                     }
                 }
                 for (i, snake) in self.snakes.iter().enumerate() {
-                    if snake.alive && projectile.pos.distance(snake.pos) < snake.radius() * CREATURE_SCALE && !killed_snakes.contains(&i) {
+                    if snake.alive
+                        && projectile.pos.distance(snake.pos) < snake.radius() * CREATURE_SCALE
+                        && !killed_snakes.contains(&i)
+                    {
                         killed_snakes.push(i);
                     }
                 }
-        for (i, wisp) in self.wisps.iter().enumerate() {
-            if wisp.alive && projectile.pos.distance(wisp.pos) < wisp.radius() * CREATURE_SCALE && !killed_wisps.contains(&i) {
-                killed_wisps.push(i);
-            }
-        }
+                for (i, wisp) in self.wisps.iter().enumerate() {
+                    if wisp.alive
+                        && projectile.pos.distance(wisp.pos) < wisp.radius() * CREATURE_SCALE
+                        && !killed_wisps.contains(&i)
+                    {
+                        killed_wisps.push(i);
+                    }
+                }
                 for (i, guardian) in self.guardians.iter_mut().enumerate() {
-                    if guardian.alive && projectile.pos.distance(guardian.pos) < guardian.radius() * CREATURE_SCALE {
+                    if guardian.alive
+                        && projectile.pos.distance(guardian.pos)
+                            < guardian.radius() * CREATURE_SCALE
+                    {
                         if i < guardian_damaged.len() && !guardian_damaged[i] {
                             if guardian.take_damage(1) {
                                 killed_guardians.push(i);
@@ -1355,7 +1697,11 @@ impl Game {
         }
 
         // Apply all collected actions (blocking bumps enemies)
-        if !spider_bumps.is_empty() || !cannon_bumps.is_empty() || !snake_bumps.is_empty() || !wisp_bumps.is_empty() {
+        if !spider_bumps.is_empty()
+            || !cannon_bumps.is_empty()
+            || !snake_bumps.is_empty()
+            || !wisp_bumps.is_empty()
+        {
             self.sound_events.push(SoundEvent::Block);
         }
         for (i, dir, amount) in spider_bumps {
@@ -1382,7 +1728,8 @@ impl Game {
             self.wave_kill_counts[0] = self.wave_kill_counts[0].saturating_add(1);
             self.explosions.spawn(pos, 7, 0, 0);
             self.sound_events.push(SoundEvent::EnemyKill);
-            self.pending_enemy_kills.push((crate::net::EnemyType::Spider, enemy_id));
+            self.pending_enemy_kills
+                .push((crate::net::EnemyType::Spider, enemy_id));
         }
         for i in killed_cannons {
             let pos = self.cannons[i].pos;
@@ -1393,7 +1740,8 @@ impl Game {
             self.wave_kill_counts[1] = self.wave_kill_counts[1].saturating_add(1);
             self.explosions.spawn(pos, 8, 0, 0);
             self.sound_events.push(SoundEvent::EnemyKill);
-            self.pending_enemy_kills.push((crate::net::EnemyType::Cannon, enemy_id));
+            self.pending_enemy_kills
+                .push((crate::net::EnemyType::Cannon, enemy_id));
         }
         for i in killed_snakes {
             let pos = self.snakes[i].pos;
@@ -1404,7 +1752,8 @@ impl Game {
             self.wave_kill_counts[2] = self.wave_kill_counts[2].saturating_add(1);
             self.explosions.spawn(pos, 9, 0, 0);
             self.sound_events.push(SoundEvent::EnemyKill);
-            self.pending_enemy_kills.push((crate::net::EnemyType::Snake, enemy_id));
+            self.pending_enemy_kills
+                .push((crate::net::EnemyType::Snake, enemy_id));
         }
         for i in killed_wisps {
             let pos = self.wisps[i].pos;
@@ -1415,7 +1764,8 @@ impl Game {
             self.wave_kill_counts[3] = self.wave_kill_counts[3].saturating_add(1);
             self.explosions.spawn(pos, 6, 0, 0);
             self.sound_events.push(SoundEvent::EnemyKill);
-            self.pending_enemy_kills.push((crate::net::EnemyType::Wisp, enemy_id));
+            self.pending_enemy_kills
+                .push((crate::net::EnemyType::Wisp, enemy_id));
         }
         for i in killed_guardians {
             let pos = self.guardians[i].pos;
@@ -1425,7 +1775,8 @@ impl Game {
             self.guardian_kills += 1;
             self.explosions.spawn(pos, 12, 0, 0);
             self.sound_events.push(SoundEvent::EnemyKill);
-            self.pending_enemy_kills.push((crate::net::EnemyType::Guardian, enemy_id));
+            self.pending_enemy_kills
+                .push((crate::net::EnemyType::Guardian, enemy_id));
         }
 
         // Spawn cannon projectiles
@@ -1445,6 +1796,9 @@ impl Game {
         if run_enemy_ai && self.wave_targets_met() {
             self.spawn_wave_for_players(player_count, target_positions);
         }
+
+        // Keep render snapshot current every frame so visuals stay smooth.
+        self.snapshot_enemies_for_render();
     }
 
     fn spawn_wave(&mut self) {
@@ -1453,7 +1807,12 @@ impl Game {
         self.spawn_wave_for_players(1, &target_positions);
     }
 
-    fn check_shrine_boss(&mut self, target_positions: &[Vec2], run_enemy_ai: bool, view_radius: f32) {
+    fn check_shrine_boss(
+        &mut self,
+        target_positions: &[Vec2],
+        run_enemy_ai: bool,
+        view_radius: f32,
+    ) {
         if self.shrine_triggered || !run_enemy_ai {
             return;
         }
@@ -1484,28 +1843,39 @@ impl Game {
             }
         }
         let guardian_id = self.guardians.len();
-        self.guardians.push(Guardian::new_at_position(guardian_id, center));
+        self.guardians
+            .push(Guardian::new_at_position(guardian_id, center));
         if spawned > 0 {
             self.sound_events.push(SoundEvent::Explosion);
         }
     }
 
-    fn spawn_enemy_at(&mut self, enemy_type: crate::net::EnemyType, center: Vec2, spread: f32) -> bool {
+    fn spawn_enemy_at(
+        &mut self,
+        enemy_type: crate::net::EnemyType,
+        center: Vec2,
+        spread: f32,
+    ) -> bool {
         for _ in 0..10 {
             let angle = self.rng.gen::<f32>() * std::f32::consts::TAU;
             let distance = self.rng.gen::<f32>() * spread;
-            let pos = Vec2::new(center.x + angle.cos() * distance, center.y + angle.sin() * distance);
+            let pos = Vec2::new(
+                center.x + angle.cos() * distance,
+                center.y + angle.sin() * distance,
+            );
             if self.chunks.collides_with_obstacle(pos, 10.0) {
                 continue;
             }
             match enemy_type {
                 crate::net::EnemyType::Spider => {
                     let id = self.spiders.len();
-                    self.spiders.push(Spider::new_at_position(id, pos, &mut self.rng));
+                    self.spiders
+                        .push(Spider::new_at_position(id, pos, &mut self.rng));
                 }
                 crate::net::EnemyType::Cannon => {
                     let id = self.cannons.len();
-                    self.cannons.push(Cannon::new_at_position(id, pos, &mut self.rng));
+                    self.cannons
+                        .push(Cannon::new_at_position(id, pos, &mut self.rng));
                 }
                 crate::net::EnemyType::Snake => {
                     let id = self.snakes.len();
@@ -1513,7 +1883,8 @@ impl Game {
                 }
                 crate::net::EnemyType::Wisp => {
                     let id = self.wisps.len();
-                    self.wisps.push(Wisp::new_at_position(id, pos, &mut self.rng));
+                    self.wisps
+                        .push(Wisp::new_at_position(id, pos, &mut self.rng));
                 }
                 crate::net::EnemyType::Guardian => {
                     let id = self.guardians.len();
@@ -1568,7 +1939,8 @@ impl Game {
             self.wave_kill_counts[0] = self.wave_kill_counts[0].saturating_add(1);
             self.explosions.spawn(pos, 7, 0, 0);
             self.sound_events.push(SoundEvent::EnemyKill);
-            self.pending_enemy_kills.push((crate::net::EnemyType::Spider, enemy_id));
+            self.pending_enemy_kills
+                .push((crate::net::EnemyType::Spider, enemy_id));
         }
         for i in killed_cannons {
             let pos = self.cannons[i].pos;
@@ -1578,7 +1950,8 @@ impl Game {
             self.wave_kill_counts[1] = self.wave_kill_counts[1].saturating_add(1);
             self.explosions.spawn(pos, 8, 0, 0);
             self.sound_events.push(SoundEvent::EnemyKill);
-            self.pending_enemy_kills.push((crate::net::EnemyType::Cannon, enemy_id));
+            self.pending_enemy_kills
+                .push((crate::net::EnemyType::Cannon, enemy_id));
         }
         for i in killed_snakes {
             let pos = self.snakes[i].pos;
@@ -1588,7 +1961,8 @@ impl Game {
             self.wave_kill_counts[2] = self.wave_kill_counts[2].saturating_add(1);
             self.explosions.spawn(pos, 9, 0, 0);
             self.sound_events.push(SoundEvent::EnemyKill);
-            self.pending_enemy_kills.push((crate::net::EnemyType::Snake, enemy_id));
+            self.pending_enemy_kills
+                .push((crate::net::EnemyType::Snake, enemy_id));
         }
         for i in killed_wisps {
             let pos = self.wisps[i].pos;
@@ -1598,7 +1972,8 @@ impl Game {
             self.wave_kill_counts[3] = self.wave_kill_counts[3].saturating_add(1);
             self.explosions.spawn(pos, 6, 0, 0);
             self.sound_events.push(SoundEvent::EnemyKill);
-            self.pending_enemy_kills.push((crate::net::EnemyType::Wisp, enemy_id));
+            self.pending_enemy_kills
+                .push((crate::net::EnemyType::Wisp, enemy_id));
         }
     }
 
@@ -1635,7 +2010,11 @@ impl Game {
         }
     }
 
-    fn trail_hits_enemy_segments(trail_segments: &[SlimeTrailSegment], pos: Vec2, radius: f32) -> bool {
+    fn trail_hits_enemy_segments(
+        trail_segments: &[SlimeTrailSegment],
+        pos: Vec2,
+        radius: f32,
+    ) -> bool {
         for segment in trail_segments {
             if pos.distance(segment.pos()) < radius + segment.radius() {
                 return true;
@@ -1688,7 +2067,8 @@ impl Game {
         self.rng = Xoshiro256PlusPlus::seed_from_u64(rng_seed);
 
         let player_scale = player_count.max(1) as u32;
-        let (base_spiders, base_cannons, base_snakes, base_wisps) = Self::wave_base_counts(self.wave);
+        let (base_spiders, base_cannons, base_snakes, base_wisps) =
+            Self::wave_base_counts(self.wave);
         let spider_count = base_spiders.saturating_mul(player_scale) as usize;
         let cannon_count = base_cannons.saturating_mul(player_scale) as usize;
         let wisp_count = base_wisps.saturating_mul(player_scale) as usize;
@@ -1787,20 +2167,37 @@ impl Game {
 
         for id in 0..spider_count {
             self.spiders.push(Spider::new_around_validated(
-                id, player_pos, spawn_distance, &self.chunks, &mut self.rng
+                id,
+                player_pos,
+                spawn_distance,
+                &self.chunks,
+                &mut self.rng,
             ));
         }
 
         for id in 0..cannon_count {
             self.cannons.push(Cannon::new_around_validated(
-                id, player_pos, spawn_distance, &self.chunks, &mut self.rng
+                id,
+                player_pos,
+                spawn_distance,
+                &self.chunks,
+                &mut self.rng,
             ));
         }
 
         for id in 0..snake_count {
-            let previous = if id > 0 { self.snakes.get(id - 1) } else { None };
+            let previous = if id > 0 {
+                self.snakes.get(id - 1)
+            } else {
+                None
+            };
             self.snakes.push(Snake::new_around_validated(
-                id, previous, player_pos, spawn_distance, &self.chunks, &mut self.rng
+                id,
+                previous,
+                player_pos,
+                spawn_distance,
+                &self.chunks,
+                &mut self.rng,
             ));
         }
 
@@ -1813,11 +2210,13 @@ impl Game {
                     player_pos.x + angle.cos() * distance,
                     player_pos.y + angle.sin() * distance,
                 );
-                if !self.chunks.collides_with_obstacle(pos, 8.0) && pos.distance(player_pos) > 50.0 {
+                if !self.chunks.collides_with_obstacle(pos, 8.0) && pos.distance(player_pos) > 50.0
+                {
                     break;
                 }
             }
-            self.wisps.push(Wisp::new_at_position(id, pos, &mut self.rng));
+            self.wisps
+                .push(Wisp::new_at_position(id, pos, &mut self.rng));
         }
     }
 
@@ -1839,7 +2238,8 @@ impl Game {
         };
         if self.snake_chain_len > 0 {
             let total_segments = wave_start.snake_count as usize;
-            self.snake_chain_target = (total_segments + self.snake_chain_len - 1) / self.snake_chain_len;
+            self.snake_chain_target =
+                (total_segments + self.snake_chain_len - 1) / self.snake_chain_len;
         } else {
             self.snake_chain_target = 0;
         }
@@ -1885,7 +2285,7 @@ impl Game {
     }
 
     fn update_gameover(&mut self, input: &Input) {
-        use crate::input::{BUTTON_ATTACK, BUTTON_PHASE, BUTTON_MAP};
+        use crate::input::{BUTTON_ATTACK, BUTTON_MAP, BUTTON_PHASE};
 
         if input.is_pressed(BUTTON_MAP) {
             self.toggle_map();
@@ -2012,7 +2412,8 @@ impl Game {
     fn prune_chat_log(&mut self) {
         let max_age_frames = 1260;
         let current = self.frame_count;
-        self.chat_log.retain(|line| current.saturating_sub(line.frame) <= max_age_frames);
+        self.chat_log
+            .retain(|line| current.saturating_sub(line.frame) <= max_age_frames);
     }
 
     pub fn scroll_player_list(&mut self, delta: i32) {
@@ -2054,7 +2455,9 @@ impl Game {
         let portrait = self.viewport_height > self.viewport_width;
         let dynamic_map = self.mobile_mode || portrait;
         let map_size = if dynamic_map {
-            (self.width.min(self.height) as f64 * 0.9).min(560.0).max(360.0)
+            (self.width.min(self.height) as f64 * 0.9)
+                .min(560.0)
+                .max(360.0)
         } else {
             MAP_OVERLAY_SIZE as f64
         };
@@ -2090,7 +2493,11 @@ impl Game {
         let map_size = map_size as f32;
         let base_world_span = CHUNK_SIZE as f32 * 8.0;
         let pixels_per_world = map_size / base_world_span * self.map_zoom;
-        let world_per_pixel = if pixels_per_world > 0.0 { 1.0 / pixels_per_world } else { 1.0 };
+        let world_per_pixel = if pixels_per_world > 0.0 {
+            1.0 / pixels_per_world
+        } else {
+            1.0
+        };
         let pan_speed = world_per_pixel * 10.0;
 
         if input.axis.x != 0.0 || input.axis.y != 0.0 {
@@ -2137,7 +2544,11 @@ impl Game {
         }
 
         let (map_left, map_top, map_size) = self.map_overlay_rect();
-        if screen_x < map_left || screen_x > map_left + map_size || screen_y < map_top || screen_y > map_top + map_size {
+        if screen_x < map_left
+            || screen_x > map_left + map_size
+            || screen_y < map_top
+            || screen_y > map_top + map_size
+        {
             return;
         }
 
@@ -2283,7 +2694,8 @@ impl Game {
         self.chunks.add_dynamic_obstacle(obstacle_data.clone());
         self.paid_obstacles.push(obstacle);
         self.paid_obstacle_hashes.insert(obstacle.proof_hash);
-        self.paid_obstacle_map.insert(obstacle.proof_hash, obstacle_data);
+        self.paid_obstacle_map
+            .insert(obstacle.proof_hash, obstacle_data);
         true
     }
 
@@ -2291,7 +2703,8 @@ impl Game {
         if let Some(obstacle) = self.paid_obstacle_map.remove(&proof_hash) {
             self.chunks.remove_dynamic_obstacle(&obstacle);
         }
-        self.paid_obstacles.retain(|obs| obs.proof_hash != proof_hash);
+        self.paid_obstacles
+            .retain(|obs| obs.proof_hash != proof_hash);
         self.paid_obstacle_hashes.remove(&proof_hash);
     }
 
@@ -2300,12 +2713,18 @@ impl Game {
             .insert(obstacle.proof_hash, obstacle);
     }
 
-    pub fn take_paid_obstacle_candidate(&mut self, proof_hash: [u8; 32]) -> Option<crate::net::PaidObstacle> {
+    pub fn take_paid_obstacle_candidate(
+        &mut self,
+        proof_hash: [u8; 32],
+    ) -> Option<crate::net::PaidObstacle> {
         self.pending_paid_obstacle_candidates.remove(&proof_hash)
     }
 
     pub fn pending_paid_obstacle_hashes(&self) -> Vec<[u8; 32]> {
-        self.pending_paid_obstacle_candidates.keys().copied().collect()
+        self.pending_paid_obstacle_candidates
+            .keys()
+            .copied()
+            .collect()
     }
 
     pub fn place_paid_obstacle(&mut self, obstacle: crate::net::PaidObstacle) -> bool {
@@ -2330,7 +2749,10 @@ impl Game {
         }
         if !payment::support_valid() {
             payment::prompt_support();
-            self.push_chat_line("System".to_string(), "Payment required for paid ability. Press 4 to open payments.".to_string());
+            self.push_chat_line(
+                "System".to_string(),
+                "Payment required for paid ability. Press 4 to open payments.".to_string(),
+            );
             return false;
         }
         match ability_type {
@@ -2370,13 +2792,14 @@ impl Game {
             crate::net::PaidAbilityType::SlimeTrail => 0.0,
         };
         let nonce = self.frame_count;
-        self.pending_paid_ability_requests.push(PendingPaidAbilityRequest {
-            ability_type,
-            x: pos.x,
-            y: pos.y,
-            radius,
-            nonce,
-        });
+        self.pending_paid_ability_requests
+            .push(PendingPaidAbilityRequest {
+                ability_type,
+                x: pos.x,
+                y: pos.y,
+                radius,
+                nonce,
+            });
         true
     }
 
@@ -2389,12 +2812,18 @@ impl Game {
             .insert(ability.proof_hash, ability);
     }
 
-    pub fn take_paid_ability_candidate(&mut self, proof_hash: [u8; 32]) -> Option<crate::net::PaidAbility> {
+    pub fn take_paid_ability_candidate(
+        &mut self,
+        proof_hash: [u8; 32],
+    ) -> Option<crate::net::PaidAbility> {
         self.pending_paid_ability_candidates.remove(&proof_hash)
     }
 
     pub fn pending_paid_ability_hashes(&self) -> Vec<[u8; 32]> {
-        self.pending_paid_ability_candidates.keys().copied().collect()
+        self.pending_paid_ability_candidates
+            .keys()
+            .copied()
+            .collect()
     }
 
     pub fn apply_paid_ability(&mut self, ability: crate::net::PaidAbility, is_local: bool) -> bool {
@@ -2483,6 +2912,7 @@ impl Game {
         self.pending_attack_hits = 0;
         self.deaths = 0;
         self.player = Player::new_at_position(Vec2::ZERO);
+        self.title_warning.clear();
         self.camera = Camera::new(self.width, self.height, CAMERA_ZOOM);
         self.chunks = ChunkManager::new(self.world_seed);
         self.explored_chunks.clear();
@@ -2507,6 +2937,10 @@ impl Game {
         self.input_history.clear();
         self.remote_simulations.clear();
         self.remote_predictions.clear();
+        self.last_enemy_sync_tick = 0;
+        self.enemy_sync_age_frames = 0;
+        self.enemy_interp = EnemyInterpCache::default();
+        self.enemy_render_snapshot = None;
         self.wave_kill_counts = [0; 4];
         self.wave_kill_targets = [0; 4];
         self.snake_chain_len = 0;
@@ -2556,6 +2990,7 @@ impl Game {
         self.pending_attack_attempts = 0;
         self.pending_attack_hits = 0;
         self.player = Player::new_at_position(Vec2::ZERO);
+        self.title_warning.clear();
         self.camera = Camera::new(self.width, self.height, CAMERA_ZOOM);
         self.chunks = ChunkManager::new(self.world_seed);
         self.explored_chunks.clear();
@@ -2580,6 +3015,10 @@ impl Game {
         self.input_history.clear();
         self.remote_simulations.clear();
         self.remote_predictions.clear();
+        self.last_enemy_sync_tick = 0;
+        self.enemy_sync_age_frames = 0;
+        self.enemy_interp = EnemyInterpCache::default();
+        self.enemy_render_snapshot = None;
         self.wave_kill_counts = [0; 4];
         self.wave_kill_targets = [0; 4];
         self.snake_chain_len = 0;
@@ -2659,10 +3098,7 @@ impl Game {
         // Add wisps (alive or dead so clients can clear dead ones)
         for wisp in &self.wisps {
             enemies.push(EnemyState::new_wisp(
-                wisp.id,
-                wisp.alive,
-                wisp.pos,
-                wisp.dir,
+                wisp.id, wisp.alive, wisp.pos, wisp.dir,
             ));
         }
 
@@ -2676,6 +3112,7 @@ impl Game {
         }
 
         crate::net::EnemySync {
+            tick: self.frame_count,
             wave: self.wave,
             enemies,
         }
@@ -2700,7 +3137,11 @@ impl Game {
     }
 
     fn wave_targets_met(&self) -> bool {
-        for (count, target) in self.wave_kill_counts.iter().zip(self.wave_kill_targets.iter()) {
+        for (count, target) in self
+            .wave_kill_counts
+            .iter()
+            .zip(self.wave_kill_targets.iter())
+        {
             if *target > 0 && *count < *target {
                 return false;
             }
@@ -2793,7 +3234,12 @@ impl Game {
         }
     }
 
-    fn spawn_initial_enemies(&mut self, target_positions: &[Vec2], player_count: usize, current_frame: u32) {
+    fn spawn_initial_enemies(
+        &mut self,
+        target_positions: &[Vec2],
+        player_count: usize,
+        current_frame: u32,
+    ) {
         let initial = player_count.max(1).min(3);
         let mut spawned = 0;
         for _ in 0..initial {
@@ -2806,7 +3252,12 @@ impl Game {
         }
     }
 
-    fn spawn_snake_chain(&mut self, target_positions: &[Vec2], count: usize, current_frame: u32) -> bool {
+    fn spawn_snake_chain(
+        &mut self,
+        target_positions: &[Vec2],
+        count: usize,
+        current_frame: u32,
+    ) -> bool {
         use crate::world::CHUNK_SIZE;
 
         if count == 0 {
@@ -2842,7 +3293,8 @@ impl Game {
                         continue;
                     }
                 }
-                let origin = Vec2::new((chunk.0 * CHUNK_SIZE) as f32, (chunk.1 * CHUNK_SIZE) as f32);
+                let origin =
+                    Vec2::new((chunk.0 * CHUNK_SIZE) as f32, (chunk.1 * CHUNK_SIZE) as f32);
                 if let Some(pos) = Self::random_point_in_chunk(
                     &mut self.rng,
                     origin,
@@ -2910,19 +3362,29 @@ impl Game {
         for segment_index in 0..count {
             let pos = head_pos - tail_dir * (segment_spacing * segment_index as f32);
             let id = self.snakes.len();
-            let dir = if head_dir.length_squared() > 0.0 { head_dir } else { Vec2::UP };
-            self.snakes.push(Snake::new_chain_segment(id, chain_id, segment_index, pos, dir));
+            let dir = if head_dir.length_squared() > 0.0 {
+                head_dir
+            } else {
+                Vec2::UP
+            };
+            self.snakes.push(Snake::new_chain_segment(
+                id,
+                chain_id,
+                segment_index,
+                pos,
+                dir,
+            ));
         }
 
         true
     }
 
-
     fn spawn_enemy_from_weights(&mut self, target_positions: &[Vec2], current_frame: u32) -> bool {
         if self.wave == 0 {
             return false;
         }
-        let (base_spiders, base_cannons, base_snakes, base_wisps) = Self::wave_base_counts(self.wave);
+        let (base_spiders, base_cannons, base_snakes, base_wisps) =
+            Self::wave_base_counts(self.wave);
         let mut weights = [base_spiders, base_cannons, base_snakes, base_wisps];
         if self.snake_chain_target == 0 || self.snake_chain_spawned >= self.snake_chain_target {
             weights[2] = 0;
@@ -2945,7 +3407,12 @@ impl Game {
         self.spawn_enemy_near_players(enemy_type, target_positions, current_frame)
     }
 
-    fn spawn_enemy_near_players(&mut self, enemy_type: crate::net::EnemyType, target_positions: &[Vec2], current_frame: u32) -> bool {
+    fn spawn_enemy_near_players(
+        &mut self,
+        enemy_type: crate::net::EnemyType,
+        target_positions: &[Vec2],
+        current_frame: u32,
+    ) -> bool {
         use crate::world::CHUNK_SIZE;
 
         if target_positions.is_empty() {
@@ -3024,11 +3491,13 @@ impl Game {
                 match enemy_type {
                     crate::net::EnemyType::Spider => {
                         let id = self.spiders.len();
-                        self.spiders.push(Spider::new_at_position(id, pos, &mut self.rng));
+                        self.spiders
+                            .push(Spider::new_at_position(id, pos, &mut self.rng));
                     }
                     crate::net::EnemyType::Cannon => {
                         let id = self.cannons.len();
-                        self.cannons.push(Cannon::new_at_position(id, pos, &mut self.rng));
+                        self.cannons
+                            .push(Cannon::new_at_position(id, pos, &mut self.rng));
                     }
                     crate::net::EnemyType::Snake => {
                         let id = self.snakes.len();
@@ -3037,7 +3506,8 @@ impl Game {
                     }
                     crate::net::EnemyType::Wisp => {
                         let id = self.wisps.len();
-                        self.wisps.push(Wisp::new_at_position(id, pos, &mut self.rng));
+                        self.wisps
+                            .push(Wisp::new_at_position(id, pos, &mut self.rng));
                     }
                     crate::net::EnemyType::Guardian => {
                         let id = self.guardians.len();
@@ -3086,6 +3556,17 @@ impl Game {
     pub fn apply_enemy_sync(&mut self, sync: &crate::net::EnemySync) {
         use crate::net::EnemyType;
 
+        // Ignore stale/duplicate sync packets that can arrive out of order
+        // when relayed through different topology paths.
+        if sync.tick <= self.last_enemy_sync_tick {
+            return;
+        }
+        let previous_tick = self.last_enemy_sync_tick;
+        let sync_dt = sync.tick.saturating_sub(previous_tick).max(1) as f32;
+        self.last_enemy_sync_tick = sync.tick;
+        self.enemy_sync_age_frames = 0;
+        self.enemy_interp.window_frames = sync_dt.clamp(2.0, 18.0);
+
         // Update wave if it changed
         if sync.wave != self.wave {
             self.wave = sync.wave;
@@ -3095,6 +3576,7 @@ impl Game {
             self.snakes.clear();
             self.wisps.clear();
             self.guardians.clear();
+            self.enemy_interp = EnemyInterpCache::default();
         }
 
         // Process each enemy in the sync
@@ -3103,6 +3585,9 @@ impl Game {
                 Some(t) => t,
                 None => continue,
             };
+            let alive = enemy_state.is_alive();
+            let target_pos = enemy_state.pos();
+            let target_dir = enemy_state.dir();
 
             match enemy_type {
                 EnemyType::Spider => {
@@ -3117,11 +3602,25 @@ impl Game {
                             &mut self.rng,
                         ));
                     }
-                    // Update spider state
                     let spider = &mut self.spiders[id];
-                    spider.alive = enemy_state.is_alive();
-                    spider.pos = enemy_state.pos();
-                    spider.dir = enemy_state.dir();
+                    let slot = Self::ensure_interp_slot(&mut self.enemy_interp.spiders, id);
+
+                    if slot.initialized {
+                        let observed_velocity = (target_pos - slot.target_pos) / sync_dt;
+                        slot.velocity = slot.velocity * 0.45 + observed_velocity * 0.55;
+                    } else {
+                        slot.initialized = true;
+                        slot.velocity = Vec2::ZERO;
+                        spider.pos = target_pos;
+                    }
+
+                    slot.target_pos = target_pos;
+                    slot.target_dir = Self::normalized_or(target_dir, spider.dir);
+                    spider.alive = alive;
+                    if !alive {
+                        spider.pos = target_pos;
+                        spider.speed = Vec2::ZERO;
+                    }
                 }
                 EnemyType::Cannon => {
                     let id = enemy_state.id as usize;
@@ -3134,14 +3633,23 @@ impl Game {
                         ));
                     }
                     let cannon = &mut self.cannons[id];
-                    let prev_pos = cannon.pos;
-                    cannon.alive = enemy_state.is_alive();
-                    cannon.pos = enemy_state.pos();
-                    cannon.look_dir = enemy_state.dir();
-                    // Update dir based on movement so wheel spacing matches host view.
-                    let delta = cannon.pos - prev_pos;
-                    if delta.length() > 0.0 {
-                        cannon.dir = delta.normalize();
+                    let slot = Self::ensure_interp_slot(&mut self.enemy_interp.cannons, id);
+
+                    if slot.initialized {
+                        let observed_velocity = (target_pos - slot.target_pos) / sync_dt;
+                        slot.velocity = slot.velocity * 0.45 + observed_velocity * 0.55;
+                    } else {
+                        slot.initialized = true;
+                        slot.velocity = Vec2::ZERO;
+                        cannon.pos = target_pos;
+                    }
+
+                    slot.target_pos = target_pos;
+                    slot.target_dir = Self::normalized_or(target_dir, cannon.look_dir);
+                    cannon.alive = alive;
+                    if !alive {
+                        cannon.pos = target_pos;
+                        cannon.speed = Vec2::ZERO;
                     }
                 }
                 EnemyType::Snake => {
@@ -3161,10 +3669,28 @@ impl Game {
                         ));
                     }
                     let snake = &mut self.snakes[id];
-                    snake.alive = enemy_state.is_alive();
-                    snake.pos = enemy_state.pos();
-                    snake.dir = enemy_state.dir();
-                    snake.size = enemy_state.snake_size();
+                    let slot = Self::ensure_interp_slot(&mut self.enemy_interp.snakes, id);
+                    let target_size = enemy_state.snake_size();
+
+                    if slot.initialized {
+                        let observed_velocity = (target_pos - slot.target_pos) / sync_dt;
+                        slot.velocity = slot.velocity * 0.45 + observed_velocity * 0.55;
+                    } else {
+                        slot.initialized = true;
+                        slot.velocity = Vec2::ZERO;
+                        snake.pos = target_pos;
+                        snake.size = target_size;
+                    }
+
+                    slot.target_pos = target_pos;
+                    slot.target_dir = Self::normalized_or(target_dir, snake.dir);
+                    slot.target_size = target_size;
+                    snake.alive = alive;
+                    if !alive {
+                        snake.pos = target_pos;
+                        snake.speed = Vec2::ZERO;
+                        snake.size = target_size;
+                    }
                 }
                 EnemyType::Wisp => {
                     let id = enemy_state.id as usize;
@@ -3176,9 +3702,23 @@ impl Game {
                         ));
                     }
                     let wisp = &mut self.wisps[id];
-                    wisp.alive = enemy_state.is_alive();
-                    wisp.pos = enemy_state.pos();
-                    wisp.dir = enemy_state.dir();
+                    let slot = Self::ensure_interp_slot(&mut self.enemy_interp.wisps, id);
+
+                    if slot.initialized {
+                        let observed_velocity = (target_pos - slot.target_pos) / sync_dt;
+                        slot.velocity = slot.velocity * 0.45 + observed_velocity * 0.55;
+                    } else {
+                        slot.initialized = true;
+                        slot.velocity = Vec2::ZERO;
+                        wisp.pos = target_pos;
+                    }
+
+                    slot.target_pos = target_pos;
+                    slot.target_dir = Self::normalized_or(target_dir, wisp.dir);
+                    wisp.alive = alive;
+                    if !alive {
+                        wisp.pos = target_pos;
+                    }
                 }
                 EnemyType::Guardian => {
                     let id = enemy_state.id as usize;
@@ -3189,9 +3729,24 @@ impl Game {
                         ));
                     }
                     let guardian = &mut self.guardians[id];
-                    guardian.alive = enemy_state.is_alive();
-                    guardian.pos = enemy_state.pos();
-                    guardian.dir = enemy_state.dir();
+                    let slot = Self::ensure_interp_slot(&mut self.enemy_interp.guardians, id);
+
+                    if slot.initialized {
+                        let observed_velocity = (target_pos - slot.target_pos) / sync_dt;
+                        slot.velocity = slot.velocity * 0.45 + observed_velocity * 0.55;
+                    } else {
+                        slot.initialized = true;
+                        slot.velocity = Vec2::ZERO;
+                        guardian.pos = target_pos;
+                    }
+
+                    slot.target_pos = target_pos;
+                    slot.target_dir = Self::normalized_or(target_dir, guardian.dir);
+                    guardian.alive = alive;
+                    if !alive {
+                        guardian.pos = target_pos;
+                        guardian.speed = Vec2::ZERO;
+                    }
                 }
             }
         }
@@ -3255,7 +3810,10 @@ impl Game {
     }
 
     /// Get all remote player positions (for enemy targeting)
-    pub fn get_all_player_positions(&self, remote_players: &std::collections::HashMap<String, crate::net::RemotePlayer>) -> Vec<Vec2> {
+    pub fn get_all_player_positions(
+        &self,
+        remote_players: &std::collections::HashMap<String, crate::net::RemotePlayer>,
+    ) -> Vec<Vec2> {
         let mut positions = vec![self.player.pos];
         for remote in remote_players.values() {
             if remote.alive {
@@ -3266,7 +3824,11 @@ impl Game {
     }
 
     /// Find the closest player position to a given point
-    pub fn find_closest_player(&self, pos: Vec2, remote_players: &std::collections::HashMap<String, crate::net::RemotePlayer>) -> Vec2 {
+    pub fn find_closest_player(
+        &self,
+        pos: Vec2,
+        remote_players: &std::collections::HashMap<String, crate::net::RemotePlayer>,
+    ) -> Vec2 {
         let mut closest = self.player.pos;
         let mut closest_dist = pos.distance(self.player.pos);
 
@@ -3286,7 +3848,10 @@ impl Game {
     /// Apply debug commands from JS/console.
     pub fn apply_debug_command(&mut self, command: &str) -> Result<String, String> {
         let mut parts = command.split_whitespace();
-        let cmd = parts.next().ok_or_else(|| "empty command".to_string())?.to_lowercase();
+        let cmd = parts
+            .next()
+            .ok_or_else(|| "empty command".to_string())?
+            .to_lowercase();
 
         match cmd.as_str() {
             "help" => Ok("commands: help, start_game, teleport x y, set_wave n, set_kills n, set_deaths n, spawn_wave [players], spawn_counts spiders cannons snakes [wisps], clear_enemies, kill_player, respawn, drop_obstacle x y radius variant [proof_hash], bind_ability <shield|shockwave|slow_spawn|speed_boost|slime_trail> <KeyX>".to_string()),
@@ -3439,7 +4004,6 @@ impl Game {
 
         closest
     }
-
 }
 
 impl RemoteSimulation {
@@ -3479,7 +4043,8 @@ impl RemoteSimulation {
         self.last_sim_frame = frame;
         self.last_authoritative_frame = frame;
         self.snapshots.clear();
-        self.snapshots.push_back((frame, self.player.clone(), self.last_input));
+        self.snapshots
+            .push_back((frame, self.player.clone(), self.last_input));
         self.rollback_from = None;
     }
 
@@ -3487,7 +4052,8 @@ impl RemoteSimulation {
         if self.pending_inputs.iter().any(|entry| entry.frame == frame) {
             return;
         }
-        self.pending_inputs.push(crate::net::InputFrame { frame, input });
+        self.pending_inputs
+            .push(crate::net::InputFrame { frame, input });
         self.pending_inputs.sort_by_key(|entry| entry.frame);
 
         if frame <= self.last_sim_frame {
@@ -3517,7 +4083,11 @@ impl RemoteSimulation {
 
         let mut frame = self.last_sim_frame + 1;
         while frame <= target_frame {
-            if let Some(index) = self.pending_inputs.iter().position(|entry| entry.frame == frame) {
+            if let Some(index) = self
+                .pending_inputs
+                .iter()
+                .position(|entry| entry.frame == frame)
+            {
                 let entry = self.pending_inputs.remove(index);
                 self.last_input = entry.input;
             }
@@ -3530,7 +4100,8 @@ impl RemoteSimulation {
             let input = Input::from_raw(self.last_input, prev_input);
             self.player.update_infinite(&input, chunks);
 
-            self.snapshots.push_back((frame, self.player.clone(), self.last_input));
+            self.snapshots
+                .push_back((frame, self.player.clone(), self.last_input));
             while self.snapshots.len() > (ROLLBACK_WINDOW_FRAMES as usize + 1) {
                 self.snapshots.pop_front();
             }
@@ -3538,11 +4109,13 @@ impl RemoteSimulation {
         }
 
         self.last_sim_frame = target_frame;
-        self.pending_inputs.retain(|entry| entry.frame > target_frame.saturating_sub(ROLLBACK_WINDOW_FRAMES));
+        self.pending_inputs
+            .retain(|entry| entry.frame > target_frame.saturating_sub(ROLLBACK_WINDOW_FRAMES));
     }
 
     fn predicted_state(&self) -> PlayerState {
         PlayerState::new(
+            self.last_sim_frame,
             self.player.pos,
             self.player.look_dir,
             self.player.move_dir,
@@ -3572,8 +4145,12 @@ fn parse_proof_hash(hex: &str) -> Result<[u8; 32], String> {
 
     let mut bytes = [0u8; 32];
     for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let hi = (chunk[0] as char).to_digit(16).ok_or_else(|| "invalid hex".to_string())?;
-        let lo = (chunk[1] as char).to_digit(16).ok_or_else(|| "invalid hex".to_string())?;
+        let hi = (chunk[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| "invalid hex".to_string())?;
+        let lo = (chunk[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| "invalid hex".to_string())?;
         bytes[i] = ((hi << 4) | lo) as u8;
     }
     Ok(bytes)

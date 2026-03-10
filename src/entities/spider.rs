@@ -21,8 +21,16 @@ impl Spider {
         let y = rng.gen::<f32>() * 100.0 - 50.0;
 
         let pos = Vec2::new(
-            if x < 0.0 { -50.0 + x } else { screen_width + 50.0 + x },
-            if y < 0.0 { -50.0 + y } else { screen_height + 50.0 + y },
+            if x < 0.0 {
+                -50.0 + x
+            } else {
+                screen_width + 50.0 + x
+            },
+            if y < 0.0 {
+                -50.0 + y
+            } else {
+                screen_height + 50.0 + y
+            },
         );
 
         // Initialize dir toward screen center so legs are visible
@@ -35,16 +43,18 @@ impl Spider {
             pos,
             speed: Vec2::ZERO,
             dir,
-            target_offset: Vec2::new(
-                rng.gen::<f32>() * 1.2 - 0.6,
-                rng.gen::<f32>() * 1.2 - 0.6,
-            ),
+            target_offset: Vec2::new(rng.gen::<f32>() * 1.2 - 0.6, rng.gen::<f32>() * 1.2 - 0.6),
         }
     }
 
     /// Spawn spider at a distance from player position (for infinite world)
     /// Checks obstacle collision and finds valid spawn position
-    pub fn new_around<R: Rng>(id: usize, player_pos: Vec2, spawn_distance: f32, rng: &mut R) -> Self {
+    pub fn new_around<R: Rng>(
+        id: usize,
+        player_pos: Vec2,
+        spawn_distance: f32,
+        rng: &mut R,
+    ) -> Self {
         let pos = Self::find_valid_spawn(player_pos, spawn_distance, 6.0, rng);
 
         // Initialize dir toward player so legs are visible from spawn
@@ -56,15 +66,17 @@ impl Spider {
             pos,
             speed: Vec2::ZERO,
             dir,
-            target_offset: Vec2::new(
-                rng.gen::<f32>() * 1.2 - 0.6,
-                rng.gen::<f32>() * 1.2 - 0.6,
-            ),
+            target_offset: Vec2::new(rng.gen::<f32>() * 1.2 - 0.6, rng.gen::<f32>() * 1.2 - 0.6),
         }
     }
 
     /// Find a valid spawn position that doesn't overlap with obstacles
-    fn find_valid_spawn<R: Rng>(player_pos: Vec2, spawn_distance: f32, _radius: f32, rng: &mut R) -> Vec2 {
+    fn find_valid_spawn<R: Rng>(
+        player_pos: Vec2,
+        spawn_distance: f32,
+        _radius: f32,
+        rng: &mut R,
+    ) -> Vec2 {
         // Try up to 10 times to find a valid position
         for _ in 0..10 {
             let angle = rng.gen::<f32>() * std::f32::consts::TAU;
@@ -122,10 +134,7 @@ impl Spider {
             pos,
             speed: Vec2::ZERO,
             dir,
-            target_offset: Vec2::new(
-                rng.gen::<f32>() * 1.2 - 0.6,
-                rng.gen::<f32>() * 1.2 - 0.6,
-            ),
+            target_offset: Vec2::new(rng.gen::<f32>() * 1.2 - 0.6, rng.gen::<f32>() * 1.2 - 0.6),
         }
     }
 
@@ -136,10 +145,7 @@ impl Spider {
             pos,
             speed: Vec2::ZERO,
             dir: Vec2::new(0.0, -1.0),
-            target_offset: Vec2::new(
-                rng.gen::<f32>() * 1.2 - 0.6,
-                rng.gen::<f32>() * 1.2 - 0.6,
-            ),
+            target_offset: Vec2::new(rng.gen::<f32>() * 1.2 - 0.6, rng.gen::<f32>() * 1.2 - 0.6),
         }
     }
 
@@ -148,11 +154,19 @@ impl Spider {
     }
 
     /// Update for infinite world - checks obstacle collisions
-    pub fn update_infinite(&mut self, player_pos: Vec2, chunks: &ChunkManager) -> Option<SpiderEvent> {
+    pub fn update_infinite(
+        &mut self,
+        player_pos: Vec2,
+        chunks: &ChunkManager,
+    ) -> Option<SpiderEvent> {
         self.update_with_chunks(player_pos, Some(chunks))
     }
 
-    fn update_with_chunks(&mut self, player_pos: Vec2, chunks: Option<&ChunkManager>) -> Option<SpiderEvent> {
+    fn update_with_chunks(
+        &mut self,
+        player_pos: Vec2,
+        chunks: Option<&ChunkManager>,
+    ) -> Option<SpiderEvent> {
         if !self.alive {
             return None;
         }

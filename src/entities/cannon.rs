@@ -25,8 +25,16 @@ impl Cannon {
         let y = rng.gen::<f32>() * 100.0 - 50.0;
 
         let pos = Vec2::new(
-            if x < 0.0 { -10.0 + x } else { screen_width + 10.0 + x },
-            if y < 0.0 { -10.0 + y } else { screen_height + 10.0 + y },
+            if x < 0.0 {
+                -10.0 + x
+            } else {
+                screen_width + 10.0 + x
+            },
+            if y < 0.0 {
+                -10.0 + y
+            } else {
+                screen_height + 10.0 + y
+            },
         );
 
         Self {
@@ -36,16 +44,18 @@ impl Cannon {
             speed: Vec2::ZERO,
             dir: Vec2::ZERO,
             look_dir: Vec2::ZERO,
-            target_offset: Vec2::new(
-                rng.gen::<f32>() * 1.2 - 0.6,
-                rng.gen::<f32>() * 1.2 - 0.6,
-            ),
+            target_offset: Vec2::new(rng.gen::<f32>() * 1.2 - 0.6, rng.gen::<f32>() * 1.2 - 0.6),
             shoot_timer: (id * 10) as u32,
         }
     }
 
     /// Spawn cannon at a distance from player position (for infinite world)
-    pub fn new_around<R: Rng>(id: usize, player_pos: Vec2, spawn_distance: f32, rng: &mut R) -> Self {
+    pub fn new_around<R: Rng>(
+        id: usize,
+        player_pos: Vec2,
+        spawn_distance: f32,
+        rng: &mut R,
+    ) -> Self {
         // Random angle around the player
         let angle = rng.gen::<f32>() * std::f32::consts::TAU;
         let distance = spawn_distance + rng.gen::<f32>() * 100.0;
@@ -62,10 +72,7 @@ impl Cannon {
             speed: Vec2::ZERO,
             dir: Vec2::ZERO,
             look_dir: Vec2::ZERO,
-            target_offset: Vec2::new(
-                rng.gen::<f32>() * 1.2 - 0.6,
-                rng.gen::<f32>() * 1.2 - 0.6,
-            ),
+            target_offset: Vec2::new(rng.gen::<f32>() * 1.2 - 0.6, rng.gen::<f32>() * 1.2 - 0.6),
             shoot_timer: (id * 10) as u32,
         }
     }
@@ -102,10 +109,7 @@ impl Cannon {
             speed: Vec2::ZERO,
             dir: Vec2::ZERO,
             look_dir: Vec2::ZERO,
-            target_offset: Vec2::new(
-                rng.gen::<f32>() * 1.2 - 0.6,
-                rng.gen::<f32>() * 1.2 - 0.6,
-            ),
+            target_offset: Vec2::new(rng.gen::<f32>() * 1.2 - 0.6, rng.gen::<f32>() * 1.2 - 0.6),
             shoot_timer: (id * 10) as u32,
         }
     }
@@ -118,15 +122,18 @@ impl Cannon {
             speed: Vec2::ZERO,
             dir: Vec2::ZERO,
             look_dir: Vec2::ZERO,
-            target_offset: Vec2::new(
-                rng.gen::<f32>() * 1.2 - 0.6,
-                rng.gen::<f32>() * 1.2 - 0.6,
-            ),
+            target_offset: Vec2::new(rng.gen::<f32>() * 1.2 - 0.6, rng.gen::<f32>() * 1.2 - 0.6),
             shoot_timer: (id * 10) as u32,
         }
     }
 
-    pub fn update(&mut self, player_pos: Vec2, frame_count: u32, screen_width: f32, screen_height: f32) -> Option<CannonEvent> {
+    pub fn update(
+        &mut self,
+        player_pos: Vec2,
+        frame_count: u32,
+        screen_width: f32,
+        screen_height: f32,
+    ) -> Option<CannonEvent> {
         if !self.alive {
             return None;
         }
@@ -157,20 +164,31 @@ impl Cannon {
         self.look_dir = target.normalize();
 
         // Shooting (only when on screen)
-        let on_screen = self.pos.x > 0.0 && self.pos.x < screen_width
-            && self.pos.y > 0.0 && self.pos.y < screen_height;
+        let on_screen = self.pos.x > 0.0
+            && self.pos.x < screen_width
+            && self.pos.y > 0.0
+            && self.pos.y < screen_height;
 
         if on_screen && (frame_count + self.shoot_timer) % 100 == 0 {
             let projectile_pos = self.pos + self.look_dir * 4.0;
             let projectile_speed = self.look_dir * PROJECTILE_SPEED;
-            return Some(CannonEvent::Shoot { pos: projectile_pos, speed: projectile_speed });
+            return Some(CannonEvent::Shoot {
+                pos: projectile_pos,
+                speed: projectile_speed,
+            });
         }
 
         None
     }
 
     /// Update for infinite world - takes whether cannon is on screen and chunks for collision
-    pub fn update_infinite(&mut self, player_pos: Vec2, frame_count: u32, on_screen: bool, chunks: &ChunkManager) -> Option<CannonEvent> {
+    pub fn update_infinite(
+        &mut self,
+        player_pos: Vec2,
+        frame_count: u32,
+        on_screen: bool,
+        chunks: &ChunkManager,
+    ) -> Option<CannonEvent> {
         if !self.alive {
             return None;
         }
@@ -224,7 +242,10 @@ impl Cannon {
         if on_screen && (frame_count + self.shoot_timer) % 100 == 0 {
             let projectile_pos = self.pos + self.look_dir * 4.0;
             let projectile_speed = self.look_dir * PROJECTILE_SPEED;
-            return Some(CannonEvent::Shoot { pos: projectile_pos, speed: projectile_speed });
+            return Some(CannonEvent::Shoot {
+                pos: projectile_pos,
+                speed: projectile_speed,
+            });
         }
 
         None

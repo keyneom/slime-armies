@@ -16,8 +16,9 @@ pub struct RemotePlayer {
 
     // For interpolation
     target_pos: Vec2,
-    prev_pos: Vec2,
-    interpolation_t: f32,
+    target_velocity: Vec2,
+    avg_update_delta_frames: f32,
+    last_state_frame: u32,
     last_update_frame: u32,
 }
 
@@ -35,16 +36,32 @@ impl RemotePlayer {
             phasing: state.is_phasing(),
             shielded: state.is_shielded(),
             target_pos: pos,
-            prev_pos: pos,
-            interpolation_t: 1.0,
+            target_velocity: Vec2::ZERO,
+            avg_update_delta_frames: 6.0,
+            last_state_frame: state.sim_frame(),
             last_update_frame: frame,
         }
     }
 
     /// Update with new state from network
     pub fn update_state(&mut self, state: &PlayerState, frame: u32) {
-        self.prev_pos = self.pos;
-        self.target_pos = state.pos();
+        // Drop stale/duplicate state to avoid out-of-order jitter and
+        // interpolation restarts on identical relay copies.
+        if state.sim_frame() <= self.last_state_frame {
+            self.last_update_frame = frame;
+            return;
+        }
+        let next_target = state.pos();
+        let sim_delta = state
+            .sim_frame()
+            .saturating_sub(self.last_state_frame)
+            .max(1) as f32;
+        let observed_velocity = (next_target - self.target_pos) / sim_delta;
+        self.target_velocity = self.target_velocity * 0.55 + observed_velocity * 0.45;
+        let arrival_delta = frame.saturating_sub(self.last_update_frame).max(1) as f32;
+        self.avg_update_delta_frames =
+            (self.avg_update_delta_frames * 0.75 + arrival_delta * 0.25).clamp(2.0, 14.0);
+        self.target_pos = next_target;
         self.look_dir = state.look_dir();
         self.move_dir = state.move_dir();
         self.alive = state.is_alive();
@@ -52,14 +69,14 @@ impl RemotePlayer {
         self.blocking = state.is_blocking();
         self.phasing = state.is_phasing();
         self.shielded = state.is_shielded();
-        self.interpolation_t = 0.0;
+        self.last_state_frame = state.sim_frame();
         self.last_update_frame = frame;
     }
 
     pub fn apply_predicted_state(&mut self, state: &PlayerState) {
         let pos = state.pos();
-        self.prev_pos = pos;
         self.target_pos = pos;
+        self.target_velocity = Vec2::ZERO;
         self.pos = pos;
         self.look_dir = state.look_dir();
         self.move_dir = state.move_dir();
@@ -68,19 +85,18 @@ impl RemotePlayer {
         self.blocking = state.is_blocking();
         self.phasing = state.is_phasing();
         self.shielded = state.is_shielded();
-        self.interpolation_t = 1.0;
     }
 
     /// Interpolate position each frame
     pub fn update(&mut self) {
-        // Smooth interpolation over ~6 frames
-        self.interpolation_t = (self.interpolation_t + 0.17).min(1.0);
+        let predict_frames = (self.avg_update_delta_frames * 0.5).clamp(0.0, 4.0);
+        let predicted_target = self.target_pos + self.target_velocity * predict_frames;
+        let blend = (2.4 / self.avg_update_delta_frames.max(2.0)).clamp(0.18, 0.60);
+        self.pos = self.pos.lerp(predicted_target, blend);
 
-        // Linear interpolation
-        self.pos = Vec2::new(
-            self.prev_pos.x + (self.target_pos.x - self.prev_pos.x) * self.interpolation_t,
-            self.prev_pos.y + (self.target_pos.y - self.prev_pos.y) * self.interpolation_t,
-        );
+        if self.move_dir.length_squared() == 0.0 && self.target_velocity.length_squared() > 0.0001 {
+            self.move_dir = self.target_velocity.normalize();
+        }
     }
 
     /// Check if this player hasn't been updated for too long (disconnected)
@@ -90,5 +106,66 @@ impl RemotePlayer {
 
     pub fn last_update_frame(&self) -> u32 {
         self.last_update_frame
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignores_stale_and_duplicate_frames() {
+        let initial = PlayerState::new(
+            10,
+            Vec2::new(0.0, 0.0),
+            Vec2::RIGHT,
+            Vec2::RIGHT,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        let mut remote = RemotePlayer::new("test".to_string(), &initial, 10);
+
+        let newer = PlayerState::new(
+            12,
+            Vec2::new(100.0, 0.0),
+            Vec2::RIGHT,
+            Vec2::RIGHT,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        remote.update_state(&newer, 20);
+        remote.update();
+        let pos_after_new = remote.pos;
+
+        // Duplicate frame should be ignored.
+        remote.update_state(&newer, 21);
+        remote.update();
+        let pos_after_duplicate = remote.pos;
+
+        // Older frame should be ignored.
+        let stale = PlayerState::new(
+            11,
+            Vec2::new(-100.0, 0.0),
+            Vec2::LEFT,
+            Vec2::LEFT,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        remote.update_state(&stale, 22);
+        remote.update();
+        let pos_after_stale = remote.pos;
+
+        assert!(pos_after_new.x >= 0.0);
+        assert!(pos_after_duplicate.x >= pos_after_new.x);
+        assert!(pos_after_stale.x >= pos_after_duplicate.x);
     }
 }

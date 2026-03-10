@@ -196,6 +196,12 @@ async fn message_loop<M: Messenger>(
             .collect::<FuturesUnordered<_>>();
 
         let mut next_peer_message_out = next_peer_messages_out.next().fuse();
+        let mut next_signaling_event = if signaling_attached {
+            Either::Left(events_receiver.next())
+        } else {
+            Either::Right(std::future::pending())
+        }
+        .fuse();
 
         select! {
             _  = &mut timeout => {
@@ -210,7 +216,7 @@ async fn message_loop<M: Messenger>(
                 }
             }
 
-            message = events_receiver.next().fuse() => {
+            message = next_signaling_event => {
                 if let Some(event) = message {
                     debug!("{event:?}");
                     match event {
@@ -276,6 +282,12 @@ async fn message_loop<M: Messenger>(
                             }
                         },
                     }
+                } else if signaling_attached {
+                    // Signaling stream closed (expected after detach or transient disconnect).
+                    // Do not keep polling a closed receiver; that would spin and starve
+                    // data-channel processing in the overlay loop.
+                    signaling_attached = false;
+                    warn!("signaling event stream closed; continuing with existing data channels");
                 }
             }
 

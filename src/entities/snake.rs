@@ -21,15 +21,29 @@ pub struct Snake {
 }
 
 impl Snake {
-    pub fn new<R: Rng>(id: usize, previous: Option<&Snake>, screen_width: f32, screen_height: f32, rng: &mut R) -> Self {
+    pub fn new<R: Rng>(
+        id: usize,
+        previous: Option<&Snake>,
+        screen_width: f32,
+        screen_height: f32,
+        rng: &mut R,
+    ) -> Self {
         let pos = if let Some(prev) = previous {
             prev.pos
         } else {
             let x = rng.gen::<f32>() * 100.0 - 50.0;
             let y = rng.gen::<f32>() * 100.0 - 50.0;
             Vec2::new(
-                if x < 0.0 { -50.0 + x } else { screen_width + 50.0 + x },
-                if y < 0.0 { -50.0 + y } else { screen_height + 50.0 + y },
+                if x < 0.0 {
+                    -50.0 + x
+                } else {
+                    screen_width + 50.0 + x
+                },
+                if y < 0.0 {
+                    -50.0 + y
+                } else {
+                    screen_height + 50.0 + y
+                },
             )
         };
 
@@ -50,7 +64,13 @@ impl Snake {
     }
 
     /// Spawn snake segment at a distance from player position (for infinite world)
-    pub fn new_around<R: Rng>(id: usize, previous: Option<&Snake>, player_pos: Vec2, spawn_distance: f32, rng: &mut R) -> Self {
+    pub fn new_around<R: Rng>(
+        id: usize,
+        previous: Option<&Snake>,
+        player_pos: Vec2,
+        spawn_distance: f32,
+        rng: &mut R,
+    ) -> Self {
         let pos = if let Some(prev) = previous {
             prev.pos
         } else {
@@ -128,7 +148,11 @@ impl Snake {
     }
 
     pub fn new_at_position(id: usize, previous: Option<&Snake>, pos: Vec2) -> Self {
-        let spawn_pos = if let Some(prev) = previous { prev.pos } else { pos };
+        let spawn_pos = if let Some(prev) = previous {
+            prev.pos
+        } else {
+            pos
+        };
         let segment_index = id as u16;
         let size = (17.0 - segment_index as f32).max(9.0);
 
@@ -144,7 +168,13 @@ impl Snake {
         }
     }
 
-    pub fn new_chain_segment(id: usize, chain_id: u16, segment_index: usize, pos: Vec2, dir: Vec2) -> Self {
+    pub fn new_chain_segment(
+        id: usize,
+        chain_id: u16,
+        segment_index: usize,
+        pos: Vec2,
+        dir: Vec2,
+    ) -> Self {
         let size = (17.0 - segment_index as f32).max(9.0);
         Self {
             id,

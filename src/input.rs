@@ -4,9 +4,9 @@ pub const BUTTON_UP: u16 = 0b0000_0000_0000_0001;
 pub const BUTTON_DOWN: u16 = 0b0000_0000_0000_0010;
 pub const BUTTON_LEFT: u16 = 0b0000_0000_0000_0100;
 pub const BUTTON_RIGHT: u16 = 0b0000_0000_0000_1000;
-pub const BUTTON_ATTACK: u16 = 0b0000_0000_0001_0000;  // Z key / Space
-pub const BUTTON_PHASE: u16 = 0b0000_0000_0010_0000;   // X key / Shift (quantum phase)
-pub const BUTTON_MAP: u16 = 0b0000_0000_0100_0000;     // M key / Map toggle
+pub const BUTTON_ATTACK: u16 = 0b0000_0000_0001_0000; // Z key / Space
+pub const BUTTON_PHASE: u16 = 0b0000_0000_0010_0000; // X key / Shift (quantum phase)
+pub const BUTTON_MAP: u16 = 0b0000_0000_0100_0000; // M key / Map toggle
 pub const BUTTON_ABILITY1: u16 = 0b0000_0000_1000_0000; // R key / Bubble shield
 pub const BUTTON_ABILITY2: u16 = 0b0000_0001_0000_0000; // F key / Shockwave
 
