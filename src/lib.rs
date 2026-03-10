@@ -2417,6 +2417,7 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 // All players broadcast their kills (authoritative from killer's machine)
                 let kills = state_ref.game.take_pending_kills();
                 let player_pos = state_ref.game.player.pos;
+                let mut outgoing_kill_events: Vec<net::EnemyKill> = Vec::new();
                 for (enemy_type, enemy_id) in kills {
                     state_ref.network.record_local_kill(enemy_type);
                     let killer_hash = state_ref.network.local_peer_hash.unwrap_or(0);
@@ -2426,7 +2427,7 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                         enemy_id as u64,
                         state_ref.game.frame_count as u64,
                     );
-                    state_ref.network.send_enemy_kill(net::EnemyKill {
+                    outgoing_kill_events.push(net::EnemyKill {
                         enemy_type: enemy_type as u8,
                         enemy_id,
                         killer_x: player_pos.x,
@@ -2434,6 +2435,9 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                         killer_hash,
                         event_id,
                     });
+                }
+                if !outgoing_kill_events.is_empty() {
+                    state_ref.network.send_enemy_kills(outgoing_kill_events);
                 }
 
                 let (attack_attempts, attack_hits) = state_ref.game.take_pending_attack_stats();

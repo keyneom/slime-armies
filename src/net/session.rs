@@ -1,11 +1,11 @@
 use crate::math::Vec2;
 use crate::net::{
     AreaAuthorityEntry, AreaAuthorityUpdate, CannonShot, ChatMessage, EnemyDamage, EnemyKill,
-    EnemySync, InputFrame, InputFrameBatch, InputFrameEntry, NetMessage, PaidAbility,
-    PaidAbilityAck, PaidAbilityType, PaidNameAck, PaidNameReservation, PaidNameSync, PaidObstacle,
-    PaidObstacleAck, PaidObstacleSync, Ping, PlayerDeath, PlayerState, PlayerStateBatch,
-    PlayerStateEntry, PlayerStatsSnapshot, Pong, ProjectileReflection, RemotePlayer,
-    SupernodeScore, TopologyUpdate, VoteMute, WaveStart,
+    EnemyKillBatch, EnemySync, InputFrame, InputFrameBatch, InputFrameEntry, NetMessage,
+    PaidAbility, PaidAbilityAck, PaidAbilityType, PaidNameAck, PaidNameReservation, PaidNameSync,
+    PaidObstacle, PaidObstacleAck, PaidObstacleSync, Ping, PlayerDeath, PlayerState,
+    PlayerStateBatch, PlayerStateEntry, PlayerStatsSnapshot, Pong, ProjectileReflection,
+    RemotePlayer, SupernodeScore, TopologyUpdate, VoteMute, WaveStart,
 };
 use crate::world::CHUNK_SIZE;
 use js_sys;
@@ -210,7 +210,7 @@ pub struct NetworkSession {
 
 impl NetworkSession {
     const MAX_SUPERNODES: usize = 256;
-    const MAX_FANOUT: usize = 12;
+    const MAX_FANOUT: usize = 16;
     const MIN_FANOUT: usize = 2;
     const PEER_HANDSHAKE_GRACE_FRAMES: u32 = 240;
     const AREA_GROUP_CHUNKS: i32 = 4;
@@ -222,9 +222,9 @@ impl NetworkSession {
     const RELAY_FAILOVER_COOLDOWN_FRAMES: u32 = 120;
     const RELAY_FAILOVER_MIN_SAMPLES: u8 = 2;
     const RELAY_HANDOFF_DUPLEX_FRAMES: u32 = 24;
-    const LEAF_LINK_CAP: usize = 5;
-    const SUPERNODE_LINK_CAP: usize = 16;
-    const ROOT_LINK_CAP: usize = 14;
+    const LEAF_LINK_CAP: usize = 7;
+    const SUPERNODE_LINK_CAP: usize = 24;
+    const ROOT_LINK_CAP: usize = 28;
     const DISCOVERY_MIN_ATTACH_FRAMES: u32 = 180;
     const SYNC_TRACE_PERIOD_FRAMES: u32 = 60;
     const SYNC_STALE_WARN_FRAMES: u32 = 180;
@@ -318,15 +318,16 @@ impl NetworkSession {
     fn choose_dynamic_fanout(total_nodes: usize) -> usize {
         let fanout = match total_nodes {
             0..=3 => 2,
-            4..=8 => 3,
-            9..=16 => 4,
-            17..=32 => 5,
-            33..=64 => 6,
-            65..=128 => 7,
-            129..=512 => 8,
-            513..=2048 => 9,
-            2049..=8192 => 10,
-            _ => 12,
+            4..=8 => 4,
+            9..=16 => 5,
+            17..=32 => 6,
+            33..=64 => 7,
+            65..=128 => 8,
+            129..=256 => 9,
+            257..=512 => 10,
+            513..=2048 => 12,
+            2049..=8192 => 14,
+            _ => 16,
         };
         fanout.clamp(Self::MIN_FANOUT, Self::MAX_FANOUT)
     }
@@ -1111,6 +1112,11 @@ impl NetworkSession {
                 }
                 NetMessage::EnemyKillEvent(kill) => {
                     enemy_kills.push((peer_id, origin_hash, kill));
+                }
+                NetMessage::EnemyKillBatchEvent(batch) => {
+                    for kill in batch.kills {
+                        enemy_kills.push((peer_id.clone(), origin_hash, kill));
+                    }
                 }
                 NetMessage::PlayerDeathEvent(death) => {
                     player_deaths.push((peer_id, origin_hash, death));
@@ -4485,6 +4491,23 @@ impl NetworkSession {
     /// Send enemy kill event to all peers
     pub fn send_enemy_kill(&mut self, kill: EnemyKill) {
         let msg = NetMessage::EnemyKillEvent(kill).to_bytes();
+        if self.is_host {
+            self.send_downstream_or_broadcast(msg, None);
+        } else {
+            self.send_upstream_or_broadcast(msg);
+        }
+    }
+
+    /// Send enemy kill events as a single batched message.
+    pub fn send_enemy_kills(&mut self, kills: Vec<EnemyKill>) {
+        if kills.is_empty() {
+            return;
+        }
+        if kills.len() == 1 {
+            self.send_enemy_kill(kills[0]);
+            return;
+        }
+        let msg = NetMessage::EnemyKillBatchEvent(EnemyKillBatch { kills }).to_bytes();
         if self.is_host {
             self.send_downstream_or_broadcast(msg, None);
         } else {

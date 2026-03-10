@@ -243,14 +243,7 @@ impl Player {
 
     /// Block collision - block_pos at look_dir * 2, check 7.5 + radius
     pub fn collide_block(&self, target: Vec2, radius: f32) -> bool {
-        if !self.alive {
-            return false;
-        }
-        // Bubble shield blocks from all sides while active.
-        if self.is_shielded() {
-            return self.pos.distance(target) < 5.5 * CREATURE_SCALE + radius;
-        }
-        if !self.blocking {
+        if !self.alive || !self.blocking {
             return false;
         }
         let look = self.look_dir.normalize();

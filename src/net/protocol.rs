@@ -765,6 +765,43 @@ pub struct EnemyKill {
     pub event_id: u64,
 }
 
+/// Batched enemy kill events to reduce per-message overhead
+#[derive(Debug, Clone)]
+pub struct EnemyKillBatch {
+    pub kills: Vec<EnemyKill>,
+}
+
+impl EnemyKillBatch {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let count = self.kills.len().min(u16::MAX as usize);
+        let mut bytes = Vec::with_capacity(2 + count * 27);
+        bytes.extend_from_slice(&(count as u16).to_le_bytes());
+        for kill in self.kills.iter().take(count) {
+            bytes.extend_from_slice(&kill.to_bytes());
+        }
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 2 {
+            return None;
+        }
+        let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        let mut kills = Vec::with_capacity(count);
+        let mut offset = 2;
+        for _ in 0..count {
+            if offset + 27 > bytes.len() {
+                break;
+            }
+            if let Some(kill) = EnemyKill::from_bytes(&bytes[offset..offset + 27]) {
+                kills.push(kill);
+            }
+            offset += 27;
+        }
+        Some(Self { kills })
+    }
+}
+
 impl EnemyKill {
     pub fn to_bytes(&self) -> [u8; 27] {
         let mut bytes = [0u8; 27];
@@ -1397,6 +1434,8 @@ pub enum NetMessage {
     WaveStartEvent(WaveStart),
     /// Enemy kill event - authoritative from killer's machine
     EnemyKillEvent(EnemyKill),
+    /// Batched enemy kill events
+    EnemyKillBatchEvent(EnemyKillBatch),
     /// Player death event - authoritative from victim's machine
     PlayerDeathEvent(PlayerDeath),
     /// Chat message
@@ -1478,6 +1517,11 @@ impl NetMessage {
             NetMessage::EnemyKillEvent(kill) => {
                 let mut bytes = vec![6u8]; // Message type 6
                 bytes.extend_from_slice(&kill.to_bytes());
+                bytes
+            }
+            NetMessage::EnemyKillBatchEvent(batch) => {
+                let mut bytes = vec![29u8]; // Message type 29
+                bytes.extend_from_slice(&batch.to_bytes());
                 bytes
             }
             NetMessage::PlayerDeathEvent(death) => {
@@ -1615,6 +1659,7 @@ impl NetMessage {
             4 => EnemyDamage::from_bytes(&bytes[1..]).map(NetMessage::EnemyDamageEvent),
             5 => WaveStart::from_bytes(&bytes[1..]).map(NetMessage::WaveStartEvent),
             6 => EnemyKill::from_bytes(&bytes[1..]).map(NetMessage::EnemyKillEvent),
+            29 => EnemyKillBatch::from_bytes(&bytes[1..]).map(NetMessage::EnemyKillBatchEvent),
             7 => PlayerDeath::from_bytes(&bytes[1..]).map(NetMessage::PlayerDeathEvent),
             16 => ChatMessage::from_bytes(&bytes[1..]).map(NetMessage::ChatMessageEvent),
             17 => VoteMute::from_bytes(&bytes[1..]).map(NetMessage::VoteMuteEvent),
@@ -1695,6 +1740,36 @@ mod tests {
         assert_eq!(decoded.y, reflection.y);
         assert_eq!(decoded.vx, reflection.vx);
         assert_eq!(decoded.vy, reflection.vy);
+    }
+
+    #[test]
+    fn enemy_kill_batch_roundtrip() {
+        let kills = vec![
+            EnemyKill {
+                enemy_type: 0,
+                enemy_id: 3,
+                killer_x: 10.0,
+                killer_y: -4.0,
+                killer_hash: 12,
+                event_id: 1001,
+            },
+            EnemyKill {
+                enemy_type: 2,
+                enemy_id: 9,
+                killer_x: 7.5,
+                killer_y: 6.0,
+                killer_hash: 12,
+                event_id: 1002,
+            },
+        ];
+        let batch = EnemyKillBatch {
+            kills: kills.clone(),
+        };
+        let bytes = batch.to_bytes();
+        let decoded = EnemyKillBatch::from_bytes(&bytes).expect("decode");
+        assert_eq!(decoded.kills.len(), kills.len());
+        assert_eq!(decoded.kills[0].event_id, kills[0].event_id);
+        assert_eq!(decoded.kills[1].event_id, kills[1].event_id);
     }
 
     #[test]

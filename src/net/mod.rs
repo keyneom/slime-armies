@@ -4,9 +4,9 @@ mod session;
 
 pub use protocol::{
     AreaAuthorityEntry, AreaAuthorityUpdate, CannonShot, ChatMessage, EnemyDamage, EnemyKill,
-    EnemyState, EnemySync, EnemyType, InputFrame, InputFrameBatch, InputFrameEntry, NetMessage,
-    PaidAbility, PaidAbilityAck, PaidAbilityType, PaidNameAck, PaidNameReservation, PaidNameSync,
-    PaidObstacle, PaidObstacleAck, PaidObstacleSync, Ping, PlayerDeath, PlayerState,
+    EnemyKillBatch, EnemyState, EnemySync, EnemyType, InputFrame, InputFrameBatch, InputFrameEntry,
+    NetMessage, PaidAbility, PaidAbilityAck, PaidAbilityType, PaidNameAck, PaidNameReservation,
+    PaidNameSync, PaidObstacle, PaidObstacleAck, PaidObstacleSync, Ping, PlayerDeath, PlayerState,
     PlayerStateBatch, PlayerStateEntry, PlayerStatsSnapshot, Pong, ProjectileReflection,
     SupernodeScore, TopologyUpdate, VoteMute, WaveStart,
 };

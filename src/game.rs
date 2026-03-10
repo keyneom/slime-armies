@@ -760,17 +760,6 @@ impl Game {
         Self::normalized_or(current.lerp(desired, 0.25), desired)
     }
 
-    fn collision_probe_on_motion(current: Vec2, velocity: Vec2, target: Vec2) -> Vec2 {
-        let start = current - velocity;
-        let segment = current - start;
-        let segment_len_sq = segment.length_squared();
-        if segment_len_sq <= f32::EPSILON {
-            return current;
-        }
-        let t = ((target - start).dot(segment) / segment_len_sq).clamp(0.0, 1.0);
-        start + segment * t
-    }
-
     fn advance_enemy_interpolation(&mut self, run_enemy_ai: bool) {
         if run_enemy_ai {
             self.enemy_sync_age_frames = 0;
@@ -1267,30 +1256,20 @@ impl Game {
                 {
                     killed_spiders.push(i);
                     attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
-                } else {
-                    let sweep_probe =
-                        Self::collision_probe_on_motion(spider.pos, spider.speed, player_pos);
-                    if self
-                        .player
-                        .collide_block(spider.pos, (spider.radius() - 3.5) * CREATURE_SCALE)
-                        || self
-                            .player
-                            .collide_block(sweep_probe, (spider.radius() - 3.5) * CREATURE_SCALE)
-                    {
-                        let distance = player_pos.distance(spider.pos);
-                        let bump = (11.0 * CREATURE_SCALE - distance).max(1.5 * CREATURE_SCALE);
-                        spider_bumps.push((i, player_look_dir, bump));
-                    } else if self
-                        .player
-                        .collide_body(spider.pos, (spider.radius() - 3.5) * CREATURE_SCALE)
-                        || self
-                            .player
-                            .collide_body(sweep_probe, (spider.radius() - 3.5) * CREATURE_SCALE)
-                    {
-                        player_killed = true;
-                        if player_killed_by.is_none() {
-                            player_killed_by = Some((0, spider.id as u16));
-                        }
+                } else if self
+                    .player
+                    .collide_block(spider.pos, (spider.radius() - 3.5) * CREATURE_SCALE)
+                {
+                    let distance = player_pos.distance(spider.pos);
+                    let bump = (11.0 * CREATURE_SCALE - distance).max(1.5 * CREATURE_SCALE);
+                    spider_bumps.push((i, player_look_dir, bump));
+                } else if self
+                    .player
+                    .collide_body(spider.pos, (spider.radius() - 3.5) * CREATURE_SCALE)
+                {
+                    player_killed = true;
+                    if player_killed_by.is_none() {
+                        player_killed_by = Some((0, spider.id as u16));
                     }
                 }
             }
@@ -1326,30 +1305,20 @@ impl Game {
                 {
                     killed_wisps.push(i);
                     attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
-                } else {
-                    let sweep_probe =
-                        Self::collision_probe_on_motion(wisp.pos, wisp.dir * 2.6, player_pos);
-                    if self
-                        .player
-                        .collide_block(wisp.pos, (wisp.radius() - 2.0) * CREATURE_SCALE)
-                        || self
-                            .player
-                            .collide_block(sweep_probe, (wisp.radius() - 2.0) * CREATURE_SCALE)
-                    {
-                        let distance = player_pos.distance(wisp.pos);
-                        let bump = (9.0 * CREATURE_SCALE - distance).max(1.0 * CREATURE_SCALE);
-                        wisp_bumps.push((i, player_look_dir, bump));
-                    } else if self
-                        .player
-                        .collide_body(wisp.pos, (wisp.radius() - 2.0) * CREATURE_SCALE)
-                        || self
-                            .player
-                            .collide_body(sweep_probe, (wisp.radius() - 2.0) * CREATURE_SCALE)
-                    {
-                        player_killed = true;
-                        if player_killed_by.is_none() {
-                            player_killed_by = Some((4, wisp.id as u16));
-                        }
+                } else if self
+                    .player
+                    .collide_block(wisp.pos, (wisp.radius() - 2.0) * CREATURE_SCALE)
+                {
+                    let distance = player_pos.distance(wisp.pos);
+                    let bump = (9.0 * CREATURE_SCALE - distance).max(1.0 * CREATURE_SCALE);
+                    wisp_bumps.push((i, player_look_dir, bump));
+                } else if self
+                    .player
+                    .collide_body(wisp.pos, (wisp.radius() - 2.0) * CREATURE_SCALE)
+                {
+                    player_killed = true;
+                    if player_killed_by.is_none() {
+                        player_killed_by = Some((4, wisp.id as u16));
                     }
                 }
             }
@@ -1538,24 +1507,14 @@ impl Game {
                 } else if self.player.collide_attack(cannon.pos, cannon.radius()) {
                     killed_cannons.push(i);
                     attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
-                } else {
-                    let sweep_probe =
-                        Self::collision_probe_on_motion(cannon.pos, cannon.speed, player_pos);
-                    if self.player.collide_block(cannon.pos, cannon.radius() - 4.0)
-                        || self
-                            .player
-                            .collide_block(sweep_probe, cannon.radius() - 4.0)
-                    {
-                        let distance = player_pos.distance(cannon.pos);
-                        let bump = (11.5 - distance).max(1.5);
-                        cannon_bumps.push((i, player_look_dir, bump));
-                    } else if self.player.collide_body(cannon.pos, cannon.radius() - 4.0)
-                        || self.player.collide_body(sweep_probe, cannon.radius() - 4.0)
-                    {
-                        player_killed = true;
-                        if player_killed_by.is_none() {
-                            player_killed_by = Some((1, cannon.id as u16));
-                        }
+                } else if self.player.collide_block(cannon.pos, cannon.radius() - 4.0) {
+                    let distance = player_pos.distance(cannon.pos);
+                    let bump = (11.5 - distance).max(1.5);
+                    cannon_bumps.push((i, player_look_dir, bump));
+                } else if self.player.collide_body(cannon.pos, cannon.radius() - 4.0) {
+                    player_killed = true;
+                    if player_killed_by.is_none() {
+                        player_killed_by = Some((1, cannon.id as u16));
                     }
                 }
             }
@@ -1609,34 +1568,23 @@ impl Game {
                 {
                     killed_snakes.push(i);
                     attack_hits_this_frame = attack_hits_this_frame.saturating_add(1);
-                } else {
-                    let sweep_probe =
-                        Self::collision_probe_on_motion(snake.pos, snake.speed, player_pos);
-                    if self
-                        .player
-                        .collide_block(snake.pos, snake.radius() * CREATURE_SCALE)
-                        || self
-                            .player
-                            .collide_block(sweep_probe, snake.radius() * CREATURE_SCALE)
-                    {
-                        let distance = player_pos.distance(snake.pos);
-                        let bump = (8.5 * CREATURE_SCALE + snake.radius() * CREATURE_SCALE
-                            - distance)
-                            .max(1.5 * CREATURE_SCALE)
-                            / 2.0;
-                        snake_bumps.push((i, player_look_dir, bump));
-                        self.player.pos -= player_look_dir * bump;
-                    } else if self
-                        .player
-                        .collide_body(snake.pos, snake.radius() * CREATURE_SCALE)
-                        || self
-                            .player
-                            .collide_body(sweep_probe, snake.radius() * CREATURE_SCALE)
-                    {
-                        player_killed = true;
-                        if player_killed_by.is_none() {
-                            player_killed_by = Some((2, snake.id as u16));
-                        }
+                } else if self
+                    .player
+                    .collide_block(snake.pos, snake.radius() * CREATURE_SCALE)
+                {
+                    let distance = player_pos.distance(snake.pos);
+                    let bump = (8.5 * CREATURE_SCALE + snake.radius() * CREATURE_SCALE - distance)
+                        .max(1.5 * CREATURE_SCALE)
+                        / 2.0;
+                    snake_bumps.push((i, player_look_dir, bump));
+                    self.player.pos -= player_look_dir * bump;
+                } else if self
+                    .player
+                    .collide_body(snake.pos, snake.radius() * CREATURE_SCALE)
+                {
+                    player_killed = true;
+                    if player_killed_by.is_none() {
+                        player_killed_by = Some((2, snake.id as u16));
                     }
                 }
             }
