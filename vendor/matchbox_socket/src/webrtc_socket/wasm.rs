@@ -144,10 +144,17 @@ impl Messenger for WasmMessenger {
 
         // Wait for answer
         let sdp = loop {
-            let signal = peer_signal_rx
-                .next()
-                .await
-                .expect("Signal server connection lost in the middle of a handshake");
+            let Some(signal) = peer_signal_rx.next().await else {
+                warn!(
+                    "signal stream closed while waiting for answer from peer {:?}",
+                    signal_peer.id
+                );
+                return HandshakeResult {
+                    peer_id: signal_peer.id,
+                    data_channels,
+                    metadata: peer_disconnected_rx,
+                };
+            };
 
             match signal {
                 PeerSignal::Answer(answer) => break answer,
@@ -216,10 +223,17 @@ impl Messenger for WasmMessenger {
         let mut received_candidates = vec![];
 
         let offer = loop {
-            let signal = peer_signal_rx
-                .next()
-                .await
-                .expect("Signal server connection lost in the middle of a handshake");
+            let Some(signal) = peer_signal_rx.next().await else {
+                warn!(
+                    "signal stream closed while waiting for offer from peer {:?}",
+                    signal_peer.id
+                );
+                return HandshakeResult {
+                    peer_id: signal_peer.id,
+                    data_channels,
+                    metadata: peer_disconnected_rx,
+                };
+            };
 
             match signal {
                 PeerSignal::Offer(o) => {

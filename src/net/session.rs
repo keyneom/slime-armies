@@ -896,6 +896,8 @@ impl NetworkSession {
 
             // Check for new peers
             let local_name = self.local_player_name.clone();
+            let seen_message_frames = self.last_peer_message_frames.clone();
+            let connected_frames = self.peer_connected_frames.clone();
             for (peer_id, peer_state) in peers {
                 let peer_id_str = format!("{:?}", peer_id);
                 match peer_state {
@@ -913,22 +915,26 @@ impl NetworkSession {
                         self.new_peers_needing_state.push(peer_id);
                     }
                     PeerState::Disconnected => {
-                        let last_seen_age = self
-                            .last_peer_message_frames
+                        let last_seen_age = seen_message_frames
                             .get(&peer_id)
-                            .map(|f| current_frame.saturating_sub(*f))
-                            .unwrap_or(u32::MAX);
-                        let connected_age = self
-                            .peer_connected_frames
+                            .map(|frame| current_frame.saturating_sub(*frame));
+                        let connected_age = connected_frames
                             .get(&peer_id)
-                            .map(|f| current_frame.saturating_sub(*f))
-                            .unwrap_or(u32::MAX);
+                            .map(|frame| current_frame.saturating_sub(*frame));
+                        let seen_age_label = last_seen_age
+                            .map(|age| age.to_string())
+                            .unwrap_or_else(|| "none".to_string());
+                        let connected_age_label = connected_age
+                            .map(|age| age.to_string())
+                            .unwrap_or_else(|| "none".to_string());
                         web_sys::console::log_1(
                             &format!("Peer disconnected: {}", peer_id_str).into(),
                         );
                         web_sys::console::warn_1(
                             &format!(
-                                "[sync-trace f={current_frame}] disconnect peer={peer_id_str} seen_age={last_seen_age} connected_age={connected_age} conn_before={} desired={} discovery={} epoch={} parent={:?} active={:?} backup={:?} root={:?} super={:?}",
+                                "[sync-trace f={current_frame}] disconnect peer={peer_id_str} seen_age={} connected_age={} conn_before={} desired={} discovery={} epoch={} parent={:?} active={:?} backup={:?} root={:?} super={:?}",
+                                seen_age_label,
+                                connected_age_label,
                                 self.peer_id_lookup.len(),
                                 self.desired_peer_set.len(),
                                 self.discovery_attached,
@@ -992,24 +998,10 @@ impl NetworkSession {
                 self.local_peer_hash = Some(hash);
                 self.peer_hash_lookup.insert(hash, local_id_str);
             }
-            let seen_message_frames = self.last_peer_message_frames.clone();
-            let connected_frames = self.peer_connected_frames.clone();
-            let raw_connected_peers: Vec<_> = socket.connected_peers().collect();
-            let connected_peers: Vec<_> = raw_connected_peers
-                .iter()
-                .copied()
-                .filter(|peer_id| {
-                    if let Some(seen_at) = seen_message_frames.get(peer_id).copied() {
-                        return current_frame.saturating_sub(seen_at)
-                            <= Self::PEER_HANDSHAKE_GRACE_FRAMES;
-                    }
-                    let connected_at = connected_frames
-                        .get(peer_id)
-                        .copied()
-                        .unwrap_or(current_frame);
-                    current_frame.saturating_sub(connected_at) <= Self::PEER_HANDSHAKE_GRACE_FRAMES
-                })
-                .collect();
+            // Keep transport connectivity sourced from socket state directly.
+            // Message-age based filtering can create "connected but blind" states where
+            // topology drops valid links before gameplay traffic has a chance to flow.
+            let connected_peers: Vec<_> = socket.connected_peers().collect();
             let mut known_peers: Vec<_> = if self.discovery_attached {
                 socket.known_peers().collect()
             } else {
@@ -1782,6 +1774,27 @@ impl NetworkSession {
         if connected_peers.is_empty() {
             return;
         }
+        let connected_set: HashSet<matchbox_socket::PeerId> =
+            connected_peers.iter().copied().collect();
+        let parent_connected = self
+            .relay_parent
+            .map(|parent| connected_set.contains(&parent))
+            .unwrap_or(false);
+        let backup_connected = self
+            .relay_backup_parent
+            .map(|parent| connected_set.contains(&parent))
+            .unwrap_or(false);
+        if connected_peers.len() < 2 && !(parent_connected && backup_connected) {
+            // With a single live route, detaching signaling can strand peers if parent
+            // churns before the overlay converges. Keep discovery attached in this state.
+            return;
+        }
+        if let Some(parent) = self.relay_active_parent.or(self.relay_parent) {
+            // Require at least one real message from the active route before detaching.
+            if self.peer_message_age(parent, current_frame).is_none() {
+                return;
+            }
+        }
         let has_overlay_route = self.relay_active_parent.or(self.relay_parent).is_some()
             || !self.relay_children.is_empty()
             || self.desired_peer_set.len() >= 2;
@@ -1994,13 +2007,46 @@ impl NetworkSession {
         }
     }
 
-    fn peer_seen_recently(&self, peer_id: matchbox_socket::PeerId, current_frame: u32) -> bool {
-        let seen = self
-            .last_peer_message_frames
+    fn peer_connected_age(
+        &self,
+        peer_id: matchbox_socket::PeerId,
+        current_frame: u32,
+    ) -> Option<u32> {
+        self.peer_connected_frames
             .get(&peer_id)
-            .copied()
-            .unwrap_or(self.last_parent_switch_frame);
-        current_frame.saturating_sub(seen) <= Self::RELAY_PARENT_STALE_FRAMES
+            .map(|frame| current_frame.saturating_sub(*frame))
+    }
+
+    fn peer_message_age(
+        &self,
+        peer_id: matchbox_socket::PeerId,
+        current_frame: u32,
+    ) -> Option<u32> {
+        self.last_peer_message_frames
+            .get(&peer_id)
+            .map(|frame| current_frame.saturating_sub(*frame))
+    }
+
+    fn peer_stale_age(&self, peer_id: matchbox_socket::PeerId, current_frame: u32) -> Option<u32> {
+        if let Some(age) = self.peer_message_age(peer_id, current_frame) {
+            return Some(age);
+        }
+        let connected_age = self.peer_connected_age(peer_id, current_frame)?;
+        if connected_age <= Self::PEER_HANDSHAKE_GRACE_FRAMES {
+            None
+        } else {
+            Some(connected_age)
+        }
+    }
+
+    fn peer_seen_recently(&self, peer_id: matchbox_socket::PeerId, current_frame: u32) -> bool {
+        if let Some(seen_age) = self.peer_message_age(peer_id, current_frame) {
+            return seen_age <= Self::RELAY_PARENT_STALE_FRAMES;
+        }
+        if let Some(connected_age) = self.peer_connected_age(peer_id, current_frame) {
+            return connected_age <= Self::PEER_HANDSHAKE_GRACE_FRAMES;
+        }
+        false
     }
 
     fn maybe_failover_parent(&mut self, current_frame: u32) {
@@ -2503,7 +2549,7 @@ impl NetworkSession {
     }
 
     fn bootstrap_accept_sender(&self, peer_id: &str) -> bool {
-        if self.is_host || !self.discovery_attached {
+        if self.is_host {
             return false;
         }
         let sender = match self.peer_id_lookup.get(peer_id) {
@@ -2519,6 +2565,8 @@ impl NetworkSession {
         }
         let no_route = self.relay_active_parent.or(self.relay_parent).is_none();
         let tiny_room = self.known_peer_count() <= 2;
+        // Allow tiny/no-route bootstrap acceptance even after discovery detach so
+        // direct peers don't become "connected but blind" during parent churn.
         self.relay_epoch == 0 || no_route || tiny_room
     }
 
@@ -3183,15 +3231,21 @@ impl NetworkSession {
             self.relay_epoch as u64,
             if self.discovery_attached { 1 } else { 0 },
             if self.is_host { 1 } else { 0 },
-            self.relay_parent.map(Self::peer_hash_for_matchbox).unwrap_or(0),
+            self.relay_parent
+                .map(Self::peer_hash_for_matchbox)
+                .unwrap_or(0),
             self.relay_backup_parent
                 .map(Self::peer_hash_for_matchbox)
                 .unwrap_or(0),
             self.relay_active_parent
                 .map(Self::peer_hash_for_matchbox)
                 .unwrap_or(0),
-            self.super_root_id.map(Self::peer_hash_for_matchbox).unwrap_or(0),
-            self.supernode_id.map(Self::peer_hash_for_matchbox).unwrap_or(0),
+            self.super_root_id
+                .map(Self::peer_hash_for_matchbox)
+                .unwrap_or(0),
+            self.supernode_id
+                .map(Self::peer_hash_for_matchbox)
+                .unwrap_or(0),
         ];
         for value in parts {
             sig ^= value;
@@ -3207,27 +3261,25 @@ impl NetworkSession {
         known_peers: &[matchbox_socket::PeerId],
     ) {
         let sig = self.sync_trace_signature(connected_peers, known_peers);
-        let periodic =
-            current_frame.saturating_sub(self.last_sync_trace_frame) >= Self::SYNC_TRACE_PERIOD_FRAMES;
+        let periodic = current_frame.saturating_sub(self.last_sync_trace_frame)
+            >= Self::SYNC_TRACE_PERIOD_FRAMES;
         let changed = sig != self.last_sync_trace_sig;
         if changed || periodic {
             self.last_sync_trace_sig = sig;
             self.last_sync_trace_frame = current_frame;
             let mut stale: Vec<String> = Vec::new();
-            let mut newest_age = 0u32;
+            let mut worst_age = 0u32;
             let mut newest_peer = None;
             for peer_id in connected_peers {
-                let age = self
-                    .last_peer_message_frames
-                    .get(peer_id)
-                    .map(|f| current_frame.saturating_sub(*f))
-                    .unwrap_or(u32::MAX);
-                if age >= Self::SYNC_STALE_WARN_FRAMES {
-                    stale.push(format!("{:?}:{age}", peer_id));
-                }
-                if age > newest_age {
-                    newest_age = age;
-                    newest_peer = Some(*peer_id);
+                let age = self.peer_stale_age(*peer_id, current_frame);
+                if let Some(age) = age {
+                    if age >= Self::SYNC_STALE_WARN_FRAMES {
+                        stale.push(format!("{:?}:{age}", peer_id));
+                    }
+                    if age > worst_age {
+                        worst_age = age;
+                        newest_peer = Some(*peer_id);
+                    }
                 }
             }
             let stale_label = if stale.is_empty() {
@@ -3255,7 +3307,7 @@ impl NetworkSession {
                     self.relay_backup_parent,
                     self.super_root_id,
                     self.supernode_id,
-                    newest_age,
+                    worst_age,
                     worst_peer,
                     stale_label,
                     Self::peer_list_compact(connected_peers),
@@ -3265,16 +3317,15 @@ impl NetworkSession {
             );
         }
 
-        if current_frame.saturating_sub(self.last_sync_warn_frame) < Self::SYNC_TRACE_PERIOD_FRAMES {
+        if current_frame.saturating_sub(self.last_sync_warn_frame) < Self::SYNC_TRACE_PERIOD_FRAMES
+        {
             return;
         }
 
         for peer_id in connected_peers {
-            let age = self
-                .last_peer_message_frames
-                .get(peer_id)
-                .map(|f| current_frame.saturating_sub(*f))
-                .unwrap_or(u32::MAX);
+            let Some(age) = self.peer_stale_age(*peer_id, current_frame) else {
+                continue;
+            };
             if age >= Self::SYNC_STALE_WARN_FRAMES {
                 self.last_sync_warn_frame = current_frame;
                 web_sys::console::warn_1(
