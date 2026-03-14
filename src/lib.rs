@@ -848,6 +848,40 @@ pub fn test_join_current_room() {
     });
 }
 
+/// Test-only automation helper to start gameplay without string-based debug commands.
+#[wasm_bindgen]
+pub fn test_debug_start_game() {
+    GAME_STATE.with(|gs| {
+        if let Some(state) = gs.borrow().as_ref() {
+            state.borrow_mut().game.debug_start_game();
+        }
+    });
+}
+
+/// Test-only automation helper to clear local enemies without string-based debug commands.
+#[wasm_bindgen]
+pub fn test_debug_clear_enemies() {
+    GAME_STATE.with(|gs| {
+        if let Some(state) = gs.borrow().as_ref() {
+            let mut state_ref = state.borrow_mut();
+            let _ = state_ref.game.apply_debug_command("clear_enemies");
+        }
+    });
+}
+
+/// Test-only automation helper to teleport the local player without string-based debug commands.
+#[wasm_bindgen]
+pub fn test_debug_teleport(x: f32, y: f32) {
+    GAME_STATE.with(|gs| {
+        if let Some(state) = gs.borrow().as_ref() {
+            let mut state_ref = state.borrow_mut();
+            let _ = state_ref
+                .game
+                .apply_debug_command(&format!("teleport {x} {y}"));
+        }
+    });
+}
+
 /// Compact runtime snapshot for automation assertions.
 /// Format: `scene=...;network=...;room=...;players=...;map_open=...;player_list_open=...;chat_open=...`
 #[wasm_bindgen]
@@ -932,6 +966,43 @@ pub fn test_network_diag() -> String {
             )
         } else {
             "network=uninitialized;room=;remote_players=0;known_peers=0;desired_peers=0;discovery_attached=false;relay_epoch=0;is_host=false;local_peer=none;supernode=none;local_name=none;rx=0;dropped=0;remote_ids=none;remote_names=none".to_string()
+        }
+    })
+}
+
+/// Compact player-position snapshot for sync assertions.
+/// Format:
+/// `scene=...;local=NAME@x,y;remote=NAME@x,y|NAME@x,y`
+#[wasm_bindgen]
+pub fn test_player_snapshot() -> String {
+    GAME_STATE.with(|gs| {
+        if let Some(state) = gs.borrow().as_ref() {
+            let state_ref = state.borrow();
+            let scene = scene_name(state_ref.game.scene);
+            let local_name = state_ref.network.local_display_name();
+            let local_pos = state_ref.game.player.pos;
+            let mut remotes: Vec<String> = state_ref
+                .network
+                .remote_players
+                .keys()
+                .map(|peer_id| {
+                    let display = state_ref.network.display_name_for_peer_id(peer_id);
+                    let remote = &state_ref.network.remote_players[peer_id];
+                    format!("{display}@{:.1},{:.1}", remote.pos.x, remote.pos.y)
+                })
+                .collect();
+            remotes.sort();
+            let remote = if remotes.is_empty() {
+                "none".to_string()
+            } else {
+                remotes.join("|")
+            };
+            format!(
+                "scene={scene};local={local_name}@{:.1},{:.1};remote={remote}",
+                local_pos.x, local_pos.y
+            )
+        } else {
+            "scene=uninitialized;local=none@0.0,0.0;remote=none".to_string()
         }
     })
 }

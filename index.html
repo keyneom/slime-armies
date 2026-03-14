@@ -335,6 +335,43 @@
     <script type="module">
         // Debug helpers will be exposed by Trunk-generated script
         // Access via window.slime and window.slimeDebug after TrunkApplicationStarted event
+        const slimeConsoleBuffer = [];
+        const SLIME_CONSOLE_LIMIT = 400;
+        const stringifyConsoleArg = (value) => {
+            if (typeof value === "string") {
+                return value;
+            }
+            if (value instanceof Error) {
+                return value.stack || value.message || String(value);
+            }
+            try {
+                return JSON.stringify(value);
+            } catch (_err) {
+                return String(value);
+            }
+        };
+        if (!window.__slimeConsoleWrapped) {
+            window.__slimeConsoleWrapped = true;
+            for (const level of ["log", "info", "warn", "error", "debug"]) {
+                const original = console[level]?.bind(console);
+                if (!original) {
+                    continue;
+                }
+                console[level] = (...args) => {
+                    try {
+                        const line = `[${level}] ${args.map(stringifyConsoleArg).join(" ")}`;
+                        slimeConsoleBuffer.push(line);
+                        if (slimeConsoleBuffer.length > SLIME_CONSOLE_LIMIT) {
+                            slimeConsoleBuffer.splice(0, slimeConsoleBuffer.length - SLIME_CONSOLE_LIMIT);
+                        }
+                    } catch (_err) {
+                        // Ignore log buffering failures.
+                    }
+                    return original(...args);
+                };
+            }
+            window.__slimeConsoleBuffer = slimeConsoleBuffer;
+        }
         addEventListener("TrunkApplicationStarted", (e) => {
             const bindings = e.detail.wasm;
             const textDecoder = new TextDecoder("utf-8");
@@ -346,6 +383,13 @@
                 { code: "KeyA", key: "a" },
                 { code: "KeyW", key: "w" },
             ];
+            const automationDirections = {
+                up: { code: "KeyW", key: "w" },
+                down: { code: "KeyS", key: "s" },
+                left: { code: "KeyA", key: "a" },
+                right: { code: "KeyD", key: "d" },
+            };
+            const automationActionKeys = ["KeyW", "KeyA", "KeyS", "KeyD", "ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight", "ShiftLeft", "ShiftRight", "KeyX", "Space", "KeyZ"];
             let keepAliveTimer = null;
             let keepAliveReleaseTimer = null;
             let keepAliveStep = 0;
@@ -448,6 +492,11 @@
                     enqueueKeyUp(code);
                 }
             };
+            const releaseAutomationKeys = () => {
+                for (const code of automationActionKeys) {
+                    enqueueKeyUp(code);
+                }
+            };
             const stopKeepAlive = () => {
                 if (keepAliveTimer !== null) {
                     clearInterval(keepAliveTimer);
@@ -459,6 +508,88 @@
                 }
                 keepAliveStep = 0;
                 releaseMovementKeys();
+            };
+            const wait = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+            const directionStep = (direction) => {
+                const key = String(direction || "").toLowerCase();
+                return automationDirections[key] || automationDirections.right;
+            };
+            const holdCode = (code, key = "") => {
+                enqueueKeyDown(code, key || keyFromCode(code));
+                return code;
+            };
+            const releaseCode = (code) => {
+                enqueueKeyUp(code);
+                return code;
+            };
+            const tapCode = async (code, key = "", holdMs = 90) => {
+                holdCode(code, key);
+                await wait(holdMs);
+                releaseCode(code);
+                return code;
+            };
+            const moveFor = async (direction = "right", holdMs = 250) => {
+                const step = directionStep(direction);
+                releaseMovementKeys();
+                holdCode(step.code, step.key);
+                await wait(holdMs);
+                releaseMovementKeys();
+                return step.code;
+            };
+            const phaseMove = async (direction = "right", holdMs = 180) => {
+                const step = directionStep(direction);
+                releaseMovementKeys();
+                holdCode("ShiftLeft", "Shift");
+                holdCode(step.code, step.key);
+                await wait(holdMs);
+                releaseCode(step.code);
+                releaseCode("ShiftLeft");
+                return step.code;
+            };
+            const setStoredProfile = (name = "", roomCode = "") => {
+                const normalizedName = String(name ?? "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 20);
+                const normalizedRoom = String(roomCode ?? "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 20);
+                if (normalizedName) {
+                    localStorage.setItem("slime_player_name", normalizedName);
+                }
+                if (normalizedRoom) {
+                    localStorage.setItem("slime_room_code", normalizedRoom);
+                } else {
+                    localStorage.removeItem("slime_room_code");
+                }
+                return { name: normalizedName, room: normalizedRoom };
+            };
+            const reloadWithProfile = (name = "", roomCode = "") => {
+                setStoredProfile(name, roomCode);
+                location.reload();
+                return "reloading";
+            };
+            const createRoom = () => {
+                return decodeRustString(bindings.create_room());
+            };
+            const joinSavedRoom = () => {
+                bindings.test_join_current_room();
+                return decodeRustString(bindings.test_runtime_state());
+            };
+            const createAs = (name = "") => reloadWithProfile(name, "");
+            const joinAs = (roomCode, name = "") => {
+                return reloadWithProfile(name, roomCode);
+            };
+            const debugCommand = (cmd) => {
+                bindings.send_debug_command(String(cmd ?? ""));
+                return cmd;
+            };
+            const teleportTo = (x, y) => {
+                bindings.test_debug_teleport(Number(x) || 0, Number(y) || 0);
+                return `${Number(x) || 0},${Number(y) || 0}`;
+            };
+            const clearEnemies = () => {
+                bindings.test_debug_clear_enemies();
+                return true;
+            };
+            const startGame = () => {
+                bindings.test_debug_start_game();
+                return true;
             };
             const startKeepAlive = (stepMs = 420, holdRatio = 0.78) => {
                 stopKeepAlive();
@@ -500,6 +631,26 @@
             // Automation surface for browser-driven tests.
             // This is additive and does not replace normal user controls.
             window.slimeTest = {
+                setStoredProfile,
+                reloadWithProfile,
+                createRoom,
+                joinSavedRoom,
+                createAs,
+                joinAs,
+                debug: (cmd) => debugCommand(cmd),
+                startGame,
+                teleport: (x, y) => teleportTo(x, y),
+                clearEnemies,
+                wait,
+                hold: (code, key = "") => holdCode(code, key),
+                release: (code) => releaseCode(code),
+                tap: (code, key = "", holdMs = 90) => tapCode(code, key, holdMs),
+                moveFor: (direction = "right", holdMs = 250) => moveFor(direction, holdMs),
+                phaseMove: (direction = "right", holdMs = 180) => phaseMove(direction, holdMs),
+                releaseAll: () => {
+                    stopKeepAlive();
+                    releaseAutomationKeys();
+                },
                 keyDown: (code, key = "") => enqueueKeyDown(code, key || keyFromCode(code)),
                 keyUp: (code) => enqueueKeyUp(code),
                 typeText: (text) => enqueueText(text),
@@ -508,6 +659,13 @@
                 joinCurrentRoom: () => bindings.test_join_current_room(),
                 state: () => decodeRustString(bindings.test_runtime_state()),
                 net: () => decodeRustString(bindings.test_network_diag()),
+                players: () => decodeRustString(bindings.test_player_snapshot()),
+                logs: () => (window.__slimeConsoleBuffer || []).join("\n"),
+                clearLogs: () => {
+                    if (Array.isArray(window.__slimeConsoleBuffer)) {
+                        window.__slimeConsoleBuffer.length = 0;
+                    }
+                },
                 keepAliveStart: (stepMs = 420, holdRatio = 0.78) => startKeepAlive(stepMs, holdRatio),
                 keepAliveStop: () => stopKeepAlive(),
             };

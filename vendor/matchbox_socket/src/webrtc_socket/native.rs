@@ -153,10 +153,23 @@ impl Messenger for NativeMessenger {
             signal_peer.send(PeerSignal::Offer(sdp));
 
             let answer = loop {
-                let signal = peer_signal_rx
-                    .next()
-                    .await
-                    .expect("Signal server connection lost in the middle of a handshake");
+                let Some(signal) = peer_signal_rx.next().await else {
+                    warn!(
+                        "signal stream closed while waiting for answer from peer {:?}",
+                        signal_peer.id
+                    );
+                    return HandshakeResult::<Self::DataChannel, Self::HandshakeMeta> {
+                        peer_id: signal_peer.id,
+                        data_channels: to_peer_message_tx,
+                        metadata: (
+                            to_peer_message_rx,
+                            data_channels,
+                            Box::pin(std::future::pending::<Result<(), webrtc::Error>>().fuse()),
+                            peer_disconnected_rx,
+                        ),
+                        established: false,
+                    };
+                };
 
                 match signal {
                     PeerSignal::Answer(answer) => {
@@ -177,7 +190,7 @@ impl Messenger for NativeMessenger {
                 .await
                 .unwrap();
 
-            let trickle_fut = complete_handshake(
+            let (trickle_fut, established) = complete_handshake(
                 trickle,
                 &connection,
                 peer_signal_rx,
@@ -194,6 +207,7 @@ impl Messenger for NativeMessenger {
                     trickle_fut,
                     peer_disconnected_rx,
                 ),
+                established,
             }
         }
         .compat() // Required to run tokio futures with other async executors
@@ -232,7 +246,24 @@ impl Messenger for NativeMessenger {
             .await;
 
             let offer = loop {
-                match peer_signal_rx.next().await.expect("error") {
+                let Some(signal) = peer_signal_rx.next().await else {
+                    warn!(
+                        "signal stream closed while waiting for offer from peer {:?}",
+                        signal_peer.id
+                    );
+                    return HandshakeResult::<Self::DataChannel, Self::HandshakeMeta> {
+                        peer_id: signal_peer.id,
+                        data_channels: to_peer_message_tx,
+                        metadata: (
+                            to_peer_message_rx,
+                            data_channels,
+                            Box::pin(std::future::pending::<Result<(), webrtc::Error>>().fuse()),
+                            peer_disconnected_rx,
+                        ),
+                        established: false,
+                    };
+                };
+                match signal {
                     PeerSignal::Offer(offer) => {
                         break offer;
                     }
@@ -252,7 +283,7 @@ impl Messenger for NativeMessenger {
             signal_peer.send(PeerSignal::Answer(answer.sdp.clone()));
             connection.set_local_description(answer).await.unwrap();
 
-            let trickle_fut = complete_handshake(
+            let (trickle_fut, established) = complete_handshake(
                 trickle,
                 &connection,
                 peer_signal_rx,
@@ -269,6 +300,7 @@ impl Messenger for NativeMessenger {
                     trickle_fut,
                     peer_disconnected_rx,
                 ),
+                established,
             }
         }
         .compat() // Required to run tokio futures with other async executors
@@ -323,8 +355,11 @@ async fn complete_handshake(
     trickle: Arc<CandidateTrickle>,
     connection: &Arc<RTCPeerConnection>,
     peer_signal_rx: UnboundedReceiver<PeerSignal>,
-    mut wait_for_channels: Pin<Box<Fuse<impl Future<Output = ()>>>>,
-) -> Pin<Box<Fuse<impl Future<Output = Result<(), webrtc::Error>>>>> {
+    mut wait_for_channels: Pin<Box<Fuse<impl Future<Output = bool>>>>,
+) -> (
+    Pin<Box<Fuse<impl Future<Output = Result<(), webrtc::Error>>>>>,
+    bool,
+) {
     trickle.send_pending_candidates().await;
     let mut trickle_fut = Box::pin(
         CandidateTrickle::listen_for_remote_candidates(Arc::clone(connection), peer_signal_rx)
@@ -333,16 +368,17 @@ async fn complete_handshake(
 
     loop {
         select! {
-            _ = wait_for_channels => {
-                break;
+            ready = wait_for_channels => {
+                if !ready {
+                    warn!("native handshake channel setup ended before channels opened");
+                }
+                return (trickle_fut, ready);
             },
             // TODO: this means that the signaling is down, should return an
             // error
             _ = trickle_fut => continue,
         };
     }
-
-    trickle_fut
 }
 
 struct CandidateTrickle {

@@ -118,6 +118,7 @@ pub struct NetworkSession {
     relay_epoch: u32,
     last_parent_switch_frame: u32,
     stale_parent_events: u32,
+    peer_link_backoff_until: HashMap<matchbox_socket::PeerId, u32>,
     last_peer_message_frames: HashMap<matchbox_socket::PeerId, u32>,
     peer_connected_frames: HashMap<matchbox_socket::PeerId, u32>,
     pub relay_telemetry: RelayTelemetry,
@@ -139,6 +140,7 @@ pub struct NetworkSession {
     pending_player_names: HashMap<PeerId, String>,
     peer_id_lookup: HashMap<PeerId, matchbox_socket::PeerId>,
     peer_hash_lookup: HashMap<u64, PeerId>,
+    peer_identity_lookup: HashMap<u64, PeerId>,
     pending_messages: Vec<(PeerId, Option<u64>, NetMessage)>,
     /// Whether this client is the host (room creator) - host controls enemy spawning
     pub is_host: bool,
@@ -228,6 +230,8 @@ impl NetworkSession {
     const DISCOVERY_MIN_ATTACH_FRAMES: u32 = 180;
     const SYNC_TRACE_PERIOD_FRAMES: u32 = 60;
     const SYNC_STALE_WARN_FRAMES: u32 = 180;
+    const STALE_LINK_RESET_FRAMES: u32 = 240;
+    const STALE_LINK_BACKOFF_FRAMES: u32 = 120;
     const BOOTSTRAP_FULLMESH_TRIGGER_FRAMES: u32 = 120;
     const BOOTSTRAP_PROBE_LINKS: usize = 8;
     const MAX_DISCOVERY_PEERS: usize = 192;
@@ -255,6 +259,13 @@ impl NetworkSession {
         self.peer_id_lookup.get(peer_id).copied()
     }
 
+    fn identity_peer_id_for_hash(&self, hash: u64) -> Option<PeerId> {
+        self.peer_identity_lookup
+            .get(&hash)
+            .cloned()
+            .or_else(|| self.peer_hash_lookup.get(&hash).cloned())
+    }
+
     fn area_authority_for(&self, area_id: u32) -> Option<matchbox_socket::PeerId> {
         let hash = self.area_authorities.get(&area_id).copied()?;
         self.hash_to_matchbox(hash)
@@ -267,8 +278,8 @@ impl NetworkSession {
             }
             return 0;
         }
-        if let Some(peer_id) = self.peer_hash_lookup.get(&peer_hash) {
-            if let Some(remote) = self.remote_players.get(peer_id) {
+        if let Some(peer_id) = self.identity_peer_id_for_hash(peer_hash) {
+            if let Some(remote) = self.remote_players.get(&peer_id) {
                 return Self::area_id_from_pos(remote.pos);
             }
         }
@@ -279,8 +290,11 @@ impl NetworkSession {
         if Some(peer_id) == self.local_peer_id {
             return self.local_last_pos;
         }
-        let id = format!("{:?}", peer_id);
-        self.remote_players.get(&id).map(|remote| remote.pos)
+        let peer_hash = Self::peer_hash_for_matchbox(peer_id);
+        let peer_key = self
+            .identity_peer_id_for_hash(peer_hash)
+            .unwrap_or_else(|| format!("{:?}", peer_id));
+        self.remote_players.get(&peer_key).map(|remote| remote.pos)
     }
 
     fn choose_dynamic_supernode_count(total_nodes: usize, active_areas: usize) -> usize {
@@ -608,6 +622,7 @@ impl NetworkSession {
             relay_epoch: 0,
             last_parent_switch_frame: 0,
             stale_parent_events: 0,
+            peer_link_backoff_until: HashMap::new(),
             last_peer_message_frames: HashMap::new(),
             peer_connected_frames: HashMap::new(),
             relay_telemetry: RelayTelemetry::default(),
@@ -629,6 +644,7 @@ impl NetworkSession {
             pending_player_names: HashMap::new(),
             peer_id_lookup: HashMap::new(),
             peer_hash_lookup: HashMap::new(),
+            peer_identity_lookup: HashMap::new(),
             pending_messages: Vec::new(),
             is_host: false,
             pending_enemy_sync: None,
@@ -829,6 +845,7 @@ impl NetworkSession {
         self.relay_epoch = 0;
         self.last_parent_switch_frame = 0;
         self.stale_parent_events = 0;
+        self.peer_link_backoff_until.clear();
         self.last_peer_message_frames.clear();
         self.peer_connected_frames.clear();
         self.relay_telemetry = RelayTelemetry::default();
@@ -846,6 +863,7 @@ impl NetworkSession {
         self.pending_player_names.clear();
         self.peer_id_lookup.clear();
         self.peer_hash_lookup.clear();
+        self.peer_identity_lookup.clear();
         self.bad_supernodes.clear();
         self.last_enemy_sync_frame = 0;
         self.paid_obstacle_confirmations.clear();
@@ -911,8 +929,12 @@ impl NetworkSession {
                         self.state = NetworkState::Connected;
                         self.peer_id_lookup.insert(peer_id_str.clone(), peer_id);
                         self.peer_connected_frames.insert(peer_id, current_frame);
+                        self.peer_link_backoff_until.remove(&peer_id);
                         let hash = Self::hash_peer_id(&peer_id_str);
                         self.peer_hash_lookup.insert(hash, peer_id_str.clone());
+                        self.peer_identity_lookup
+                            .entry(hash)
+                            .or_insert_with(|| peer_id_str.clone());
                         // Send join message with our name
                         let msg = NetMessage::PlayerJoined(local_name.clone()).to_bytes();
                         socket.send(msg.into_boxed_slice(), peer_id);
@@ -952,13 +974,24 @@ impl NetworkSession {
                             )
                             .into(),
                         );
-                        self.remote_players.remove(&peer_id_str);
-                        self.pending_player_names.remove(&peer_id_str);
+                        let hash = Self::hash_peer_id(&peer_id_str);
+                        let canonical_peer_id = self
+                            .peer_identity_lookup
+                            .get(&hash)
+                            .cloned()
+                            .unwrap_or_else(|| peer_id_str.clone());
+                        if canonical_peer_id == peer_id_str {
+                            self.remote_players.remove(&canonical_peer_id);
+                            self.remote_stats.remove(&canonical_peer_id);
+                            self.pending_player_names.remove(&canonical_peer_id);
+                            self.peer_identity_lookup.remove(&hash);
+                        }
                         if let Some(peer_id) = self.peer_id_lookup.get(&peer_id_str).copied() {
                             self.bad_supernodes.remove(&peer_id);
                             self.supernode_scores.remove(&peer_id);
                             self.latency_ms.remove(&peer_id);
                             self.latency_samples.remove(&peer_id);
+                            self.peer_link_backoff_until.remove(&peer_id);
                             self.last_peer_message_frames.remove(&peer_id);
                             self.peer_connected_frames.remove(&peer_id);
                         }
@@ -977,7 +1010,11 @@ impl NetworkSession {
                 self.peer_id_lookup.insert(peer_id_str.clone(), peer_id);
                 let hash = Self::hash_peer_id(&peer_id_str);
                 self.peer_hash_lookup.insert(hash, peer_id_str.clone());
+                self.peer_identity_lookup
+                    .entry(hash)
+                    .or_insert_with(|| peer_id_str.clone());
                 self.last_peer_message_frames.insert(peer_id, current_frame);
+                self.peer_link_backoff_until.remove(&peer_id);
                 self.relay_telemetry.recv_messages =
                     self.relay_telemetry.recv_messages.saturating_add(1);
                 if let Some((origin_hash, payload)) = Self::decode_relay_envelope(&data) {
@@ -1045,6 +1082,27 @@ impl NetworkSession {
                     .as_ref()
                     .map(|local| local == peer_id)
                     .unwrap_or(false)
+                || self.remote_players.contains_key(peer_id)
+                || self.pending_player_names.contains_key(peer_id)
+                || self.remote_stats.contains_key(peer_id)
+                || self
+                    .pending_input_frames
+                    .iter()
+                    .any(|(id, _)| id == peer_id)
+        });
+        self.peer_identity_lookup.retain(|_, peer_id| {
+            known_peer_strs.contains(peer_id)
+                || local_peer_str
+                    .as_ref()
+                    .map(|local| local == peer_id)
+                    .unwrap_or(false)
+                || self.remote_players.contains_key(peer_id)
+                || self.pending_player_names.contains_key(peer_id)
+                || self.remote_stats.contains_key(peer_id)
+                || self
+                    .pending_input_frames
+                    .iter()
+                    .any(|(id, _)| id == peer_id)
         });
         let known_peer_ids: HashSet<matchbox_socket::PeerId> =
             known_peers.iter().copied().collect();
@@ -1077,6 +1135,8 @@ impl NetworkSession {
         let mut input_frames: Vec<(PeerId, InputFrame)> = Vec::new();
         let mut player_batches: Vec<(PeerId, PlayerStateBatch)> = Vec::new();
         let mut input_batches: Vec<(PeerId, InputFrameBatch)> = Vec::new();
+        let mut player_joins: Vec<(PeerId, u64, String)> = Vec::new();
+        let mut player_lefts: Vec<(PeerId, u64)> = Vec::new();
         let mut topology_updates: Vec<(PeerId, u64, TopologyUpdate)> = Vec::new();
         let mut area_authority_updates: Vec<(PeerId, u64, AreaAuthorityUpdate)> = Vec::new();
 
@@ -1087,19 +1147,10 @@ impl NetworkSession {
                     player_updates.push((peer_id, state));
                 }
                 NetMessage::PlayerJoined(name) => {
-                    web_sys::console::log_1(
-                        &format!("Player joined: {} ({})", name, peer_id).into(),
-                    );
-                    // Update the player's name if they already exist
-                    if let Some(remote) = self.remote_players.get_mut(&peer_id) {
-                        remote.name = name;
-                    } else {
-                        self.pending_player_names.insert(peer_id, name);
-                    }
-                    // If they don't exist yet, they'll be added on the first PlayerUpdate
+                    player_joins.push((peer_id, origin_hash, name));
                 }
                 NetMessage::PlayerLeft => {
-                    self.remote_players.remove(&peer_id);
+                    player_lefts.push((peer_id, origin_hash));
                 }
                 NetMessage::EnemySync(sync) => {
                     enemy_syncs.push((peer_id, origin_hash, sync));
@@ -1217,13 +1268,46 @@ impl NetworkSession {
             }
             self.apply_area_authority_update(&peer_id, update);
         }
+        for (peer_id, origin_hash, name) in player_joins {
+            self.relay_control_message(
+                &peer_id,
+                NetMessage::PlayerJoined(name.clone()).to_bytes(),
+                Some(origin_hash),
+            );
+
+            let mapped_peer_id = self.resolve_or_register_peer_hash(origin_hash);
+            self.migrate_peer_alias(&peer_id, &mapped_peer_id);
+            if self.is_local_peer_str(&mapped_peer_id) {
+                continue;
+            }
+            web_sys::console::log_1(
+                &format!("Player joined: {} ({})", name, mapped_peer_id).into(),
+            );
+            if let Some(remote) = self.remote_players.get_mut(&mapped_peer_id) {
+                remote.name = name;
+            } else {
+                self.pending_player_names.insert(mapped_peer_id, name);
+            }
+        }
+
+        for (peer_id, origin_hash) in player_lefts {
+            let mapped_peer_id = self
+                .identity_peer_id_for_hash(origin_hash)
+                .unwrap_or(peer_id);
+            self.remote_players.remove(&mapped_peer_id);
+            self.remote_stats.remove(&mapped_peer_id);
+            self.pending_player_names.remove(&mapped_peer_id);
+            self.peer_identity_lookup.remove(&origin_hash);
+        }
 
         for (peer_id, state) in player_updates {
+            let peer_hash = Self::hash_peer_id(&peer_id);
+            let mapped_peer_id = self.resolve_or_register_peer_hash(peer_hash);
+            self.migrate_peer_alias(&peer_id, &mapped_peer_id);
             if !self.is_parent_sender(&peer_id) {
-                let peer_hash = Self::hash_peer_id(&peer_id);
                 self.queue_relay_player_state(peer_hash, state);
             }
-            if self.is_local_peer_str(&peer_id) {
+            if self.is_local_peer_str(&mapped_peer_id) {
                 continue;
             }
             if self.is_host
@@ -1231,15 +1315,15 @@ impl NetworkSession {
                 || self.is_parent_sender(&peer_id)
                 || self.bootstrap_accept_sender(&peer_id)
             {
-                if let Some(remote) = self.remote_players.get_mut(&peer_id) {
+                if let Some(remote) = self.remote_players.get_mut(&mapped_peer_id) {
                     remote.update_state(&state, current_frame);
                 } else {
                     let name = self
                         .pending_player_names
-                        .remove(&peer_id)
+                        .remove(&mapped_peer_id)
                         .unwrap_or_else(|| "Player".to_string());
                     self.remote_players.insert(
-                        peer_id.clone(),
+                        mapped_peer_id.clone(),
                         RemotePlayer::new(name, &state, current_frame),
                     );
                 }
@@ -1247,11 +1331,13 @@ impl NetworkSession {
         }
 
         for (peer_id, frame) in input_frames {
+            let peer_hash = Self::hash_peer_id(&peer_id);
+            let mapped_peer_id = self.resolve_or_register_peer_hash(peer_hash);
+            self.migrate_peer_alias(&peer_id, &mapped_peer_id);
             if !self.is_parent_sender(&peer_id) {
-                let peer_hash = Self::hash_peer_id(&peer_id);
                 self.queue_relay_input_frame(peer_hash, frame);
             }
-            self.pending_input_frames.push((peer_id, frame));
+            self.pending_input_frames.push((mapped_peer_id, frame));
         }
 
         for (peer_id, batch) in player_batches {
@@ -1265,22 +1351,21 @@ impl NetworkSession {
                 continue;
             }
             for entry in &batch.entries {
-                if let Some(peer_id) = self.resolve_peer_hash(entry.peer_hash) {
-                    if self.is_local_peer_str(&peer_id) {
-                        continue;
-                    }
-                    if let Some(remote) = self.remote_players.get_mut(&peer_id) {
-                        remote.update_state(&entry.state, current_frame);
-                    } else {
-                        let name = self
-                            .pending_player_names
-                            .remove(&peer_id)
-                            .unwrap_or_else(|| "Player".to_string());
-                        self.remote_players.insert(
-                            peer_id.clone(),
-                            RemotePlayer::new(name, &entry.state, current_frame),
-                        );
-                    }
+                let peer_id = self.resolve_or_register_peer_hash(entry.peer_hash);
+                if self.is_local_peer_str(&peer_id) {
+                    continue;
+                }
+                if let Some(remote) = self.remote_players.get_mut(&peer_id) {
+                    remote.update_state(&entry.state, current_frame);
+                } else {
+                    let name = self
+                        .pending_player_names
+                        .remove(&peer_id)
+                        .unwrap_or_else(|| "Player".to_string());
+                    self.remote_players.insert(
+                        peer_id.clone(),
+                        RemotePlayer::new(name, &entry.state, current_frame),
+                    );
                 }
             }
             if from_parent && !self.relay_children.is_empty() {
@@ -1307,9 +1392,8 @@ impl NetworkSession {
                 continue;
             }
             for entry in &batch.entries {
-                if let Some(peer_id) = self.resolve_peer_hash(entry.peer_hash) {
-                    self.pending_input_frames.push((peer_id, entry.frame));
-                }
+                let peer_id = self.resolve_or_register_peer_hash(entry.peer_hash);
+                self.pending_input_frames.push((peer_id, entry.frame));
             }
             if from_parent && !self.relay_children.is_empty() {
                 self.queue_downlink_input_batch(batch);
@@ -1692,6 +1776,7 @@ impl NetworkSession {
             self.local_peer_id = Some(id);
         }
         self.maybe_failover_parent(current_frame);
+        self.maybe_backoff_silent_peers(current_frame, &connected_peers);
         self.maybe_manage_bootstrap_full_mesh(&known_peers, &connected_peers);
         self.update_desired_peers(&known_peers, &connected_peers);
         self.maybe_detach_discovery(current_frame, &connected_peers);
@@ -1868,7 +1953,7 @@ impl NetworkSession {
         &mut self,
         local_id: Option<matchbox_socket::PeerId>,
         connected_peers: &[matchbox_socket::PeerId],
-        _known_peers: &[matchbox_socket::PeerId],
+        known_peers: &[matchbox_socket::PeerId],
         current_frame: u32,
     ) {
         if let Some(id) = local_id {
@@ -1887,10 +1972,15 @@ impl NetworkSession {
         self.latency_samples
             .retain(|peer_id, _| connected_peers.contains(peer_id));
 
-        // Keep election rooted in the active transport graph.
-        // Using signaling-known peers here can diverge between clients and cause split-brain
-        // host decisions in small rooms (e.g. two peers each self-electing).
-        let mut all_nodes = connected_peers.to_vec();
+        // While discovery is attached, root topology in the broader room membership view.
+        // Using only the currently-connected subgraph lets separate mini-clusters elect
+        // different roots and prune each other before the overlay converges.
+        let mut all_nodes = if self.discovery_attached {
+            known_peers.to_vec()
+        } else {
+            connected_peers.to_vec()
+        };
+        all_nodes.extend_from_slice(connected_peers);
         all_nodes.push(local_id);
         Self::sort_peer_ids(&mut all_nodes);
         all_nodes.dedup();
@@ -2009,8 +2099,8 @@ impl NetworkSession {
                 if let Some(pos) = self.local_last_pos {
                     supernode_positions.insert(hash, pos);
                 }
-            } else if let Some(peer_id) = self.peer_hash_lookup.get(&hash) {
-                if let Some(remote) = self.remote_players.get(peer_id) {
+            } else if let Some(peer_id) = self.identity_peer_id_for_hash(hash) {
+                if let Some(remote) = self.remote_players.get(&peer_id) {
                     supernode_positions.insert(hash, remote.pos);
                 }
             }
@@ -2153,6 +2243,38 @@ impl NetworkSession {
         }
     }
 
+    fn maybe_backoff_silent_peers(
+        &mut self,
+        current_frame: u32,
+        connected_peers: &[matchbox_socket::PeerId],
+    ) {
+        self.peer_link_backoff_until
+            .retain(|_, until| *until > current_frame);
+
+        for peer_id in connected_peers {
+            if self.peer_link_backoff_until.contains_key(peer_id) {
+                continue;
+            }
+            let Some(age) = self.peer_stale_age(*peer_id, current_frame) else {
+                continue;
+            };
+            if age < Self::STALE_LINK_RESET_FRAMES {
+                continue;
+            }
+            self.peer_link_backoff_until.insert(
+                *peer_id,
+                current_frame.saturating_add(Self::STALE_LINK_BACKOFF_FRAMES),
+            );
+            web_sys::console::warn_1(
+                &format!(
+                    "Backoff silent peer link {:?} after {} stale frames",
+                    peer_id, age
+                )
+                .into(),
+            );
+        }
+    }
+
     fn local_is_supernode(&self) -> bool {
         if self.is_host {
             return true;
@@ -2264,6 +2386,12 @@ impl NetworkSession {
         if let Some(local) = local_id {
             desired.remove(&local);
         }
+        desired.retain(|peer_id| {
+            self.peer_link_backoff_until
+                .get(peer_id)
+                .map(|until| *until <= self.last_update_frame)
+                .unwrap_or(true)
+        });
         desired
     }
 
@@ -2977,7 +3105,55 @@ impl NetworkSession {
     }
 
     pub fn resolve_peer_hash(&self, hash: u64) -> Option<PeerId> {
-        self.peer_hash_lookup.get(&hash).cloned()
+        self.identity_peer_id_for_hash(hash)
+    }
+
+    fn synthetic_peer_id_for_hash(hash: u64) -> PeerId {
+        format!("OverlayPeer({hash:016x})")
+    }
+
+    fn parse_synthetic_peer_hash(peer_id: &str) -> Option<u64> {
+        let hex = peer_id.strip_prefix("OverlayPeer(")?.strip_suffix(')')?;
+        u64::from_str_radix(hex, 16).ok()
+    }
+
+    fn peer_identity_hash(peer_id: &str) -> u64 {
+        Self::parse_synthetic_peer_hash(peer_id).unwrap_or_else(|| Self::hash_peer_id(peer_id))
+    }
+
+    fn migrate_peer_alias(&mut self, from: &str, to: &str) {
+        if from == to {
+            return;
+        }
+        if let Some(remote) = self.remote_players.remove(from) {
+            self.remote_players.entry(to.to_string()).or_insert(remote);
+        }
+        if let Some(stats) = self.remote_stats.remove(from) {
+            self.remote_stats.entry(to.to_string()).or_insert(stats);
+        }
+        if let Some(name) = self.pending_player_names.remove(from) {
+            self.pending_player_names
+                .entry(to.to_string())
+                .or_insert(name);
+        }
+        for (peer_id, _) in self.pending_input_frames.iter_mut() {
+            if peer_id == from {
+                *peer_id = to.to_string();
+            }
+        }
+    }
+
+    fn resolve_or_register_peer_hash(&mut self, hash: u64) -> PeerId {
+        if let Some(peer_id) = self.peer_identity_lookup.get(&hash) {
+            return peer_id.clone();
+        }
+        let canonical = self
+            .peer_hash_lookup
+            .get(&hash)
+            .cloned()
+            .unwrap_or_else(|| Self::synthetic_peer_id_for_hash(hash));
+        self.peer_identity_lookup.insert(hash, canonical.clone());
+        canonical
     }
 
     fn peer_id_key(peer_id: matchbox_socket::PeerId) -> String {
@@ -3100,7 +3276,7 @@ impl NetworkSession {
         }
 
         for (peer_id, remote) in &self.remote_players {
-            let hash = Self::hash_peer_id(peer_id);
+            let hash = Self::peer_identity_hash(peer_id);
             let base = Self::sanitize_display_base(&remote.name);
             base_by_hash.insert(hash, base.clone());
             groups
@@ -3537,7 +3713,7 @@ impl NetworkSession {
         }
 
         for (peer_id, remote) in &self.remote_players {
-            let hash = Self::hash_peer_id(peer_id);
+            let hash = Self::peer_identity_hash(peer_id);
             let base = Self::sanitize_display_base(&remote.name);
             let unique = display_by_hash.get(&hash).cloned().unwrap_or(base.clone());
             if unique.to_ascii_lowercase() == query {
@@ -3585,7 +3761,7 @@ impl NetworkSession {
         }
 
         for (peer_id, remote) in &self.remote_players {
-            let hash = Self::hash_peer_id(peer_id);
+            let hash = Self::peer_identity_hash(peer_id);
             let base = Self::sanitize_display_base(&remote.name);
             let unique = display_by_hash.get(&hash).cloned().unwrap_or(base.clone());
             if base.to_ascii_lowercase() == query || unique.to_ascii_lowercase() == query {
@@ -3704,7 +3880,7 @@ impl NetworkSession {
         };
         let mut remote_names = HashMap::new();
         for (peer_id, remote) in &self.remote_players {
-            let hash = Self::hash_peer_id(peer_id);
+            let hash = Self::peer_identity_hash(peer_id);
             let base = Self::sanitize_display_base(&remote.name);
             let display = display_by_hash.get(&hash).cloned().unwrap_or(base);
             remote_names.insert(peer_id.clone(), display);
@@ -3713,8 +3889,11 @@ impl NetworkSession {
     }
 
     pub fn display_name_for_peer_id(&self, peer_id: &str) -> String {
-        if let Some(remote) = self.remote_players.get(peer_id) {
-            let hash = Self::hash_peer_id(peer_id);
+        let hash = Self::peer_identity_hash(peer_id);
+        let canonical_peer_id = self
+            .identity_peer_id_for_hash(hash)
+            .unwrap_or_else(|| peer_id.to_string());
+        if let Some(remote) = self.remote_players.get(&canonical_peer_id) {
             let base = Self::sanitize_display_base(&remote.name);
             return self
                 .display_name_map_by_hash()
@@ -3836,9 +4015,7 @@ impl NetworkSession {
     }
 
     fn apply_remote_stats_snapshot(&mut self, snapshot: PlayerStatsSnapshot) {
-        let Some(peer_id) = self.resolve_peer_hash(snapshot.player_hash) else {
-            return;
-        };
+        let peer_id = self.resolve_or_register_peer_hash(snapshot.player_hash);
         if self.is_local_peer_str(&peer_id) {
             return;
         }
@@ -3961,7 +4138,7 @@ impl NetworkSession {
     pub fn flush_relay_batches(&mut self) {
         let parent = self.relay_active_parent.or(self.relay_parent);
         let children = self.relay_children.clone();
-        let hash_lookup = self.peer_hash_lookup.clone();
+        let identity_lookup = self.peer_identity_lookup.clone();
         let mut remote_positions: HashMap<PeerId, Vec2> = self
             .remote_players
             .iter()
@@ -3974,7 +4151,7 @@ impl NetworkSession {
                 .unwrap_or_default();
             if !local_id.is_empty() {
                 remote_positions.insert(local_id.clone(), local_pos);
-                let _ = hash_lookup.get(&local_hash);
+                let _ = identity_lookup.get(&local_hash);
             }
         }
 
@@ -4042,7 +4219,11 @@ impl NetworkSession {
                         None => continue,
                     };
                     let target_hash = Self::hash_peer_id(&child_id);
-                    let target_pos = remote_positions.get(&child_id).copied();
+                    let target_key = identity_lookup
+                        .get(&target_hash)
+                        .cloned()
+                        .unwrap_or_else(|| child_id.clone());
+                    let target_pos = remote_positions.get(&target_key).copied();
                     let target_area = target_pos.map(Self::area_id_from_pos);
                     let mut filtered: Vec<PlayerStateEntry> = entries
                         .iter()
@@ -4093,7 +4274,11 @@ impl NetworkSession {
                         None => continue,
                     };
                     let target_hash = Self::hash_peer_id(&child_id);
-                    let target_pos = remote_positions.get(&child_id).copied();
+                    let target_key = identity_lookup
+                        .get(&target_hash)
+                        .cloned()
+                        .unwrap_or_else(|| child_id.clone());
+                    let target_pos = remote_positions.get(&target_key).copied();
                     let target_area = target_pos.map(Self::area_id_from_pos);
                     let mut filtered: Vec<PlayerStateEntry> = batch
                         .entries
@@ -4158,7 +4343,11 @@ impl NetworkSession {
                         None => continue,
                     };
                     let target_hash = Self::hash_peer_id(&child_id);
-                    let target_pos = remote_positions.get(&child_id).copied();
+                    let target_key = identity_lookup
+                        .get(&target_hash)
+                        .cloned()
+                        .unwrap_or_else(|| child_id.clone());
+                    let target_pos = remote_positions.get(&target_key).copied();
                     let target_area = target_pos.map(Self::area_id_from_pos);
                     let mut filtered: Vec<InputFrameEntry> = entries
                         .iter()
@@ -4171,7 +4360,7 @@ impl NetworkSession {
                                     return true;
                                 }
                             }
-                            let entry_peer_id = match hash_lookup.get(&entry.peer_hash) {
+                            let entry_peer_id = match identity_lookup.get(&entry.peer_hash) {
                                 Some(id) => id,
                                 None => return true,
                             };
@@ -4219,7 +4408,11 @@ impl NetworkSession {
                         None => continue,
                     };
                     let target_hash = Self::hash_peer_id(&child_id);
-                    let target_pos = remote_positions.get(&child_id).copied();
+                    let target_key = identity_lookup
+                        .get(&target_hash)
+                        .cloned()
+                        .unwrap_or_else(|| child_id.clone());
+                    let target_pos = remote_positions.get(&target_key).copied();
                     let target_area = target_pos.map(Self::area_id_from_pos);
                     let mut filtered: Vec<InputFrameEntry> = batch
                         .entries
@@ -4233,7 +4426,7 @@ impl NetworkSession {
                                     return true;
                                 }
                             }
-                            let entry_peer_id = match hash_lookup.get(&entry.peer_hash) {
+                            let entry_peer_id = match identity_lookup.get(&entry.peer_hash) {
                                 Some(id) => id,
                                 None => return true,
                             };
@@ -5308,5 +5501,181 @@ mod tests {
         assert!(owner_session.apply_paid_name_reservation(reservation_local_owner));
         let fallback = owner_session.ensure_local_name_not_reserved_by_other();
         assert!(fallback.is_none());
+    }
+
+    #[test]
+    fn synthetic_peer_identity_resolves_consistently() {
+        let mut session = NetworkSession::new();
+        let remote = peer_from(7);
+        let remote_id = format!("{:?}", remote);
+        let remote_hash = NetworkSession::hash_peer_id(&remote_id);
+        let synthetic = NetworkSession::synthetic_peer_id_for_hash(remote_hash);
+        let state = PlayerState::new(
+            8,
+            Vec2::new(320.0, -144.0),
+            Vec2::LEFT,
+            Vec2::LEFT,
+            true,
+            false,
+            true,
+            false,
+            true,
+        );
+
+        session.peer_id_lookup.insert(remote_id.clone(), remote);
+        session
+            .peer_hash_lookup
+            .insert(remote_hash, remote_id.clone());
+        session
+            .peer_identity_lookup
+            .insert(remote_hash, synthetic.clone());
+        session.remote_players.insert(
+            synthetic.clone(),
+            RemotePlayer::new("SYNC".to_string(), &state, 8),
+        );
+        session.remote_stats.insert(
+            synthetic.clone(),
+            PlayerStats {
+                kills: 3,
+                ..PlayerStats::default()
+            },
+        );
+
+        assert_eq!(
+            session.resolve_peer_hash(remote_hash),
+            Some(synthetic.clone())
+        );
+        assert_eq!(
+            session.display_name_for_peer_id(&remote_id),
+            "SYNC".to_string()
+        );
+        assert_eq!(
+            session.display_name_for_hash(remote_hash),
+            "SYNC".to_string()
+        );
+        assert_eq!(session.resolve_hash_by_name("SYNC"), Some(remote_hash));
+        assert_eq!(session.peer_pos(remote), Some(Vec2::new(320.0, -144.0)));
+    }
+
+    #[test]
+    fn migrate_peer_alias_merges_direct_and_overlay_state() {
+        let mut session = NetworkSession::new();
+        let remote = peer_from(8);
+        let remote_id = format!("{:?}", remote);
+        let remote_hash = NetworkSession::hash_peer_id(&remote_id);
+        let synthetic = NetworkSession::synthetic_peer_id_for_hash(remote_hash);
+        let state = PlayerState::new(
+            12,
+            Vec2::new(12.0, 24.0),
+            Vec2::RIGHT,
+            Vec2::RIGHT,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        session.peer_id_lookup.insert(remote_id.clone(), remote);
+        session
+            .peer_hash_lookup
+            .insert(remote_hash, remote_id.clone());
+        session
+            .peer_identity_lookup
+            .insert(remote_hash, synthetic.clone());
+        session
+            .pending_player_names
+            .insert(remote_id.clone(), "SYNC".to_string());
+        session.remote_players.insert(
+            remote_id.clone(),
+            RemotePlayer::new("SYNC".to_string(), &state, 12),
+        );
+        session.remote_stats.insert(
+            remote_id.clone(),
+            PlayerStats {
+                kills: 5,
+                ..PlayerStats::default()
+            },
+        );
+        session.pending_input_frames.push((
+            remote_id.clone(),
+            InputFrame {
+                frame: 12,
+                input: 0,
+            },
+        ));
+
+        session.migrate_peer_alias(&remote_id, &synthetic);
+
+        assert!(session.remote_players.contains_key(&synthetic));
+        assert!(!session.remote_players.contains_key(&remote_id));
+        assert!(session.remote_stats.contains_key(&synthetic));
+        assert!(!session.remote_stats.contains_key(&remote_id));
+        assert_eq!(
+            session
+                .pending_input_frames
+                .first()
+                .map(|(id, _)| id.clone()),
+            Some(synthetic)
+        );
+    }
+
+    #[test]
+    fn discovery_membership_prevents_split_root_election() {
+        let root = peer_from(0);
+        let mid = peer_from(1);
+        let leaf = peer_from(2);
+
+        let mut session = NetworkSession::new();
+        session.discovery_attached = true;
+        session.local_peer_id = Some(mid);
+
+        session.update_supernode_from(Some(mid), &[leaf], &[root, leaf], 60);
+
+        assert_eq!(session.super_root_id, Some(root));
+        assert_eq!(session.supernode_id, Some(root));
+        assert!(!session.is_host);
+        assert_eq!(session.relay_parent, Some(root));
+    }
+
+    #[test]
+    fn detached_overlay_election_uses_connected_subgraph() {
+        let root = peer_from(0);
+        let mid = peer_from(1);
+        let leaf = peer_from(2);
+
+        let mut session = NetworkSession::new();
+        session.discovery_attached = false;
+        session.local_peer_id = Some(mid);
+
+        session.update_supernode_from(Some(mid), &[leaf], &[root, leaf], 60);
+
+        assert_eq!(session.super_root_id, Some(mid));
+        assert_eq!(session.supernode_id, Some(mid));
+        assert!(session.is_host);
+        assert_eq!(session.relay_parent, None);
+    }
+
+    #[test]
+    fn desired_links_exclude_temporarily_backed_off_peers() {
+        let peers = known_peers(4);
+        let local = peers[0];
+        let silent = peers[1];
+        let healthy = peers[2];
+
+        let mut session = NetworkSession::new();
+        session.local_peer_id = Some(local);
+        session.is_host = true;
+        session.discovery_attached = true;
+        session.relay_children = vec![silent, healthy];
+        session.last_update_frame = 100;
+        session
+            .peer_link_backoff_until
+            .insert(silent, session.last_update_frame + 30);
+
+        let desired = session.desired_peer_links(&peers, &peers[1..3]);
+
+        assert!(!desired.contains(&silent));
+        assert!(desired.contains(&healthy));
     }
 }

@@ -85,30 +85,34 @@ window.slimeTest.net();
 
 Use this workflow to reproduce/validate multiplayer sync stability and freeze regressions.
 
-1. Open two isolated browser contexts (separate tabs with isolated storage/profile).
-2. In tab A, create a room (manual title action is fine).
-3. Read tab A room code from `window.slimeTest.net()` (`room=XXXXXX`).
-4. In tab B console, set room + reload + join:
+1. Open separate browser windows for each client under test. Separate tabs can be background-throttled by the OS/browser and are less reliable for sync debugging.
+2. In window A, create a room and wait until `window.slimeTest.net()` shows a real `local_peer=PeerId(...)`.
+3. Read window A room code from `window.slimeTest.net()` (`room=XXXXXX`).
+4. In window B console, set room + reload + join:
 ```js
 localStorage.setItem("slime_room_code", "ROOMCODE");
 location.reload();
 // after reload:
 window.slimeTest.joinCurrentRoom();
 ```
-5. Immediately keep both slimes moving so they do not die during sync checks:
+5. Repeat for any additional windows after the creator is already attached to signaling.
+6. Immediately keep all slimes moving so they do not die during sync checks:
 ```js
 window.slimeTest.keepAliveStart(360, 0.72);
 ```
-6. Poll both tabs every 1s:
+7. Poll all windows every 1s:
 ```js
 window.slimeTest.net();
 window.slimeTest.state();
+window.slimeTest.logs();
 ```
-7. Healthy behavior: both tabs keep `remote_players=1` and remain responsive.
-8. Freeze regression signature: one tab logs `Discovery detached: using gameplay overlay links only`, then becomes unresponsive or drops; the other tab eventually reports `remote_players=0`.
+8. Healthy behavior: all windows agree on player count/names and continue receiving traffic (`rx` rises, `remote_players` matches expected peers).
+9. Split-room regression signature: one window shows a connected peer with a growing stale age or rising silence warnings, while other windows form a separate subgraph and do not list the creator.
+10. Freeze regression signature: one window logs `Discovery detached: using gameplay overlay links only`, then becomes unresponsive or drops; the other windows eventually report fewer peers.
 
 Notes:
 - Use `window.slimeTest` for automation. `window.slime` exposes low-level wasm exports and is not safe for direct string-argument automation calls.
+- `window.slimeTest.logs()` returns the buffered page console tail, which is the first thing to inspect when a peer stalls or splits.
 - Keep this as the default sync regression test until a fuller automated harness lands.
 
 ## Architecture

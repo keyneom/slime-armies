@@ -19,7 +19,11 @@ pub use socket::{
     BuildablePlurality, ChannelConfig, ChannelPlurality, MultipleChannels, NoChannels, PeerState,
     RtcIceServerConfig, SingleChannel, WebRtcChannel, WebRtcSocket, WebRtcSocketBuilder,
 };
-use std::{collections::{HashMap, HashSet}, pin::Pin, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    pin::Pin,
+    time::{Duration, Instant},
+};
 
 cfg_if! {
     if #[cfg(target_arch = "wasm32")] {
@@ -128,6 +132,7 @@ struct HandshakeResult<D: PeerDataSender, M> {
     peer_id: PeerId,
     data_channels: Vec<D>,
     metadata: M,
+    established: bool,
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -162,6 +167,8 @@ async fn message_loop<M: Messenger>(
     channels: MessageLoopChannels,
     keep_alive_interval: Option<Duration>,
 ) -> Result<(), SignalingError> {
+    const HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_millis(750);
+
     let MessageLoopChannels {
         requests_sender,
         mut events_receiver,
@@ -178,6 +185,7 @@ async fn message_loop<M: Messenger>(
     let mut data_channels: HashMap<PeerId, Vec<M::DataChannel>> = HashMap::new();
     let mut known_peers = HashSet::new();
     let mut desired_peers: Option<HashSet<PeerId>> = None;
+    let mut handshake_retry_after: HashMap<PeerId, Instant> = HashMap::new();
     let mut id_tx = Option::Some(id_tx);
     let mut signaling_attached = true;
 
@@ -187,6 +195,38 @@ async fn message_loop<M: Messenger>(
         Either::Right(std::future::pending())
     }
     .fuse();
+    let mut handshake_retry_tick = Delay::new(HANDSHAKE_RETRY_INTERVAL).fuse();
+
+    macro_rules! queue_offer_handshake {
+        ($peer:expr) => {{
+            let peer_uuid = $peer;
+            let should_connect = desired_peers
+                .as_ref()
+                .map_or(true, |set| set.contains(&peer_uuid));
+            let retry_ready = handshake_retry_after
+                .get(&peer_uuid)
+                .map(|deadline| Instant::now() >= *deadline)
+                .unwrap_or(true);
+            if signaling_attached
+                && should_connect
+                && retry_ready
+                && !data_channels.contains_key(&peer_uuid)
+                && !handshake_signals.contains_key(&peer_uuid)
+            {
+                let (signal_tx, signal_rx) = futures_channel::mpsc::unbounded();
+                handshake_signals.insert(peer_uuid, signal_tx);
+                handshake_retry_after.remove(&peer_uuid);
+                let signal_peer = SignalPeer::new(peer_uuid, requests_sender.clone());
+                handshakes.push(M::offer_handshake(
+                    signal_peer,
+                    signal_rx,
+                    messages_from_peers_tx.clone(),
+                    ice_server_config,
+                    channel_configs,
+                ));
+            }
+        }};
+    }
 
     loop {
         let mut next_peer_messages_out = peer_messages_out_rx
@@ -216,6 +256,16 @@ async fn message_loop<M: Messenger>(
                 }
             }
 
+            _ = &mut handshake_retry_tick => {
+                if signaling_attached {
+                    let retry_peers: Vec<PeerId> = known_peers.iter().copied().collect();
+                    for peer_uuid in retry_peers {
+                        queue_offer_handshake!(peer_uuid);
+                    }
+                }
+                handshake_retry_tick = Delay::new(HANDSHAKE_RETRY_INTERVAL).fuse();
+            }
+
             message = next_signaling_event => {
                 if let Some(event) = message {
                     debug!("{event:?}");
@@ -228,30 +278,15 @@ async fn message_loop<M: Messenger>(
                         },
                         PeerEvent::NewPeer(peer_uuid) => {
                             known_peers.insert(peer_uuid);
+                            handshake_retry_after.remove(&peer_uuid);
                             if known_peer_tx.unbounded_send((peer_uuid, true)).is_err() {
                                 break Ok(());
                             }
-                            let should_connect = desired_peers
-                                .as_ref()
-                                .map_or(true, |set| set.contains(&peer_uuid));
-                            if should_connect
-                                && !data_channels.contains_key(&peer_uuid)
-                                && !handshake_signals.contains_key(&peer_uuid)
-                            {
-                                let (signal_tx, signal_rx) = futures_channel::mpsc::unbounded();
-                                handshake_signals.insert(peer_uuid, signal_tx);
-                                let signal_peer = SignalPeer::new(peer_uuid, requests_sender.clone());
-                                handshakes.push(M::offer_handshake(
-                                    signal_peer,
-                                    signal_rx,
-                                    messages_from_peers_tx.clone(),
-                                    ice_server_config,
-                                    channel_configs
-                                ));
-                            }
+                            queue_offer_handshake!(peer_uuid);
                         },
                         PeerEvent::PeerLeft(peer_uuid) => {
                             known_peers.remove(&peer_uuid);
+                            handshake_retry_after.remove(&peer_uuid);
                             let _ = known_peer_tx.unbounded_send((peer_uuid, false));
                             handshake_signals.remove(&peer_uuid);
                             // Keep already-established data channels alive even if the peer leaves
@@ -272,6 +307,7 @@ async fn message_loop<M: Messenger>(
                             }
                             let signal_tx = handshake_signals.entry(sender).or_insert_with(|| {
                                 let (from_peer_tx, peer_signal_rx) = futures_channel::mpsc::unbounded();
+                                handshake_retry_after.remove(&sender);
                                 let signal_peer = SignalPeer::new(sender, requests_sender.clone());
                                 handshakes.push(M::accept_handshake(signal_peer, peer_signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs));
                                 from_peer_tx
@@ -326,6 +362,7 @@ async fn message_loop<M: Messenger>(
                         .copied()
                         .collect();
                     for peer in to_drop {
+                        handshake_retry_after.remove(&peer);
                         if let Some(mut channels) = data_channels.remove(&peer) {
                             for channel in channels.iter_mut() {
                                 channel.close();
@@ -339,25 +376,7 @@ async fn message_loop<M: Messenger>(
                 if signaling_attached {
                     let known_snapshot: Vec<PeerId> = known_peers.iter().copied().collect();
                     for peer in known_snapshot {
-                        let should_connect = desired_peers
-                            .as_ref()
-                            .map_or(true, |set| set.contains(&peer));
-                        if !should_connect
-                            || data_channels.contains_key(&peer)
-                            || handshake_signals.contains_key(&peer)
-                        {
-                            continue;
-                        }
-                        let (signal_tx, signal_rx) = futures_channel::mpsc::unbounded();
-                        handshake_signals.insert(peer, signal_tx);
-                        let signal_peer = SignalPeer::new(peer, requests_sender.clone());
-                        handshakes.push(M::offer_handshake(
-                            signal_peer,
-                            signal_rx,
-                            messages_from_peers_tx.clone(),
-                            ice_server_config,
-                            channel_configs
-                        ));
+                        queue_offer_handshake!(peer);
                     }
                 }
             }
@@ -369,12 +388,19 @@ async fn message_loop<M: Messenger>(
                     .as_ref()
                     .map_or(true, |set| set.contains(&peer_id));
                 let mut channels = handshake_result.data_channels;
-                if !should_connect {
+                if !handshake_result.established || !should_connect {
                     for channel in channels.iter_mut() {
                         channel.close();
                     }
+                    if !handshake_result.established {
+                        handshake_retry_after.insert(peer_id, Instant::now() + HANDSHAKE_RETRY_INTERVAL);
+                        let _ = peer_state_tx.unbounded_send((peer_id, PeerState::Disconnected));
+                    } else {
+                        handshake_retry_after.remove(&peer_id);
+                    }
                     continue;
                 }
+                handshake_retry_after.remove(&peer_id);
                 data_channels.insert(peer_id, channels);
                 if peer_state_tx.unbounded_send((peer_id, PeerState::Connected)).is_err() {
                     // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore
@@ -390,6 +416,17 @@ async fn message_loop<M: Messenger>(
                     for channel in channels.iter_mut() {
                         channel.close();
                     }
+                }
+                if signaling_attached
+                    && desired_peers
+                        .as_ref()
+                        .map_or(true, |set| set.contains(&peer_uuid))
+                    && known_peers.contains(&peer_uuid)
+                {
+                    handshake_retry_after
+                        .insert(peer_uuid, Instant::now() + HANDSHAKE_RETRY_INTERVAL);
+                } else {
+                    handshake_retry_after.remove(&peer_uuid);
                 }
                 if peer_state_tx.unbounded_send((peer_uuid, PeerState::Disconnected)).is_err() {
                     // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore

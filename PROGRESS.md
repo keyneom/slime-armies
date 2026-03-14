@@ -133,6 +133,8 @@ CLIENT (joiner):
 - [x] Added Shrinefinder badge + shrine encounter at (67, 67)
 - [x] p2pago SDK bundled (UMD) + support gating hooks for paid abilities
 - [x] Added dedicated browser automation entry point (`window.slimeTest`) with input injection + runtime snapshot helpers for test harnesses (no gameplay/UI behavior changes for normal users)
+- [x] Added buffered automation log access via `window.slimeTest.logs()` for sync triage
+- [x] Added regression coverage for discovery-rooted topology election to prevent split-room self-election during overlay convergence
 
 ## Build & Test
 ```bash
@@ -148,12 +150,12 @@ trunk serve  # Dev server on http://localhost:8080
 6. Client player's attacks should also kill enemies (local collision still works)
 
 ### Sync Testing (Automation-Friendly)
-1. Use isolated browser contexts so tabs do not share local storage.
-2. Create room in tab A; capture `room=...` from `window.slimeTest.net()`.
-3. In tab B: set `localStorage.setItem("slime_room_code", "<ROOM>")`, reload, then call `window.slimeTest.joinCurrentRoom()`.
-4. Start movement keepalive in both tabs (`window.slimeTest.keepAliveStart(360, 0.72)`) so slimes stay alive.
-5. Poll both tabs with `window.slimeTest.net()` + `window.slimeTest.state()` every 1s.
-6. Regression signature: one tab logs `Discovery detached: using gameplay overlay links only` then drops/freeze behavior; peer count eventually falls back to solo (`remote_players=0`).
+1. Prefer separate browser windows for each client under test; tabs are more likely to be background-throttled.
+2. Create room in window A and wait until `window.slimeTest.net()` shows a real `local_peer=PeerId(...)`.
+3. In each additional window: set `localStorage.setItem("slime_room_code", "<ROOM>")`, reload, then call `window.slimeTest.joinCurrentRoom()`.
+4. Start movement keepalive in all windows (`window.slimeTest.keepAliveStart(360, 0.72)`) so slimes stay alive.
+5. Poll each window with `window.slimeTest.net()` + `window.slimeTest.state()` + `window.slimeTest.logs()` every 1s.
+6. Regression signature: one window keeps a silent/stale connected peer while other windows form a separate subgraph, or a window logs `Discovery detached: using gameplay overlay links only` then drops/freeze behavior and falls back toward solo (`remote_players=0`).
 
 ## Requested Features
 - [x] Team scoring system that accounts for kills, deaths, and time played.

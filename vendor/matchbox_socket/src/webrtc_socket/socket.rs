@@ -8,7 +8,7 @@ use crate::{
 };
 use futures::{future::Fuse, select, Future, FutureExt, StreamExt};
 use futures_channel::mpsc::{SendError, TrySendError, UnboundedReceiver, UnboundedSender};
-use log::{debug, error};
+use log::{debug, error, warn};
 use matchbox_protocol::PeerId;
 use std::{collections::{HashMap, HashSet}, marker::PhantomData, pin::Pin, time::Duration};
 
@@ -759,7 +759,7 @@ pub(crate) fn create_data_channels_ready_fut(
     channel_configs: &[ChannelConfig],
 ) -> (
     Vec<futures_channel::mpsc::Sender<()>>,
-    Pin<Box<Fuse<impl Future<Output = ()>>>>,
+    Pin<Box<Fuse<impl Future<Output = bool>>>>,
 ) {
     let (senders, receivers) = (0..channel_configs.len())
         .map(|_| futures_channel::mpsc::channel(1))
@@ -768,12 +768,14 @@ pub(crate) fn create_data_channels_ready_fut(
     (senders, Box::pin(wait_for_ready(receivers).fuse()))
 }
 
-async fn wait_for_ready(channel_ready_rx: Vec<futures_channel::mpsc::Receiver<()>>) {
+async fn wait_for_ready(channel_ready_rx: Vec<futures_channel::mpsc::Receiver<()>>) -> bool {
     for mut receiver in channel_ready_rx {
         if receiver.next().await.is_none() {
-            panic!("Sender closed before channel was ready");
+            warn!("channel-ready sender closed before data channel opened");
+            return false;
         }
     }
+    true
 }
 
 /// All the channels needed for the messaging loop.
