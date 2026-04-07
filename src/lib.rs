@@ -887,8 +887,13 @@ pub fn test_debug_teleport(x: f32, y: f32) {
 #[wasm_bindgen]
 pub fn test_runtime_state() -> String {
     GAME_STATE.with(|gs| {
-        if let Some(state) = gs.borrow().as_ref() {
-            let state_ref = state.borrow();
+        let Ok(game_state) = gs.try_borrow() else {
+            return "scene=busy;network=busy;room=;players=0;map_open=false;player_list_open=false;chat_open=false".to_string();
+        };
+        if let Some(state) = game_state.as_ref() {
+            let Ok(state_ref) = state.try_borrow() else {
+                return "scene=busy;network=busy;room=;players=0;map_open=false;player_list_open=false;chat_open=false".to_string();
+            };
             let scene = scene_name(state_ref.game.scene);
             let net = network_state_name(&state_ref.network.state);
             let room = state_ref.network.room_code.as_str();
@@ -907,17 +912,23 @@ pub fn test_runtime_state() -> String {
 
 /// Focused network diagnostics for multi-device validation.
 /// Format:
-/// `network=...;room=...;remote_players=...;known_peers=...;desired_peers=...;discovery_attached=...;relay_epoch=...;is_host=...;local_peer=...;supernode=...;local_name=...;rx=...;dropped=...;remote_ids=...;remote_names=...`
+/// `network=...;room=...;remote_players=...;known_peers=...;desired_peers=...;desired_ids=...;discovery_attached=...;relay_epoch=...;is_host=...;local_peer=...;supernode=...;local_name=...;rx=...;dropped=...;remote_ids=...;remote_names=...`
 #[wasm_bindgen]
 pub fn test_network_diag() -> String {
     GAME_STATE.with(|gs| {
-        if let Some(state) = gs.borrow().as_ref() {
-            let state_ref = state.borrow();
+        let Ok(game_state) = gs.try_borrow() else {
+            return "network=busy;room=;remote_players=0;known_peers=0;desired_peers=0;desired_ids=none;discovery_attached=false;relay_epoch=0;is_host=false;local_peer=none;supernode=none;local_name=none;rx=0;dropped=0;remote_ids=none;remote_names=none".to_string();
+        };
+        if let Some(state) = game_state.as_ref() {
+            let Ok(state_ref) = state.try_borrow() else {
+                return "network=busy;room=;remote_players=0;known_peers=0;desired_peers=0;desired_ids=none;discovery_attached=false;relay_epoch=0;is_host=false;local_peer=none;supernode=none;local_name=none;rx=0;dropped=0;remote_ids=none;remote_names=none".to_string();
+            };
             let net = network_state_name(&state_ref.network.state);
             let room = state_ref.network.room_code.as_str();
             let remote_players = state_ref.network.peer_count();
             let known_peers = state_ref.network.known_peer_count();
             let desired_peers = state_ref.network.desired_peer_count();
+            let desired_ids = state_ref.network.desired_peer_debug();
             let discovery_attached = state_ref.network.discovery_attached();
             let relay_epoch = state_ref.network.relay_epoch();
             let is_host = state_ref.network.is_host;
@@ -962,10 +973,10 @@ pub fn test_network_diag() -> String {
                 remote_names.join(",")
             };
             format!(
-                "network={net};room={room};remote_players={remote_players};known_peers={known_peers};desired_peers={desired_peers};discovery_attached={discovery_attached};relay_epoch={relay_epoch};is_host={is_host};local_peer={local_peer};supernode={supernode};local_name={local_name};rx={rx};dropped={dropped};remote_ids={remote_ids};remote_names={remote_names}"
+                "network={net};room={room};remote_players={remote_players};known_peers={known_peers};desired_peers={desired_peers};desired_ids={desired_ids};discovery_attached={discovery_attached};relay_epoch={relay_epoch};is_host={is_host};local_peer={local_peer};supernode={supernode};local_name={local_name};rx={rx};dropped={dropped};remote_ids={remote_ids};remote_names={remote_names}"
             )
         } else {
-            "network=uninitialized;room=;remote_players=0;known_peers=0;desired_peers=0;discovery_attached=false;relay_epoch=0;is_host=false;local_peer=none;supernode=none;local_name=none;rx=0;dropped=0;remote_ids=none;remote_names=none".to_string()
+            "network=uninitialized;room=;remote_players=0;known_peers=0;desired_peers=0;desired_ids=none;discovery_attached=false;relay_epoch=0;is_host=false;local_peer=none;supernode=none;local_name=none;rx=0;dropped=0;remote_ids=none;remote_names=none".to_string()
         }
     })
 }
@@ -976,8 +987,13 @@ pub fn test_network_diag() -> String {
 #[wasm_bindgen]
 pub fn test_player_snapshot() -> String {
     GAME_STATE.with(|gs| {
-        if let Some(state) = gs.borrow().as_ref() {
-            let state_ref = state.borrow();
+        let Ok(game_state) = gs.try_borrow() else {
+            return "scene=busy;local=none@0.0,0.0;remote=none".to_string();
+        };
+        if let Some(state) = game_state.as_ref() {
+            let Ok(state_ref) = state.try_borrow() else {
+                return "scene=busy;local=none@0.0,0.0;remote=none".to_string();
+            };
             let scene = scene_name(state_ref.game.scene);
             let local_name = state_ref.network.local_display_name();
             let local_pos = state_ref.game.player.pos;

@@ -125,6 +125,7 @@ trait PeerDataSender {
 pub(crate) enum SocketControl {
     FullMesh,
     SetDesiredPeers(HashSet<PeerId>),
+    DropPeer(PeerId),
     DetachSignaling,
 }
 
@@ -133,6 +134,27 @@ struct HandshakeResult<D: PeerDataSender, M> {
     data_channels: Vec<D>,
     metadata: M,
     established: bool,
+}
+
+enum HandshakeOutcome<D: PeerDataSender, M> {
+    Result(HandshakeResult<D, M>),
+    TimedOut(PeerId),
+}
+
+async fn with_handshake_timeout<F, D, M>(peer_id: PeerId, future: F) -> HandshakeOutcome<D, M>
+where
+    F: Future<Output = HandshakeResult<D, M>>,
+    D: PeerDataSender,
+{
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(6);
+
+    let mut timeout = Delay::new(HANDSHAKE_TIMEOUT).fuse();
+    let mut future = Box::pin(future).fuse();
+
+    select! {
+        result = future => HandshakeOutcome::Result(result),
+        _ = timeout => HandshakeOutcome::TimedOut(peer_id),
+    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -217,12 +239,15 @@ async fn message_loop<M: Messenger>(
                 handshake_signals.insert(peer_uuid, signal_tx);
                 handshake_retry_after.remove(&peer_uuid);
                 let signal_peer = SignalPeer::new(peer_uuid, requests_sender.clone());
-                handshakes.push(M::offer_handshake(
-                    signal_peer,
-                    signal_rx,
-                    messages_from_peers_tx.clone(),
-                    ice_server_config,
-                    channel_configs,
+                handshakes.push(with_handshake_timeout(
+                    peer_uuid,
+                    M::offer_handshake(
+                        signal_peer,
+                        signal_rx,
+                        messages_from_peers_tx.clone(),
+                        ice_server_config,
+                        channel_configs,
+                    ),
                 ));
             }
         }};
@@ -299,9 +324,19 @@ async fn message_loop<M: Messenger>(
                             }
                         },
                         PeerEvent::Signal { sender, data } => {
+                            let bootstrap_accept_sender = signaling_attached
+                                && data_channels.len() < 2
+                                && (known_peers.len() <= 1
+                                    || desired_peers
+                                        .as_ref()
+                                        .map_or(true, |set| set.len() <= 1));
                             let should_connect = desired_peers
                                 .as_ref()
-                                .map_or(true, |set| set.contains(&sender) || data_channels.contains_key(&sender));
+                                .map_or(true, |set| {
+                                    set.contains(&sender)
+                                        || data_channels.contains_key(&sender)
+                                        || bootstrap_accept_sender
+                                });
                             if !should_connect {
                                 continue;
                             }
@@ -309,7 +344,16 @@ async fn message_loop<M: Messenger>(
                                 let (from_peer_tx, peer_signal_rx) = futures_channel::mpsc::unbounded();
                                 handshake_retry_after.remove(&sender);
                                 let signal_peer = SignalPeer::new(sender, requests_sender.clone());
-                                handshakes.push(M::accept_handshake(signal_peer, peer_signal_rx, messages_from_peers_tx.clone(), ice_server_config, channel_configs));
+                                handshakes.push(with_handshake_timeout(
+                                    sender,
+                                    M::accept_handshake(
+                                        signal_peer,
+                                        peer_signal_rx,
+                                        messages_from_peers_tx.clone(),
+                                        ice_server_config,
+                                        channel_configs,
+                                    ),
+                                ));
                                 from_peer_tx
                             });
 
@@ -333,7 +377,18 @@ async fn message_loop<M: Messenger>(
                         desired_peers = None;
                     }
                     Some(SocketControl::SetDesiredPeers(peers)) => {
+                        debug!("set desired peers: {peers:?}");
                         desired_peers = Some(peers);
+                    }
+                    Some(SocketControl::DropPeer(peer)) => {
+                        debug!("force drop peer: {peer:?}");
+                        handshake_retry_after.remove(&peer);
+                        if let Some(mut channels) = data_channels.remove(&peer) {
+                            for channel in channels.iter_mut() {
+                                channel.close();
+                            }
+                            let _ = peer_state_tx.unbounded_send((peer, PeerState::Disconnected));
+                        }
                     }
                     Some(SocketControl::DetachSignaling) => {
                         if signaling_attached {
@@ -382,31 +437,41 @@ async fn message_loop<M: Messenger>(
             }
 
             handshake_result = handshakes.select_next_some() => {
-                let peer_id = handshake_result.peer_id;
-                handshake_signals.remove(&peer_id);
-                let should_connect = desired_peers
-                    .as_ref()
-                    .map_or(true, |set| set.contains(&peer_id));
-                let mut channels = handshake_result.data_channels;
-                if !handshake_result.established || !should_connect {
-                    for channel in channels.iter_mut() {
-                        channel.close();
-                    }
-                    if !handshake_result.established {
+                match handshake_result {
+                    HandshakeOutcome::TimedOut(peer_id) => {
+                        warn!("handshake timed out for peer {peer_id:?}");
+                        handshake_signals.remove(&peer_id);
                         handshake_retry_after.insert(peer_id, Instant::now() + HANDSHAKE_RETRY_INTERVAL);
                         let _ = peer_state_tx.unbounded_send((peer_id, PeerState::Disconnected));
-                    } else {
-                        handshake_retry_after.remove(&peer_id);
                     }
-                    continue;
+                    HandshakeOutcome::Result(handshake_result) => {
+                        let peer_id = handshake_result.peer_id;
+                        handshake_signals.remove(&peer_id);
+                        let should_connect = desired_peers
+                            .as_ref()
+                            .map_or(true, |set| set.contains(&peer_id));
+                        let mut channels = handshake_result.data_channels;
+                        if !handshake_result.established || !should_connect {
+                            for channel in channels.iter_mut() {
+                                channel.close();
+                            }
+                            if !handshake_result.established {
+                                handshake_retry_after.insert(peer_id, Instant::now() + HANDSHAKE_RETRY_INTERVAL);
+                                let _ = peer_state_tx.unbounded_send((peer_id, PeerState::Disconnected));
+                            } else {
+                                handshake_retry_after.remove(&peer_id);
+                            }
+                            continue;
+                        }
+                        handshake_retry_after.remove(&peer_id);
+                        data_channels.insert(peer_id, channels);
+                        if peer_state_tx.unbounded_send((peer_id, PeerState::Connected)).is_err() {
+                            // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore
+                            break Ok(());
+                        }
+                        peer_loops.push(M::peer_loop(peer_id, handshake_result.metadata));
+                    }
                 }
-                handshake_retry_after.remove(&peer_id);
-                data_channels.insert(peer_id, channels);
-                if peer_state_tx.unbounded_send((peer_id, PeerState::Connected)).is_err() {
-                    // sending can only fail on socket drop, in which case connected_peers is unavailable, ignore
-                    break Ok(());
-                }
-                peer_loops.push(M::peer_loop(peer_id, handshake_result.metadata));
             }
 
             peer_uuid = peer_loops.select_next_some() => {

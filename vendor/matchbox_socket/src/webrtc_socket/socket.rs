@@ -565,6 +565,11 @@ impl<C: ChannelPlurality> WebRtcSocket<C> {
         let _ = self.control_tx.unbounded_send(SocketControl::SetDesiredPeers(set));
     }
 
+    /// Force-drops a connected peer channel so the overlay can recover from stale routes.
+    pub fn drop_peer(&mut self, peer: PeerId) {
+        let _ = self.control_tx.unbounded_send(SocketControl::DropPeer(peer));
+    }
+
     /// Restores full-mesh behavior (connect to all known peers).
     pub fn clear_desired_peers(&mut self) {
         let _ = self.control_tx.unbounded_send(SocketControl::FullMesh);

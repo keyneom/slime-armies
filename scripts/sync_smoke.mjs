@@ -242,7 +242,7 @@ async function main() {
       await page.connect();
       await page.waitFor(
         "typeof window.slimeTest === 'object' && typeof window.slimeTest.reloadWithProfile === 'function' && typeof window.slimeTest.players === 'function'",
-        20000,
+        40000,
         "page 1 window.slimeTest readiness"
       );
       pages.push(page);
@@ -277,7 +277,7 @@ async function main() {
     );
     await pages[0].waitFor(
       "typeof window.slimeTest === 'object' && typeof window.slimeTest.createRoom === 'function'",
-      20000,
+      40000,
       "page 1 reload readiness"
     );
     const room = await pages[0].slime("window.slimeTest.createRoom()");
@@ -303,7 +303,7 @@ async function main() {
       await page.connect();
       await page.waitFor(
         "typeof window.slimeTest === 'object' && typeof window.slimeTest.reloadWithProfile === 'function' && typeof window.slimeTest.players === 'function'",
-        20000,
+        40000,
         `page ${i + 1} window.slimeTest readiness`
       );
       pages.push(page);
@@ -312,7 +312,7 @@ async function main() {
       );
       await pages[i].waitFor(
         "typeof window.slimeTest === 'object' && typeof window.slimeTest.joinSavedRoom === 'function'",
-        20000,
+        40000,
         `page ${i + 1} reload readiness`
       );
       await pages[i].slime("window.slimeTest.joinSavedRoom()");

@@ -1769,7 +1769,9 @@ impl NetworkSession {
 
         let prev_supernode = self.supernode_id;
         let prev_relay_epoch = self.relay_epoch;
-        let allow_local_topology_recompute = self.discovery_attached || self.is_host;
+        let allow_local_topology_recompute = self.discovery_attached
+            || self.is_host
+            || self.detached_overlay_needs_recompute(&connected_peers, current_frame);
         if allow_local_topology_recompute {
             self.update_supernode_from(local_id, &connected_peers, &known_peers, current_frame);
         } else if let Some(id) = local_id {
@@ -2395,6 +2397,34 @@ impl NetworkSession {
         desired
     }
 
+    fn desired_set_needs_enforcement(
+        desired: &HashSet<matchbox_socket::PeerId>,
+        connected_peers: &[matchbox_socket::PeerId],
+    ) -> bool {
+        connected_peers.iter().any(|peer_id| !desired.contains(peer_id))
+    }
+
+    fn detached_overlay_needs_recompute(
+        &self,
+        connected_peers: &[matchbox_socket::PeerId],
+        current_frame: u32,
+    ) -> bool {
+        if self.discovery_attached || self.is_host || connected_peers.is_empty() {
+            return false;
+        }
+
+        let connected: HashSet<matchbox_socket::PeerId> =
+            connected_peers.iter().copied().collect();
+        let route_live = |peer: Option<matchbox_socket::PeerId>| {
+            peer.map(|id| connected.contains(&id) && self.peer_seen_recently(id, current_frame))
+                .unwrap_or(false)
+        };
+
+        !(route_live(self.relay_active_parent)
+            || route_live(self.relay_parent)
+            || route_live(self.relay_backup_parent))
+    }
+
     fn update_desired_peers(
         &mut self,
         known_peers: &[matchbox_socket::PeerId],
@@ -2404,10 +2434,28 @@ impl NetworkSession {
             return;
         }
         let desired = self.desired_peer_links(known_peers, connected_peers);
-        if desired == self.desired_peer_set {
+        let needs_enforcement = Self::desired_set_needs_enforcement(&desired, connected_peers);
+        if desired == self.desired_peer_set && !needs_enforcement {
             return;
         }
         if let Some(socket) = &mut self.socket {
+            if needs_enforcement {
+                for peer_id in connected_peers {
+                    if !desired.contains(peer_id) {
+                        web_sys::console::warn_1(
+                            &format!(
+                                "[sync-trace f={}] force-drop undesired peer {:?}; desired={:?}; connected={:?}",
+                                self.last_update_frame,
+                                peer_id,
+                                desired,
+                                connected_peers
+                            )
+                            .into(),
+                        );
+                        socket.drop_peer(*peer_id);
+                    }
+                }
+            }
             socket.set_desired_peers(desired.iter().copied());
         }
         self.desired_peer_set = desired;
@@ -4558,6 +4606,20 @@ impl NetworkSession {
         self.desired_peer_set.len()
     }
 
+    pub fn desired_peer_debug(&self) -> String {
+        let mut ids: Vec<String> = self
+            .desired_peer_set
+            .iter()
+            .map(|id| format!("{:?}", id))
+            .collect();
+        ids.sort();
+        if ids.is_empty() {
+            "none".to_string()
+        } else {
+            ids.join(",")
+        }
+    }
+
     pub fn discovery_attached(&self) -> bool {
         self.discovery_attached
     }
@@ -5677,5 +5739,42 @@ mod tests {
 
         assert!(!desired.contains(&silent));
         assert!(desired.contains(&healthy));
+    }
+
+    #[test]
+    fn desired_set_reenforces_when_connected_peer_is_no_longer_desired() {
+        let peers = known_peers(3);
+        let mut desired = HashSet::new();
+        desired.insert(peers[1]);
+
+        assert!(NetworkSession::desired_set_needs_enforcement(
+            &desired,
+            &[peers[1], peers[2]]
+        ));
+        assert!(!NetworkSession::desired_set_needs_enforcement(
+            &desired,
+            &[peers[1]]
+        ));
+    }
+
+    #[test]
+    fn detached_overlay_recomputes_when_all_parent_routes_are_lost() {
+        let root = peer_from(0);
+        let mid = peer_from(1);
+        let leaf = peer_from(2);
+
+        let mut session = NetworkSession::new();
+        session.discovery_attached = false;
+        session.local_peer_id = Some(mid);
+        session.relay_parent = Some(root);
+        session.relay_active_parent = Some(root);
+        session.super_root_id = Some(root);
+
+        assert!(session.detached_overlay_needs_recompute(&[leaf], 60));
+
+        session.relay_parent = Some(leaf);
+        session.relay_active_parent = Some(leaf);
+        session.peer_connected_frames.insert(leaf, 50);
+        assert!(!session.detached_overlay_needs_recompute(&[leaf], 60));
     }
 }
