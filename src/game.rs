@@ -2242,6 +2242,12 @@ impl Game {
 
     /// Apply a wave start event from the network
     pub fn apply_wave_start(&mut self, wave_start: &crate::net::WaveStart) {
+        // Idempotent: host may re-broadcast the same wave over the relay tree for late joiners.
+        if let Some(last) = self.last_wave_start {
+            if last.wave == wave_start.wave && last.rng_seed == wave_start.rng_seed {
+                return;
+            }
+        }
         self.wave = wave_start.wave;
         self.rng = Xoshiro256PlusPlus::seed_from_u64(wave_start.rng_seed);
         self.wave_kill_counts = [0; 4];
@@ -2269,6 +2275,7 @@ impl Game {
         self.last_spawn_positions.clear();
         self.spawn_budget = 0.0;
         self.next_spawn_frame = self.frame_count;
+        self.last_wave_start = Some(*wave_start);
     }
 
     /// Take pending wave start event (for network broadcast)

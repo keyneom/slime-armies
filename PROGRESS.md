@@ -7,6 +7,127 @@ Transform "One Slime Army" from a single-player WASM-4 game into a P2P multiplay
 - Infinite procedurally generated world
 - Wave-based enemy spawning scaled by player count
 
+## Current Session - Topology Control-Plane Rewrite (sticky root + map)
+
+### Why
+Nodes were dropping in and out constantly and rooms split into subgraphs where
+players could not see each other. Root causes found (see
+`NETWORK_SCALING_PLAN.md` for the full write-up):
+1. Per-frame, per-node root election over asymmetric membership views
+   (matchbox only announces peers that join after you) -> split brains.
+2. Tree assignments derived from player positions/RTT/load -> normal movement
+   reshuffled parents/children room-wide, bumping epochs continuously.
+3. Epoch-rotating witness/admission links + force-drop of any connected peer
+   not in the latest desired set (in BOTH session and socket fork) -> a
+   self-sustaining connect/disconnect churn loop.
+4. Per-peer `TopologyUpdate` had no addressee; forwarded copies were applied
+   by grandchildren as their own assignment -> poisoned routes at depth >= 2.
+5. Discovery detach had no re-attach path; a detached node whose parent died
+   could never form new links -> local re-election -> split rooms.
+6. `is_host` followed lowest-uuid election, so authority flapped on joins.
+
+### What changed
+- [x] `TopologyUpdate` is now a room-wide map: epoch, root, fanout, and
+      `{peer_hash, uuid, parent_hash}` per member. Identical for everyone,
+      forwarded verbatim down the tree; each node derives its own links.
+- [x] New `JoinRequest` message (tag 30) relayed up to the root; the root
+      admits members with sticky BFS-by-join-order parent assignment and
+      prunes silent members (~10s TTL, refreshed by relayed batch traffic).
+- [x] Room creator is the sticky root/host. No per-node election. Root death
+      is handled by staggered successor takeover from the shared map; rival
+      roots converge via (epoch, root-hash) ordering + abdication.
+- [x] Link policy is make-before-break: desired peers gate outgoing offers
+      only, incoming offers are always accepted, undesired-but-healthy links
+      get a ~10s grace before lazy drop, and the socket fork no longer closes
+      channels on desired-set changes or mid-handshake desired drift.
+- [x] Stable admission links (root/supernodes -> newcomers) and rescue links
+      (root -> silent members) guarantee one side of any recovery pair can
+      always initiate, regardless of signaling join order.
+- [x] All nodes stay attached to signaling (membership oracle + only way to
+      mint links). Discovery-detach removed from the session (fork API kept
+      for a future overlay-relayed-signaling mode).
+- [x] Direct `PlayerUpdate`s are accepted as the sender's own state claim
+      (fixes "connected but blind" during convergence).
+- [x] Player-state batches periodically bypass interest filtering (every 8th
+      flush in rooms <= 128, every 32nd beyond) so distant players stay on
+      rosters/minimaps at low rate.
+- [x] `mark_supernode_bad` no longer poisons the root; it forces parent
+      failover + a fresh JoinRequest.
+- [x] The root is a replaceable coordinator role, not a fixed node: signaling
+      departure of the root arms a fast failover (successor in ~3s, staggered
+      by uuid rank); silent death falls back to a ~30s timeout. Stale-map
+      echoes between orphans no longer count as root liveness (same-epoch
+      maps refresh liveness only when they arrive from the parent/root path).
+- [x] Hidden-tab watchdog: rAF stops entirely for occluded/backgrounded
+      pages, which froze the whole client (no heartbeats -> pruned from the
+      room; a dead root could never be replaced). A 500ms interval now drives
+      the tick when rAF stalls, and the network runs on a wall-clock frame
+      counter so its timeouts/cadences stay correct at any tick rate.
+      Backgrounded players now stay in the room instead of dropping.
+- [x] Map heartbeat doubles as root liveness; cadence widens in big rooms.
+- [x] Unit tests for: sticky admission, map adoption (no self-election),
+      stale-map rejection, staggered root failover, host abdication ordering,
+      epoch-stable desired links, undesired-link grace, wire roundtrips.
+
+### Verification (2026-06-10)
+- `cargo test` (24 tests) green; `cargo check --target wasm32-unknown-unknown`
+  clean; `trunk build` succeeds.
+- Browser smoke (`scripts/sync_smoke.mjs`, 3 windows, headless Chrome + local
+  matchbox server as test fixture): **PASS twice consecutively** — create +
+  join-anytime, full 3-way roster with correct names on every tab, movement
+  replicated to all tabs. Run with:
+  `SLIME_SIGNALING=ws://127.0.0.1:3536 node scripts/sync_smoke.mjs 3`
+  (needs `trunk serve`, Chrome with `--remote-debugging-port=9222`, and
+  `matchbox_server` running locally; omit `SLIME_SIGNALING` to use the public
+  server).
+- Creator-departure drill (the room must outlive the first node): with a
+  converged 3-player room, force-closing the creator's tab makes the
+  survivors detect the departure via the room-wide signaling broadcast and
+  promote a successor coordinator in ~3-5s (uuid-ordered, staggered); a
+  transient dual-promotion under extreme tab throttling converges via the
+  (epoch, root-hash) outranking + abdication rules. End state observed: one
+  host, both survivors mutually visible with correct names, stable epoch.
+- Baseline comparison: the same smoke run against a `HEAD` worktree (with only
+  the ICE-gathering cap backported so it could form links in this sandbox at
+  all) reproduced the reported disease in one run: the room creator (SYNCA)
+  ended up alone with `discovery_attached=false` and `desired={}`,
+  force-dropping both peers every frame, while SYNCB/SYNCC formed a separate
+  2-player session in which SYNCB had elected itself host. The new build never
+  exhibits this (sticky root, no detach, no force-drops).
+
+### Scaling mechanics session (2026-06-10, later)
+- [x] `TopologyDelta` (tag 31): delta-based roster broadcasts above 32
+      members, empty-delta heartbeats, checksummed with full-map fallback on
+      any desync, full-map anchors every 10th broadcast, coalesced dirty
+      broadcasts. Unit-tested to 2,000 members (fanout/depth bounds, ~64KB
+      full map vs <100B join delta).
+- [x] Auto-rejoin: signaling/socket loss reconnects to the same room with
+      backoff instead of erroring to title. connect() now fully resets relay
+      topology state (stale routes used to poison the desired set after
+      reconnect). Drill: 12s matchbox outage under a live 3-player room ->
+      full recovery, positions preserved.
+- [x] Connectivity-aware parent reassignment: repeated join-request nags
+      from an in-roster member move it under a different parent (threshold,
+      cooldown, subtree-safe) — the tree is the TURN-free relay fallback.
+- [x] 29 unit tests green; smoke PASS; server-restart drill PASS;
+      creator-kill drill PASS (chained after the server outage).
+
+### Also fixed along the way (pre-existing, exposed by the smoke run)
+- Handshakes stalled forever when STUN was unreachable: the vendored socket
+  waited for ICE gathering to complete before sending any offer/answer, while
+  the 6s handshake timeout kept firing -> infinite retry loop, zero
+  connections. Gathering wait is now capped at 3s; trickle ICE delivers late
+  candidates. This also un-breaks players behind UDP-blocking firewalls.
+- Input pipeline applied all key-downs before all key-ups within a frame, so
+  a same-frame "release+press" (the automation helpers, fast taps) silently
+  ate held keys: `moveFor`/`keepAliveStart` never moved the player. The input
+  buffer is now a single ordered event list.
+- `PlayerJoined` handling migrated the *relayer's* peer state onto the
+  *origin's* key for relayed joins, corrupting the relayer's roster entry
+  (players showing as "PLAYER"). Alias migration now only happens when the
+  direct sender is the origin. Control events (names/chat/votes) now flood to
+  sibling subtrees, and each node re-announces its name every ~10s.
+
 ## Current Session - Enemy Sync Fix
 
 ### Open Issues (Priority)

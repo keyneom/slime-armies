@@ -5,7 +5,7 @@ use crate::webrtc_socket::{
     Signaller,
 };
 use async_trait::async_trait;
-use futures::{Future, SinkExt, StreamExt};
+use futures::{Future, FutureExt, SinkExt, StreamExt};
 use futures_channel::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
 use futures_timer::Delay;
 use futures_util::select;
@@ -437,13 +437,18 @@ fn create_rtc_peer_connection(ice_server_config: &RtcIceServerConfig) -> RtcPeer
     }
 
     let peer_config = RtcConfiguration::new();
-    let ice_server_config = IceServerConfig {
-        urls: ice_server_config.urls.clone(),
-        username: ice_server_config.username.clone().unwrap_or_default(),
-        credential: ice_server_config.credential.clone().unwrap_or_default(),
-    };
-    let ice_server_config_list = [ice_server_config];
-    peer_config.set_ice_servers(&serde_wasm_bindgen::to_value(&ice_server_config_list).unwrap());
+    // An RTCIceServer with an empty url list is malformed; an empty server
+    // list (host candidates only, e.g. LAN/test setups) is valid.
+    if !ice_server_config.urls.is_empty() {
+        let ice_server_config = IceServerConfig {
+            urls: ice_server_config.urls.clone(),
+            username: ice_server_config.username.clone().unwrap_or_default(),
+            credential: ice_server_config.credential.clone().unwrap_or_default(),
+        };
+        let ice_server_config_list = [ice_server_config];
+        peer_config
+            .set_ice_servers(&serde_wasm_bindgen::to_value(&ice_server_config_list).unwrap());
+    }
     let connection = RtcPeerConnection::new_with_configuration(&peer_config).unwrap();
 
     let connection_1 = connection.clone();
@@ -464,6 +469,14 @@ fn create_rtc_peer_connection(ice_server_config: &RtcIceServerConfig) -> RtcPeer
 }
 
 async fn wait_for_ice_gathering_complete(conn: RtcPeerConnection) {
+    // Bounded wait: when STUN/TURN servers are unreachable (UDP-blocking
+    // firewalls, offline LANs), gathering can take tens of seconds or never
+    // complete, which used to stall every handshake past the 6s handshake
+    // timeout and made peers retry forever. Host candidates arrive within
+    // milliseconds; proceed with whatever we have after the cap and let
+    // trickle ICE deliver the rest.
+    const ICE_GATHERING_CAP: Duration = Duration::from_secs(3);
+
     if conn.ice_gathering_state() == RtcIceGatheringState::Complete {
         debug!("Ice gathering already completed");
         return;
@@ -474,7 +487,7 @@ async fn wait_for_ice_gathering_complete(conn: RtcPeerConnection) {
     let conn_clone = conn.clone();
     let onstatechange: Box<dyn FnMut(JsValue)> = Box::new(move |_| {
         if conn_clone.ice_gathering_state() == RtcIceGatheringState::Complete {
-            tx.try_send(()).unwrap();
+            let _ = tx.try_send(());
         }
     });
 
@@ -482,10 +495,20 @@ async fn wait_for_ice_gathering_complete(conn: RtcPeerConnection) {
 
     conn.set_onicegatheringstatechange(Some(onstatechange.as_ref().unchecked_ref()));
 
-    rx.next().await;
+    let mut timeout = Delay::new(ICE_GATHERING_CAP).fuse();
+    let mut gathered = rx.next().fuse();
+    select! {
+        _ = gathered => {
+            debug!("Ice gathering completed");
+        }
+        _ = timeout => {
+            warn!(
+                "ice gathering still incomplete after {ICE_GATHERING_CAP:?}; proceeding with current candidates"
+            );
+        }
+    }
 
     conn.set_onicegatheringstatechange(None);
-    debug!("Ice gathering completed");
 }
 
 fn create_data_channels(

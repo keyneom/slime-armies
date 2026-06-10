@@ -1,7 +1,7 @@
 // Allow dead code for items that will be used in future phases (GGRS, multiplayer, etc.)
 #![allow(dead_code)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -40,6 +40,17 @@ thread_local! {
     // Separate input buffer to avoid borrow conflicts - event handlers write here,
     // game loop reads and clears each frame
     static INPUT_BUFFER: RefCell<InputBuffer> = RefCell::new(InputBuffer::new());
+    /// True while a requestAnimationFrame callback is queued. The hidden-tab
+    /// watchdog must not queue extras, or every visibility change would
+    /// multiply the tick chains.
+    static RAF_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// Wall-clock ms of the last game tick (rAF or watchdog driven).
+    static LAST_TICK_MS: Cell<f64> = const { Cell::new(0.0) };
+    /// The closure registered with requestAnimationFrame (clears RAF_PENDING
+    /// then runs the game tick).
+    static RAF_SHIM: RefCell<Option<Closure<dyn FnMut()>>> = const { RefCell::new(None) };
+    /// Epoch for the wall-clock network frame counter.
+    static NET_CLOCK_START_MS: Cell<f64> = const { Cell::new(0.0) };
     // Debug command queue (fed via JS console or tooling)
     static DEBUG_COMMANDS: RefCell<Vec<String>> = RefCell::new(Vec::new());
     static TOUCH_STATE: RefCell<TouchState> = RefCell::new(TouchState::new());
@@ -49,8 +60,10 @@ thread_local! {
 /// Buffer for input events that event handlers can write to without conflicting
 /// with the main game state borrow
 struct InputBuffer {
-    keys_down: Vec<String>,
-    keys_up: Vec<String>,
+    /// Ordered key events: (code, is_down). Order matters — automation and
+    /// fast taps can enqueue an up and a down for the same key within one
+    /// frame, and applying downs before ups used to silently eat held keys.
+    key_events: Vec<(String, bool)>,
     chars: Vec<char>,
     backspace: bool,
     escape: bool,
@@ -157,8 +170,7 @@ impl TouchState {
 impl InputBuffer {
     fn new() -> Self {
         Self {
-            keys_down: Vec::new(),
-            keys_up: Vec::new(),
+            key_events: Vec::new(),
             chars: Vec::new(),
             backspace: false,
             escape: false,
@@ -170,8 +182,7 @@ impl InputBuffer {
     }
 
     fn clear(&mut self) {
-        self.keys_down.clear();
-        self.keys_up.clear();
+        self.key_events.clear();
         self.chars.clear();
         self.backspace = false;
         self.escape = false;
@@ -191,10 +202,10 @@ fn queue_key_down(buffer: &mut InputBuffer, code: &str, key: &str) {
         // Arrow keys and modifiers are gameplay/navigation keys only.
         "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" | "ShiftLeft" | "ShiftRight"
         | "ControlLeft" | "ControlRight" | "AltLeft" | "AltRight" | "MetaLeft" | "MetaRight" => {
-            buffer.keys_down.push(code.to_string());
+            buffer.key_events.push((code.to_string(), true));
         }
         _ => {
-            buffer.keys_down.push(code.to_string());
+            buffer.key_events.push((code.to_string(), true));
             if key.len() == 1 {
                 if let Some(c) = key.chars().next() {
                     if c.is_ascii() && !c.is_ascii_control() {
@@ -208,7 +219,7 @@ fn queue_key_down(buffer: &mut InputBuffer, code: &str, key: &str) {
 
 fn queue_key_up(buffer: &mut InputBuffer, code: &str) {
     if !code.is_empty() {
-        buffer.keys_up.push(code.to_string());
+        buffer.key_events.push((code.to_string(), false));
     }
 }
 
@@ -600,8 +611,11 @@ pub fn get_signaling_server() -> String {
 /// Set ICE server URLs and optional auth for TURN.
 /// `urls_csv` supports comma-separated values, e.g.:
 /// "stun:stun.l.google.com:19302,turn:turn.example.com:3478?transport=udp"
+/// Pass "none" to use no ICE servers at all (host candidates only — LAN play
+/// or automated tests where STUN is unreachable).
 #[wasm_bindgen]
 pub fn set_ice_servers(urls_csv: &str, username: &str, credential: &str) {
+    let disable_ice = urls_csv.trim().eq_ignore_ascii_case("none");
     let urls: Vec<String> = urls_csv
         .split(',')
         .map(|u| u.trim())
@@ -610,7 +624,9 @@ pub fn set_ice_servers(urls_csv: &str, username: &str, credential: &str) {
         .collect();
     ICE_CONFIG.with(|cfg| {
         let mut cfg = cfg.borrow_mut();
-        cfg.urls = if urls.is_empty() {
+        cfg.urls = if disable_ice {
+            Vec::new()
+        } else if urls.is_empty() {
             IceConfig::default().urls
         } else {
             urls
@@ -910,21 +926,40 @@ pub fn test_runtime_state() -> String {
     })
 }
 
+/// Test/debug: root-failover predicate internals.
+#[wasm_bindgen]
+pub fn test_failover_diag() -> String {
+    GAME_STATE.with(|gs| {
+        let Ok(game_state) = gs.try_borrow() else {
+            return "busy".to_string();
+        };
+        if let Some(state) = game_state.as_ref() {
+            let Ok(state_ref) = state.try_borrow() else {
+                return "busy".to_string();
+            };
+            state_ref.network.failover_debug()
+        } else {
+            "uninitialized".to_string()
+        }
+    })
+}
+
 /// Focused network diagnostics for multi-device validation.
 /// Format:
-/// `network=...;room=...;remote_players=...;known_peers=...;desired_peers=...;desired_ids=...;discovery_attached=...;relay_epoch=...;is_host=...;local_peer=...;supernode=...;local_name=...;rx=...;dropped=...;remote_ids=...;remote_names=...`
+/// `network=...;room=...;ice=...;remote_players=...;known_peers=...;desired_peers=...;desired_ids=...;discovery_attached=...;relay_epoch=...;is_host=...;local_peer=...;super_root=...;supernode=...;local_name=...;rx=...;dropped=...;remote_ids=...;remote_names=...`
 #[wasm_bindgen]
 pub fn test_network_diag() -> String {
     GAME_STATE.with(|gs| {
         let Ok(game_state) = gs.try_borrow() else {
-            return "network=busy;room=;remote_players=0;known_peers=0;desired_peers=0;desired_ids=none;discovery_attached=false;relay_epoch=0;is_host=false;local_peer=none;supernode=none;local_name=none;rx=0;dropped=0;remote_ids=none;remote_names=none".to_string();
+            return "network=busy;room=;ice=;remote_players=0;known_peers=0;desired_peers=0;desired_ids=none;discovery_attached=false;relay_epoch=0;is_host=false;local_peer=none;super_root=none;supernode=none;local_name=none;rx=0;dropped=0;remote_ids=none;remote_names=none".to_string();
         };
         if let Some(state) = game_state.as_ref() {
             let Ok(state_ref) = state.try_borrow() else {
-                return "network=busy;room=;remote_players=0;known_peers=0;desired_peers=0;desired_ids=none;discovery_attached=false;relay_epoch=0;is_host=false;local_peer=none;supernode=none;local_name=none;rx=0;dropped=0;remote_ids=none;remote_names=none".to_string();
+                return "network=busy;room=;ice=;remote_players=0;known_peers=0;desired_peers=0;desired_ids=none;discovery_attached=false;relay_epoch=0;is_host=false;local_peer=none;super_root=none;supernode=none;local_name=none;rx=0;dropped=0;remote_ids=none;remote_names=none".to_string();
             };
             let net = network_state_name(&state_ref.network.state);
             let room = state_ref.network.room_code.as_str();
+            let ice = get_ice_servers();
             let remote_players = state_ref.network.peer_count();
             let known_peers = state_ref.network.known_peer_count();
             let desired_peers = state_ref.network.desired_peer_count();
@@ -940,6 +975,11 @@ pub fn test_network_diag() -> String {
             let supernode = state_ref
                 .network
                 .supernode_id
+                .map(|id| format!("{:?}", id))
+                .unwrap_or_else(|| "none".to_string());
+            let super_root = state_ref
+                .network
+                .super_root_id
                 .map(|id| format!("{:?}", id))
                 .unwrap_or_else(|| "none".to_string());
             let local_name = state_ref.network.local_display_name();
@@ -973,10 +1013,10 @@ pub fn test_network_diag() -> String {
                 remote_names.join(",")
             };
             format!(
-                "network={net};room={room};remote_players={remote_players};known_peers={known_peers};desired_peers={desired_peers};desired_ids={desired_ids};discovery_attached={discovery_attached};relay_epoch={relay_epoch};is_host={is_host};local_peer={local_peer};supernode={supernode};local_name={local_name};rx={rx};dropped={dropped};remote_ids={remote_ids};remote_names={remote_names}"
+                "network={net};room={room};ice={ice};remote_players={remote_players};known_peers={known_peers};desired_peers={desired_peers};desired_ids={desired_ids};discovery_attached={discovery_attached};relay_epoch={relay_epoch};is_host={is_host};local_peer={local_peer};super_root={super_root};supernode={supernode};local_name={local_name};rx={rx};dropped={dropped};remote_ids={remote_ids};remote_names={remote_names}"
             )
         } else {
-            "network=uninitialized;room=;remote_players=0;known_peers=0;desired_peers=0;desired_ids=none;discovery_attached=false;relay_epoch=0;is_host=false;local_peer=none;supernode=none;local_name=none;rx=0;dropped=0;remote_ids=none;remote_names=none".to_string()
+            "network=uninitialized;room=;ice=;remote_players=0;known_peers=0;desired_peers=0;desired_ids=none;discovery_attached=false;relay_epoch=0;is_host=false;local_peer=none;super_root=none;supernode=none;local_name=none;rx=0;dropped=0;remote_ids=none;remote_names=none".to_string()
         }
     })
 }
@@ -1663,12 +1703,27 @@ fn setup_input(
     Ok(())
 }
 
+/// Network timing is frame-denominated assuming 60/s, but the tick rate is
+/// variable (60/s on rAF, ~1/s under the hidden-tab watchdog). Deriving the
+/// network's frame clock from wall time keeps every age/timeout/cadence
+/// correct regardless of how the loop is being driven.
+fn network_clock_frame() -> u32 {
+    NET_CLOCK_START_MS.with(|cell| {
+        let now = js_sys::Date::now();
+        if cell.get() == 0.0 {
+            cell.set(now);
+        }
+        ((now - cell.get()) * 0.06) as u32
+    })
+}
+
 fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Result<(), JsValue> {
     let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
     let g = f.clone();
 
     let window_clone = window.clone();
     *g.borrow_mut() = Some(Closure::new(move || {
+        LAST_TICK_MS.with(|cell| cell.set(js_sys::Date::now()));
         {
             let mut state_ref = state.borrow_mut();
             let is_mobile = window_clone
@@ -1753,8 +1808,7 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     }
 
                     // Clear keys since we're in text mode (don't pass to game input)
-                    buf.keys_down.clear();
-                    buf.keys_up.clear();
+                    buf.key_events.clear();
                 } else if state_ref.game.is_map_input_active() {
                     for c in buf.chars.drain(..) {
                         state_ref.game.handle_map_char_input(c);
@@ -1773,8 +1827,7 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                         state_ref.game.map_text_input_active = false;
                     }
 
-                    buf.keys_down.clear();
-                    buf.keys_up.clear();
+                    buf.key_events.clear();
                 } else if state_ref.game.is_chat_input_active() {
                     for c in buf.chars.drain(..) {
                         state_ref.game.handle_chat_char_input(c);
@@ -1931,15 +1984,14 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                         state_ref.game.close_chat();
                     }
 
-                    buf.keys_down.clear();
-                    buf.keys_up.clear();
+                    buf.key_events.clear();
                 } else {
                     if state_ref.game.player_list_open
                         && (state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver)
                     {
                         let blocked = ["KeyZ", "KeyX", "ArrowLeft", "ArrowRight"];
-                        buf.keys_down.retain(|code| !blocked.contains(&code.as_str()));
-                        buf.keys_up.retain(|code| !blocked.contains(&code.as_str()));
+                        buf.key_events
+                            .retain(|(code, _)| !blocked.contains(&code.as_str()));
                     }
                     if state_ref.game.map_open
                         && (state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver)
@@ -1950,14 +2002,17 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                             "KeyZ", "Space", "KeyX", "ShiftLeft", "ShiftRight",
                             "KeyM",
                         ];
-                        buf.keys_down.retain(|code| allowed.contains(&code.as_str()));
-                        buf.keys_up.retain(|code| allowed.contains(&code.as_str()));
+                        buf.key_events
+                            .retain(|(code, _)| allowed.contains(&code.as_str()));
                     }
                     if (state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver)
                         && !state_ref.game.map_open
                     {
                         let mut handled_keys: Vec<String> = Vec::new();
-                        for code in &buf.keys_down {
+                        for (code, is_down) in &buf.key_events {
+                            if !is_down {
+                                continue;
+                            }
                             match code.as_str() {
                                 "KeyP" => {
                                     state_ref.game.toggle_player_list();
@@ -2021,7 +2076,8 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                             }
                         }
                         if !handled_keys.is_empty() {
-                            buf.keys_down.retain(|code| !handled_keys.contains(code));
+                            buf.key_events
+                                .retain(|(code, is_down)| !*is_down || !handled_keys.contains(code));
                         }
                     }
 
@@ -2035,8 +2091,7 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                         if buf.escape {
                             state_ref.game.clear_player_list_search();
                         }
-                        buf.keys_down.clear();
-                        buf.keys_up.clear();
+                        buf.key_events.clear();
                     }
 
                     if (state_ref.game.scene == Scene::Game || state_ref.game.scene == Scene::GameOver)
@@ -2047,13 +2102,17 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                         for c in buf.chars.drain(..) {
                             state_ref.game.handle_map_char_input(c);
                         }
-                        buf.keys_down.clear();
-                        buf.keys_up.clear();
+                        buf.key_events.clear();
                         buf.clear();
                         return;
                     }
-                    // Process key down events for game input
-                    for code in buf.keys_down.drain(..) {
+                    // Process key events in arrival order so a same-frame
+                    // release+press of the same key nets out to "held".
+                    for (code, is_down) in buf.key_events.drain(..) {
+                        if !is_down {
+                            state_ref.input.key_up(&code);
+                            continue;
+                        }
                         if state_ref.game.ability_bind_open {
                             if state_ref.game.ability_bind_waiting() {
                                 if state_ref.game.handle_ability_bind_key(&code) {
@@ -2081,11 +2140,6 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                             continue;
                         }
                         state_ref.input.key_down(&code);
-                    }
-
-                    // Process key up events
-                    for code in buf.keys_up.drain(..) {
-                        state_ref.input.key_up(&code);
                     }
                 }
 
@@ -2364,15 +2418,21 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 }
             }
 
-            // Update network (safely - returns false on connection failure)
-            let frame_count = state_ref.game.frame_count;
+            // Update network (safely - returns false on connection failure).
+            // The network runs on a wall-clock frame counter, not the game's
+            // tick counter: under the hidden-tab watchdog the game ticks ~1/s
+            // and frame-based network timeouts would stretch 60x.
+            let frame_count = network_clock_frame();
             let network_ok = state_ref.network.update(frame_count);
             let supernode_id = state_ref.network.supernode_id;
             let became_host =
                 state_ref.network.is_host && state_ref.last_supernode_id != supernode_id;
             state_ref.last_supernode_id = supernode_id;
 
-            // Check if we should transition to game based on network state
+            // Multiplayer title → game: per-client only (join-anytime).
+            // There is no party-wide wait for N players or host "Start"; we leave the title once
+            // this machine's room is non-empty and signaling reports Connected or WaitingForPeers.
+            // Others may still be joining or already in-game (late join handled in network layer).
             if state_ref.game.scene == Scene::Title {
                 match state_ref.network.state {
                     NetworkState::Connected | NetworkState::WaitingForPeers => {
@@ -2473,25 +2533,22 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                         state_ref.network.send_wave_start(wave_start);
                     }
 
-                    // Host: Send current wave state AND enemy sync to late joiners
+                    // Host: resync authoritative state for new data-channel peers.
+                    // Use tree broadcast (same paths as steady-state), not direct socket.send per peer:
+                    // in sparse relay mode the root may have no DC to a leaf; unicast drops snapshots.
                     if state_ref.network.has_new_peers_needing_state() {
-                        let new_peers = state_ref.network.take_new_peers_needing_state();
+                        let _new_peers = state_ref.network.take_new_peers_needing_state();
                         if let Some(wave_start) = state_ref.game.last_wave_start {
-                            state_ref
-                                .network
-                                .send_wave_start_to_peers(&wave_start, &new_peers);
+                            state_ref.network.send_wave_start(wave_start);
                         }
-                        // Also send enemy sync so late joiners see current enemy state (alive/dead)
                         let enemy_sync = state_ref.game.create_enemy_sync();
                         state_ref.network.send_enemy_sync(enemy_sync);
                         let paid_obstacles = state_ref.game.paid_obstacles.clone();
                         state_ref
                             .network
-                            .send_paid_obstacles_to_peers(&paid_obstacles, &new_peers);
+                            .send_paid_obstacles_to_all(&paid_obstacles);
                         let paid_names = state_ref.network.paid_name_reservations_snapshot();
-                        state_ref
-                            .network
-                            .send_paid_names_to_peers(&paid_names, &new_peers);
+                        state_ref.network.send_paid_names_to_all(&paid_names);
                     }
                 } else {
                     // Client: Apply wave start from host to spawn enemies deterministically
@@ -3051,13 +3108,73 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 .render(&state_ref.game, &state_ref.network);
         }
 
-        window_clone
-            .request_animation_frame(f.borrow().as_ref().unwrap().as_ref().unchecked_ref())
-            .expect("failed to request animation frame");
+        // Queue exactly one upcoming rAF. The shim clears the flag when the
+        // browser actually fires it; watchdog-driven ticks leave it queued.
+        if !RAF_PENDING.with(|cell| cell.replace(true)) {
+            window_clone
+                .request_animation_frame(
+                    RAF_SHIM
+                        .with(|shim| {
+                            shim.borrow()
+                                .as_ref()
+                                .map(|s| s.as_ref().unchecked_ref::<js_sys::Function>().clone())
+                        })
+                        .expect("raf shim not installed")
+                        .unchecked_ref(),
+                )
+                .expect("failed to request animation frame");
+        }
     }));
 
+    // The shim is what rAF actually invokes: it clears the pending flag and
+    // runs the tick. The watchdog calls the tick directly (flag untouched).
+    let tick_for_shim = f.clone();
+    RAF_SHIM.with(|shim| {
+        *shim.borrow_mut() = Some(Closure::new(move || {
+            RAF_PENDING.with(|cell| cell.set(false));
+            if let Some(tick) = tick_for_shim.borrow().as_ref() {
+                let func: &js_sys::Function = tick.as_ref().unchecked_ref();
+                let _ = func.call0(&JsValue::NULL);
+            }
+        }));
+    });
+
+    // Hidden-tab watchdog: browsers stop firing rAF entirely for occluded or
+    // backgrounded pages, which used to freeze the whole client (no network
+    // pump, no heartbeats -> the player "drops out" and gets pruned, and a
+    // dead root could never be replaced). Timers still run at >=1Hz in hidden
+    // tabs (WebRTC-active pages are exempt from intensive throttling), so a
+    // stalled loop keeps ticking here in slow motion until rAF resumes.
+    let tick_for_watchdog = f.clone();
+    let watchdog = Closure::<dyn FnMut()>::new(move || {
+        let stalled = LAST_TICK_MS.with(|cell| js_sys::Date::now() - cell.get()) > 700.0;
+        if stalled {
+            if let Some(tick) = tick_for_watchdog.borrow().as_ref() {
+                let func: &js_sys::Function = tick.as_ref().unchecked_ref();
+                let _ = func.call0(&JsValue::NULL);
+            }
+        }
+    });
     window
-        .request_animation_frame(g.borrow().as_ref().unwrap().as_ref().unchecked_ref())
+        .set_interval_with_callback_and_timeout_and_arguments_0(
+            watchdog.as_ref().unchecked_ref(),
+            500,
+        )
+        .expect("failed to install loop watchdog");
+    watchdog.forget();
+
+    RAF_PENDING.with(|cell| cell.set(true));
+    window
+        .request_animation_frame(
+            RAF_SHIM
+                .with(|shim| {
+                    shim.borrow()
+                        .as_ref()
+                        .map(|s| s.as_ref().unchecked_ref::<js_sys::Function>().clone())
+                })
+                .expect("raf shim not installed")
+                .unchecked_ref(),
+        )
         .expect("failed to request animation frame");
 
     Ok(())

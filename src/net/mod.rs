@@ -5,10 +5,11 @@ mod session;
 pub use protocol::{
     AreaAuthorityEntry, AreaAuthorityUpdate, CannonShot, ChatMessage, EnemyDamage, EnemyKill,
     EnemyKillBatch, EnemyState, EnemySync, EnemyType, InputFrame, InputFrameBatch, InputFrameEntry,
-    NetMessage, PaidAbility, PaidAbilityAck, PaidAbilityType, PaidNameAck, PaidNameReservation,
-    PaidNameSync, PaidObstacle, PaidObstacleAck, PaidObstacleSync, Ping, PlayerDeath, PlayerState,
-    PlayerStateBatch, PlayerStateEntry, PlayerStatsSnapshot, Pong, ProjectileReflection,
-    SupernodeScore, TopologyUpdate, VoteMute, WaveStart,
+    JoinRequest, NetMessage, PaidAbility, PaidAbilityAck, PaidAbilityType, PaidNameAck,
+    PaidNameReservation, PaidNameSync, PaidObstacle, PaidObstacleAck, PaidObstacleSync, Ping,
+    PlayerDeath, PlayerState, PlayerStateBatch, PlayerStateEntry, PlayerStatsSnapshot, Pong,
+    ProjectileReflection, SupernodeScore, TopologyDelta, TopologyEntry, TopologyUpdate, VoteMute,
+    WaveStart,
 };
 pub use remote_player::RemotePlayer;
 pub use session::{IceConfig, NetworkSession, NetworkState, PlayerStats};

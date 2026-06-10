@@ -199,6 +199,7 @@ async fn message_loop<M: Messenger>(
         peer_state_tx,
         mut control_receiver,
         known_peer_tx,
+        peer_left_tx,
     } = channels;
 
     let mut handshakes = FuturesUnordered::new();
@@ -313,6 +314,9 @@ async fn message_loop<M: Messenger>(
                             known_peers.remove(&peer_uuid);
                             handshake_retry_after.remove(&peer_uuid);
                             let _ = known_peer_tx.unbounded_send((peer_uuid, false));
+                            // Departure is broadcast room-wide by the server, so this is
+                            // a reliable fast liveness signal for any member.
+                            let _ = peer_left_tx.unbounded_send(peer_uuid);
                             handshake_signals.remove(&peer_uuid);
                             // Keep already-established data channels alive even if the peer leaves
                             // signaling; this allows a separate gameplay overlay from discovery.
@@ -324,22 +328,12 @@ async fn message_loop<M: Messenger>(
                             }
                         },
                         PeerEvent::Signal { sender, data } => {
-                            let bootstrap_accept_sender = signaling_attached
-                                && data_channels.len() < 2
-                                && (known_peers.len() <= 1
-                                    || desired_peers
-                                        .as_ref()
-                                        .map_or(true, |set| set.len() <= 1));
-                            let should_connect = desired_peers
-                                .as_ref()
-                                .map_or(true, |set| {
-                                    set.contains(&sender)
-                                        || data_channels.contains_key(&sender)
-                                        || bootstrap_accept_sender
-                                });
-                            if !should_connect {
-                                continue;
-                            }
+                            // Always accept incoming handshakes. Sparsity is
+                            // enforced on the *initiating* side (desired-peer
+                            // gating in queue_offer_handshake); rejecting
+                            // accepts here only strands peers whose view of
+                            // the topology is momentarily newer than ours.
+                            // Surplus links are trimmed lazily by the session.
                             let signal_tx = handshake_signals.entry(sender).or_insert_with(|| {
                                 let (from_peer_tx, peer_signal_rx) = futures_channel::mpsc::unbounded();
                                 handshake_retry_after.remove(&sender);
@@ -410,23 +404,10 @@ async fn message_loop<M: Messenger>(
                     None => {}
                 }
 
-                if let Some(desired) = desired_peers.as_ref() {
-                    let to_drop: Vec<PeerId> = data_channels
-                        .keys()
-                        .filter(|peer| !desired.contains(peer))
-                        .copied()
-                        .collect();
-                    for peer in to_drop {
-                        handshake_retry_after.remove(&peer);
-                        if let Some(mut channels) = data_channels.remove(&peer) {
-                            for channel in channels.iter_mut() {
-                                channel.close();
-                            }
-                        }
-                        handshake_signals.remove(&peer);
-                        let _ = peer_state_tx.unbounded_send((peer, PeerState::Disconnected));
-                    }
-                }
+                // Note: shrinking the desired set must NOT close established
+                // channels. Live links are dropped only via an explicit
+                // DropPeer (the session applies a make-before-break grace
+                // window first); desired peers only gate new offers.
 
                 if signaling_attached {
                     let known_snapshot: Vec<PeerId> = known_peers.iter().copied().collect();
@@ -447,20 +428,16 @@ async fn message_loop<M: Messenger>(
                     HandshakeOutcome::Result(handshake_result) => {
                         let peer_id = handshake_result.peer_id;
                         handshake_signals.remove(&peer_id);
-                        let should_connect = desired_peers
-                            .as_ref()
-                            .map_or(true, |set| set.contains(&peer_id));
                         let mut channels = handshake_result.data_channels;
-                        if !handshake_result.established || !should_connect {
+                        // Keep any successfully-established channel, even if the
+                        // peer left the desired set mid-handshake: the session
+                        // trims surplus links lazily (make-before-break).
+                        if !handshake_result.established {
                             for channel in channels.iter_mut() {
                                 channel.close();
                             }
-                            if !handshake_result.established {
-                                handshake_retry_after.insert(peer_id, Instant::now() + HANDSHAKE_RETRY_INTERVAL);
-                                let _ = peer_state_tx.unbounded_send((peer_id, PeerState::Disconnected));
-                            } else {
-                                handshake_retry_after.remove(&peer_id);
-                            }
+                            handshake_retry_after.insert(peer_id, Instant::now() + HANDSHAKE_RETRY_INTERVAL);
+                            let _ = peer_state_tx.unbounded_send((peer_id, PeerState::Disconnected));
                             continue;
                         }
                         handshake_retry_after.remove(&peer_id);

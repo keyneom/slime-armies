@@ -1,11 +1,12 @@
 use crate::math::Vec2;
 use crate::net::{
     AreaAuthorityEntry, AreaAuthorityUpdate, CannonShot, ChatMessage, EnemyDamage, EnemyKill,
-    EnemyKillBatch, EnemySync, InputFrame, InputFrameBatch, InputFrameEntry, NetMessage,
-    PaidAbility, PaidAbilityAck, PaidAbilityType, PaidNameAck, PaidNameReservation, PaidNameSync,
-    PaidObstacle, PaidObstacleAck, PaidObstacleSync, Ping, PlayerDeath, PlayerState,
+    EnemyKillBatch, EnemySync, InputFrame, InputFrameBatch, InputFrameEntry, JoinRequest,
+    NetMessage, PaidAbility, PaidAbilityAck, PaidAbilityType, PaidNameAck, PaidNameReservation,
+    PaidNameSync, PaidObstacle, PaidObstacleAck, PaidObstacleSync, Ping, PlayerDeath, PlayerState,
     PlayerStateBatch, PlayerStateEntry, PlayerStatsSnapshot, Pong, ProjectileReflection,
-    RemotePlayer, SupernodeScore, TopologyUpdate, VoteMute, WaveStart,
+    RemotePlayer, SupernodeScore, TopologyDelta, TopologyEntry, TopologyUpdate, VoteMute,
+    WaveStart,
 };
 use crate::world::CHUNK_SIZE;
 use js_sys;
@@ -27,9 +28,15 @@ pub struct IceConfig {
 impl Default for IceConfig {
     fn default() -> Self {
         Self {
+            // Free public STUN from two independent operators, queried in
+            // parallel; one being unreachable costs nothing (gathering is
+            // capped at 3s in the socket fork). STUN is a one-shot, stateless
+            // "what is my public address?" echo at link setup — it never
+            // carries game data and any server is interchangeable.
             urls: vec![
                 "stun:stun.l.google.com:19302".to_string(),
                 "stun:stun1.l.google.com:19302".to_string(),
+                "stun:stun.cloudflare.com:3478".to_string(),
             ],
             username: None,
             credential: None,
@@ -104,7 +111,6 @@ pub struct NetworkSession {
     pub supernode_id: Option<matchbox_socket::PeerId>,
     pub super_root_id: Option<matchbox_socket::PeerId>,
     pub supernode_set: Vec<matchbox_socket::PeerId>,
-    peer_anchor_supernode: HashMap<matchbox_socket::PeerId, matchbox_socket::PeerId>,
     relay_parent: Option<matchbox_socket::PeerId>,
     relay_backup_parent: Option<matchbox_socket::PeerId>,
     relay_active_parent: Option<matchbox_socket::PeerId>,
@@ -112,9 +118,52 @@ pub struct NetworkSession {
     relay_children: Vec<matchbox_socket::PeerId>,
     desired_peer_set: HashSet<matchbox_socket::PeerId>,
     discovery_attached: bool,
-    discovery_attach_frame: Option<u32>,
-    bootstrap_full_mesh_active: bool,
-    frames_without_peer_connection: u32,
+    /// Last applied room-wide relay map (authoritative copy on the root).
+    topology_roster: Vec<TopologyEntry>,
+    /// Cached `{:?}` strings of roster uuids so per-frame lookup pruning keeps
+    /// hash->id mappings alive for roster members we have not connected to yet.
+    roster_peer_strs: HashSet<String>,
+    /// Root only: last frame each member (by origin hash) showed signs of life.
+    member_last_seen: HashMap<u64, u32>,
+    /// Root only: membership/assignments changed since last broadcast.
+    roster_dirty: bool,
+    last_map_rx_frame: u32,
+    last_join_request_frame: u32,
+    /// Peers that asked to join through us; they get the next map directly.
+    pending_map_peers: Vec<matchbox_socket::PeerId>,
+    /// Join requests forwarded recently (origin hash -> frame), to dedupe relays.
+    recent_join_forwards: HashMap<u64, u32>,
+    /// Connected links no longer in the desired set (peer -> frame it became
+    /// undesired). Dropped only after a grace window: make-before-break.
+    undesired_since: HashMap<matchbox_socket::PeerId, u32>,
+    /// First frame at which we had any connected peer (bootstrap promotion timer).
+    first_peer_frame: Option<u32>,
+    flush_counter: u32,
+    last_name_announce_frame: u32,
+    /// Frame at which we got positive evidence the root is gone (signaling
+    /// departure broadcast, or its direct link dying on its own). Triggers the
+    /// fast failover path instead of waiting out the silence timeout.
+    root_departure_frame: Option<u32>,
+    /// Links we closed ourselves (grace trims); their Disconnected events are
+    /// expected and must not count as death evidence. Frame-stamped for expiry.
+    intentional_drops: HashMap<matchbox_socket::PeerId, u32>,
+    /// Root only: roster as of the last broadcast, for delta computation.
+    last_broadcast_roster: Vec<TopologyEntry>,
+    last_broadcast_epoch: u32,
+    map_anchor_counter: u32,
+    /// Receiver fell out of sync with the delta stream; ask for a full map.
+    needs_full_map: bool,
+    /// Root only: when each member's current parent was assigned.
+    member_parent_since: HashMap<u64, u32>,
+    /// Root only: repeated join requests from an in-roster member signal the
+    /// assigned parent link never formed (e.g. hard-NAT pair): (count, frame).
+    member_link_nags: HashMap<u64, (u32, u32)>,
+    /// Reconnect parameters for auto-rejoin after signaling/socket loss.
+    reconnect_signaling: Option<String>,
+    reconnect_ice: Option<IceConfig>,
+    auto_rejoin_enabled: bool,
+    rejoin_attempts: u32,
+    next_rejoin_frame: u32,
     relay_epoch: u32,
     last_parent_switch_frame: u32,
     stale_parent_events: u32,
@@ -143,6 +192,9 @@ pub struct NetworkSession {
     peer_identity_lookup: HashMap<u64, PeerId>,
     pending_messages: Vec<(PeerId, Option<u64>, NetMessage)>,
     /// Whether this client is the host (room creator) - host controls enemy spawning
+    /// Relay-tree root (lowest sorted [`PeerId`] among known/connected nodes). Drives topology
+    /// broadcast and `send_*` routing—not necessarily the player who clicked "create room".
+    /// Game simulation authority (waves/enemy sync) currently follows this same flag.
     pub is_host: bool,
     /// Received enemy sync from host (for clients)
     pub pending_enemy_sync: Option<EnemySync>,
@@ -198,7 +250,6 @@ pub struct NetworkSession {
     latency_samples: HashMap<matchbox_socket::PeerId, u8>,
     /// Supernode score reports (score, sample_count, frame_received)
     pub supernode_scores: HashMap<matchbox_socket::PeerId, (u32, u8, u32)>,
-    bad_supernodes: HashSet<matchbox_socket::PeerId>,
     last_enemy_sync_frame: u32,
     paid_obstacle_confirmations: HashMap<[u8; 32], HashSet<matchbox_socket::PeerId>>,
     paid_ability_confirmations: HashMap<[u8; 32], HashSet<matchbox_socket::PeerId>>,
@@ -211,15 +262,10 @@ pub struct NetworkSession {
 }
 
 impl NetworkSession {
-    const MAX_SUPERNODES: usize = 256;
     const MAX_FANOUT: usize = 16;
     const MIN_FANOUT: usize = 2;
     const PEER_HANDSHAKE_GRACE_FRAMES: u32 = 240;
     const AREA_GROUP_CHUNKS: i32 = 4;
-    const TARGET_PLAYERS_PER_SUPERNODE: usize = 24;
-    const TARGET_AREAS_PER_SUPERNODE: usize = 2;
-    const ANCHOR_SWITCH_MARGIN: f32 = 55_000.0;
-    const ANCHOR_FORCE_DISTANCE_SQ: f32 = 1_100_000.0;
     const RELAY_PARENT_STALE_FRAMES: u32 = 180;
     const RELAY_FAILOVER_COOLDOWN_FRAMES: u32 = 120;
     const RELAY_FAILOVER_MIN_SAMPLES: u8 = 2;
@@ -227,18 +273,56 @@ impl NetworkSession {
     const LEAF_LINK_CAP: usize = 7;
     const SUPERNODE_LINK_CAP: usize = 24;
     const ROOT_LINK_CAP: usize = 28;
-    const DISCOVERY_MIN_ATTACH_FRAMES: u32 = 180;
     const SYNC_TRACE_PERIOD_FRAMES: u32 = 60;
     const SYNC_STALE_WARN_FRAMES: u32 = 180;
     const STALE_LINK_RESET_FRAMES: u32 = 240;
     const STALE_LINK_BACKOFF_FRAMES: u32 = 120;
-    const BOOTSTRAP_FULLMESH_TRIGGER_FRAMES: u32 = 120;
-    const BOOTSTRAP_PROBE_LINKS: usize = 8;
     const MAX_DISCOVERY_PEERS: usize = 192;
     const MAX_RELAY_INPUT_QUEUE: usize = 1024;
     const MAX_DOWNLINK_QUEUE: usize = 64;
     const MAX_BATCH_ENTRIES: usize = 512;
     const RELAY_ENVELOPE_MAGIC: [u8; 4] = *b"SLRY";
+    /// Root drops a member that has shown no signs of life for this long (~10s).
+    const MEMBER_TTL_FRAMES: u32 = 600;
+    /// Root re-broadcasts the (possibly unchanged) map at this cadence; the
+    /// periodic flood down the tree doubles as the root liveness heartbeat.
+    const MAP_BROADCAST_PERIOD_FRAMES: u32 = 60;
+    /// How often a node without a tree slot re-sends its JoinRequest.
+    const JOIN_REQUEST_PERIOD_FRAMES: u32 = 90;
+    /// No map for this long (~30s) means the root is presumed dead.
+    const ROOT_STALE_FRAMES: u32 = 1800;
+    /// Successor candidates take over in uuid order, staggered by this much,
+    /// so the room converges on one new root without extra coordination.
+    const ROOT_TAKEOVER_STAGGER_FRAMES: u32 = 300;
+    /// With positive death evidence (signaling departure / link death) the
+    /// takeover is fast: ~3s for the first candidate, +2s per rank.
+    const ROOT_DEPARTURE_TAKEOVER_BASE_FRAMES: u32 = 180;
+    const ROOT_DEPARTURE_TAKEOVER_STAGGER_FRAMES: u32 = 120;
+    /// Never received any map after this long with live links: assume the room
+    /// has no root (creator left) and let the lowest-uuid connected node claim it.
+    const BOOTSTRAP_NO_ROOT_FRAMES: u32 = 900;
+    /// Healthy-but-undesired links are kept this long before being dropped
+    /// (make-before-break: replacement tree links form while old ones serve).
+    const UNDESIRED_LINK_GRACE_FRAMES: u32 = 600;
+    /// How long a forwarded JoinRequest suppresses re-forwarding for the same origin.
+    const JOIN_FORWARD_DEDUP_FRAMES: u32 = 60;
+    /// Rooms above this size broadcast topology deltas/heartbeats instead of
+    /// full maps (small rooms keep the simpler battle-tested full-map path).
+    const DELTA_ROSTER_MIN: usize = 33;
+    /// In delta mode, every Nth broadcast is a full-map anchor.
+    const MAP_FULL_ANCHOR_EVERY: u32 = 10;
+    /// Coalesce membership-change broadcasts in big rooms (join replies still
+    /// go out immediately via pending_map_peers).
+    const MIN_DIRTY_BROADCAST_FRAMES: u32 = 30;
+    /// A member must hold a parent this long before connectivity nags can
+    /// trigger reassignment, and reassignments are at most this frequent.
+    const REASSIGN_MIN_PARENT_AGE_FRAMES: u32 = 600;
+    /// Join-request nags from an in-roster member count within this window...
+    const LINK_NAG_WINDOW_FRAMES: u32 = 300;
+    /// ...and this many of them mean "my assigned parent is unreachable".
+    const LINK_NAG_THRESHOLD: u32 = 2;
+    /// First auto-rejoin attempt happens this long after socket loss.
+    const REJOIN_BASE_DELAY_FRAMES: u32 = 60;
 
     fn interest_radius_sq() -> f32 {
         let radius = 1800.0;
@@ -297,38 +381,6 @@ impl NetworkSession {
         self.remote_players.get(&peer_key).map(|remote| remote.pos)
     }
 
-    fn choose_dynamic_supernode_count(total_nodes: usize, active_areas: usize) -> usize {
-        if total_nodes <= 3 {
-            return 1;
-        }
-        let area_count = active_areas.max(1);
-        let small_room_floor = match total_nodes {
-            0..=3 => 1,
-            4..=8 => 2,
-            9..=16 => 3,
-            17..=24 => 4,
-            25..=40 => 6,
-            41..=64 => 8,
-            _ => 0,
-        };
-        let by_scale = ((total_nodes as f32).sqrt() / 1.8).ceil() as usize;
-        let by_load = total_nodes.div_ceil(Self::TARGET_PLAYERS_PER_SUPERNODE.max(1));
-        let by_areas = area_count
-            .max(1)
-            .div_ceil(Self::TARGET_AREAS_PER_SUPERNODE.max(1));
-        let mut target = small_room_floor.max(by_scale).max(by_load).max(by_areas);
-        if total_nodes <= 64 {
-            // Prevent over-sharding in small rooms.
-            target = target.min((total_nodes / 2).max(1));
-        }
-        if total_nodes >= 5_000 {
-            // Keep enough relay heads in very large rooms.
-            let huge_floor = ((total_nodes as f32).sqrt() / 1.4).ceil() as usize;
-            target = target.max(huge_floor);
-        }
-        target.clamp(1, Self::MAX_SUPERNODES).min(total_nodes)
-    }
-
     fn choose_dynamic_fanout(total_nodes: usize) -> usize {
         let fanout = match total_nodes {
             0..=3 => 2,
@@ -346,254 +398,130 @@ impl NetworkSession {
         fanout.clamp(Self::MIN_FANOUT, Self::MAX_FANOUT)
     }
 
-    fn select_supernodes_dynamic(
-        &self,
-        all_nodes: &[matchbox_socket::PeerId],
-        target_k: usize,
-    ) -> Vec<matchbox_socket::PeerId> {
-        let mut ranked = all_nodes.to_vec();
-        Self::sort_peer_ids(&mut ranked);
-        let mut eligible: Vec<matchbox_socket::PeerId> = ranked
-            .iter()
-            .copied()
-            .filter(|id| !self.bad_supernodes.contains(id))
-            .collect();
-        if eligible.is_empty() {
-            eligible = ranked.clone();
-        }
-        if eligible.is_empty() {
-            return Vec::new();
-        }
-
-        let deterministic_root = ranked[0];
-        let mut area_counts: HashMap<u32, usize> = HashMap::new();
-        for node in &eligible {
-            let area = self
-                .peer_pos(*node)
-                .map(Self::area_id_from_pos)
-                .unwrap_or(0);
-            *area_counts.entry(area).or_insert(0) += 1;
-        }
-
-        let mut selected = vec![deterministic_root];
-
-        while selected.len() < target_k {
-            let mut best: Option<(matchbox_socket::PeerId, f32)> = None;
-            for candidate in &eligible {
-                if selected.contains(candidate) {
-                    continue;
-                }
-                let cand_pos = self.peer_pos(*candidate);
-                let area = cand_pos.map(Self::area_id_from_pos).unwrap_or(0);
-                let area_density = *area_counts.get(&area).unwrap_or(&1) as f32;
-                let min_dist = selected
-                    .iter()
-                    .map(|picked| {
-                        let a = cand_pos.unwrap_or(Vec2::ZERO);
-                        let b = self.peer_pos(*picked).unwrap_or(Vec2::ZERO);
-                        let d = a - b;
-                        d.x * d.x + d.y * d.y
-                    })
-                    .fold(f32::MAX, f32::min);
-                let latency = self.latency_ms.get(candidate).copied().unwrap_or(200) as f32;
-                let score = area_density * 8_000.0 + min_dist * 0.03 - latency * 80.0;
-                match best {
-                    Some((id, best_score)) => {
-                        if score > best_score
-                            || (score == best_score
-                                && Self::peer_id_ordering(*candidate, id).is_lt())
-                        {
-                            best = Some((*candidate, score));
-                        }
-                    }
-                    None => best = Some((*candidate, score)),
-                }
-            }
-            if let Some((candidate, _)) = best {
-                selected.push(candidate);
-            } else {
-                break;
-            }
-        }
-
-        Self::sort_peer_ids(&mut selected);
-        selected
+    /// Console logging that is a no-op in native unit tests.
+    fn log_info(message: &str) {
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(&message.into());
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = message;
     }
 
-    fn build_clustered_relay_order(
-        &mut self,
-        all_nodes: &[matchbox_socket::PeerId],
-        supernodes: &[matchbox_socket::PeerId],
-        super_root: matchbox_socket::PeerId,
-    ) -> Vec<matchbox_socket::PeerId> {
-        if supernodes.is_empty() {
-            return all_nodes.to_vec();
-        }
+    fn log_warn(message: &str) {
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::warn_1(&message.into());
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = message;
+    }
 
-        let root = super_root;
-        let root_pos = self.peer_pos(root).unwrap_or(Vec2::ZERO);
+    fn peer_id_from_uuid(uuid: [u8; 16]) -> matchbox_socket::PeerId {
+        matchbox_socket::PeerId(uuid::Uuid::from_bytes(uuid))
+    }
 
-        let mut backbone: Vec<matchbox_socket::PeerId> = supernodes
+    fn uuid_for_peer(peer_id: matchbox_socket::PeerId) -> [u8; 16] {
+        *peer_id.0.as_bytes()
+    }
+
+    /// Make a roster member resolvable: hash -> `{:?}` string -> matchbox PeerId,
+    /// even if we have never exchanged a message with it.
+    fn register_peer_uuid(&mut self, uuid: [u8; 16]) -> (u64, matchbox_socket::PeerId) {
+        let peer = Self::peer_id_from_uuid(uuid);
+        let peer_str = format!("{:?}", peer);
+        let hash = Self::hash_peer_id(&peer_str);
+        self.peer_id_lookup.insert(peer_str.clone(), peer);
+        self.peer_hash_lookup.insert(hash, peer_str.clone());
+        self.peer_identity_lookup
+            .entry(hash)
+            .or_insert_with(|| peer_str.clone());
+        (hash, peer)
+    }
+
+    fn roster_entry(&self, peer_hash: u64) -> Option<&TopologyEntry> {
+        self.topology_roster
             .iter()
-            .copied()
-            .filter(|id| *id != root)
+            .find(|entry| entry.peer_hash == peer_hash)
+    }
+
+    fn roster_contains(&self, peer_hash: u64) -> bool {
+        self.roster_entry(peer_hash).is_some()
+    }
+
+    fn roster_root_hash(&self) -> Option<u64> {
+        self.topology_roster
+            .iter()
+            .find(|entry| entry.parent_hash == 0)
+            .map(|entry| entry.peer_hash)
+    }
+
+    fn roster_child_count(&self, peer_hash: u64) -> usize {
+        self.topology_roster
+            .iter()
+            .filter(|entry| entry.parent_hash == peer_hash)
+            .count()
+    }
+
+    fn rebuild_roster_peer_strs(&mut self) {
+        self.roster_peer_strs = self
+            .topology_roster
+            .iter()
+            .map(|entry| format!("{:?}", Self::peer_id_from_uuid(entry.uuid)))
             .collect();
-        backbone.sort_by(|a, b| {
-            let pa = self.peer_pos(*a).unwrap_or(root_pos);
-            let pb = self.peer_pos(*b).unwrap_or(root_pos);
-            let da = {
-                let d = pa - root_pos;
-                d.x * d.x + d.y * d.y
-            };
-            let db = {
-                let d = pb - root_pos;
-                d.x * d.x + d.y * d.y
-            };
-            da.partial_cmp(&db)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| Self::peer_id_ordering(*a, *b))
+    }
+
+    /// Root: any sign of life from a member refreshes its TTL.
+    fn note_member_seen(&mut self, origin_hash: u64, current_frame: u32) {
+        if self.is_host {
+            self.member_last_seen.insert(origin_hash, current_frame);
+        }
+    }
+
+    /// Root: sticky parent assignment. New members attach to the earliest
+    /// roster member (root first, then join order) with spare fanout, so a
+    /// join never reshuffles existing routes.
+    fn pick_parent_for_new_member(&self) -> u64 {
+        let fanout = self.relay_fanout.clamp(Self::MIN_FANOUT, Self::MAX_FANOUT);
+        for entry in &self.topology_roster {
+            if self.roster_child_count(entry.peer_hash) < fanout {
+                return entry.peer_hash;
+            }
+        }
+        self.roster_root_hash().unwrap_or(0)
+    }
+
+    /// Root: add a member to the roster (idempotent).
+    fn add_roster_member(&mut self, uuid: [u8; 16], current_frame: u32) {
+        let (hash, _) = self.register_peer_uuid(uuid);
+        self.member_last_seen.insert(hash, current_frame);
+        if Some(hash) == self.local_peer_hash || self.roster_contains(hash) {
+            return;
+        }
+        let parent_hash = self.pick_parent_for_new_member();
+        self.topology_roster.push(TopologyEntry {
+            peer_hash: hash,
+            uuid,
+            parent_hash,
         });
+        self.member_parent_since.insert(hash, current_frame);
+        self.roster_dirty = true;
+    }
 
-        let mut anchors: HashMap<matchbox_socket::PeerId, Vec<matchbox_socket::PeerId>> =
-            HashMap::new();
-        let mut loads: HashMap<matchbox_socket::PeerId, usize> = HashMap::new();
-        for supernode in supernodes {
-            anchors.insert(*supernode, Vec::new());
-            loads.insert(*supernode, 0);
-            self.peer_anchor_supernode.insert(*supernode, *supernode);
-        }
-
-        let mut leaves: Vec<matchbox_socket::PeerId> = all_nodes
+    /// Order-independent fingerprint of a roster's structure. Lets delta
+    /// receivers prove they reconstructed exactly what the root has.
+    fn roster_checksum(entries: &[TopologyEntry]) -> u64 {
+        let mut pairs: Vec<(u64, u64)> = entries
             .iter()
-            .copied()
-            .filter(|id| !supernodes.contains(id))
+            .map(|entry| (entry.peer_hash, entry.parent_hash))
             .collect();
-        Self::sort_peer_ids(&mut leaves);
-
-        for node in leaves {
-            let node_pos = self.peer_pos(node).unwrap_or(Vec2::ZERO);
-            let mut best: Option<(matchbox_socket::PeerId, f32)> = None;
-            let mut scores: HashMap<matchbox_socket::PeerId, f32> = HashMap::new();
-            for supernode in supernodes {
-                let super_pos = self.peer_pos(*supernode).unwrap_or(node_pos);
-                let d = super_pos - node_pos;
-                let distance_score = d.x * d.x + d.y * d.y;
-                let latency_score =
-                    self.latency_ms.get(supernode).copied().unwrap_or(200) as f32 * 220.0;
-                let load_score = *loads.get(supernode).unwrap_or(&0) as f32 * 18_000.0;
-                let score = distance_score + latency_score + load_score;
-                scores.insert(*supernode, score);
-                match best {
-                    Some((id, best_score)) => {
-                        if score < best_score
-                            || (score == best_score
-                                && Self::peer_id_ordering(*supernode, id).is_lt())
-                        {
-                            best = Some((*supernode, score));
-                        }
-                    }
-                    None => best = Some((*supernode, score)),
-                }
-            }
-            let mut chosen = best.map(|(id, _)| id).unwrap_or(root);
-            if let Some(prev_anchor) = self.peer_anchor_supernode.get(&node).copied() {
-                if prev_anchor != chosen && supernodes.contains(&prev_anchor) {
-                    let prev_score = scores.get(&prev_anchor).copied().unwrap_or(f32::MAX);
-                    let chosen_score = scores.get(&chosen).copied().unwrap_or(prev_score);
-                    let prev_pos = self.peer_pos(prev_anchor).unwrap_or(node_pos);
-                    let pd = prev_pos - node_pos;
-                    let prev_dist_sq = pd.x * pd.x + pd.y * pd.y;
-                    let switch_is_decisive = chosen_score + Self::ANCHOR_SWITCH_MARGIN < prev_score;
-                    let force_switch = prev_dist_sq > Self::ANCHOR_FORCE_DISTANCE_SQ;
-                    if !switch_is_decisive && !force_switch {
-                        chosen = prev_anchor;
-                    }
-                }
-            }
-            self.peer_anchor_supernode.insert(node, chosen);
-            *loads.entry(chosen).or_insert(0) += 1;
-            anchors.entry(chosen).or_default().push(node);
-        }
-
-        let mut relay_order = vec![root];
-        for node in &backbone {
-            relay_order.push(*node);
-        }
-
-        let mut supernode_order = vec![root];
-        supernode_order.extend(backbone.iter().copied());
-        for supernode in supernode_order {
-            if let Some(children) = anchors.get_mut(&supernode) {
-                let super_pos = self.peer_pos(supernode).unwrap_or(Vec2::ZERO);
-                children.sort_by(|a, b| {
-                    let pa = self.peer_pos(*a).unwrap_or(super_pos);
-                    let pb = self.peer_pos(*b).unwrap_or(super_pos);
-                    let da = {
-                        let d = pa - super_pos;
-                        d.x * d.x + d.y * d.y
-                    };
-                    let db = {
-                        let d = pb - super_pos;
-                        d.x * d.x + d.y * d.y
-                    };
-                    da.partial_cmp(&db)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| Self::peer_id_ordering(*a, *b))
-                });
-                relay_order.extend(children.iter().copied());
+        pairs.sort_unstable();
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for (peer, parent) in pairs {
+            for byte in peer.to_le_bytes().iter().chain(parent.to_le_bytes().iter()) {
+                hash ^= *byte as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
             }
         }
-        relay_order
+        hash
     }
 
-    fn build_relay_order(
-        all_nodes: &[matchbox_socket::PeerId],
-        supernodes: &[matchbox_socket::PeerId],
-    ) -> Vec<matchbox_socket::PeerId> {
-        let super_set: HashSet<matchbox_socket::PeerId> = supernodes.iter().copied().collect();
-        let mut relay_order = supernodes.to_vec();
-        for node in all_nodes {
-            if !super_set.contains(node) {
-                relay_order.push(*node);
-            }
-        }
-        relay_order
-    }
-
-    fn tree_assignment_for_index(
-        relay_order: &[matchbox_socket::PeerId],
-        local_idx: usize,
-        fanout: usize,
-    ) -> (
-        Option<matchbox_socket::PeerId>,
-        Option<matchbox_socket::PeerId>,
-        Vec<matchbox_socket::PeerId>,
-    ) {
-        let fanout = fanout.clamp(Self::MIN_FANOUT, Self::MAX_FANOUT);
-        let parent = if local_idx == 0 {
-            None
-        } else {
-            let parent_idx = (local_idx - 1) / fanout;
-            relay_order.get(parent_idx).copied()
-        };
-
-        let backup_parent = if local_idx <= 1 {
-            None
-        } else {
-            let alt_idx = (local_idx - 2) / fanout;
-            relay_order.get(alt_idx).copied()
-        };
-
-        let mut children = Vec::new();
-        for child_slot in 0..fanout {
-            let child_idx = local_idx * fanout + child_slot + 1;
-            if let Some(child) = relay_order.get(child_idx) {
-                children.push(*child);
-            }
-        }
-
-        (parent, backup_parent, children)
-    }
     pub fn new() -> Self {
         Self {
             socket: None,
@@ -608,7 +536,6 @@ impl NetworkSession {
             supernode_id: None,
             super_root_id: None,
             supernode_set: Vec::new(),
-            peer_anchor_supernode: HashMap::new(),
             relay_parent: None,
             relay_backup_parent: None,
             relay_active_parent: None,
@@ -616,9 +543,31 @@ impl NetworkSession {
             relay_children: Vec::new(),
             desired_peer_set: HashSet::new(),
             discovery_attached: false,
-            discovery_attach_frame: None,
-            bootstrap_full_mesh_active: false,
-            frames_without_peer_connection: 0,
+            topology_roster: Vec::new(),
+            roster_peer_strs: HashSet::new(),
+            member_last_seen: HashMap::new(),
+            roster_dirty: false,
+            last_map_rx_frame: 0,
+            last_join_request_frame: 0,
+            pending_map_peers: Vec::new(),
+            recent_join_forwards: HashMap::new(),
+            undesired_since: HashMap::new(),
+            first_peer_frame: None,
+            flush_counter: 0,
+            last_name_announce_frame: 0,
+            root_departure_frame: None,
+            intentional_drops: HashMap::new(),
+            last_broadcast_roster: Vec::new(),
+            last_broadcast_epoch: 0,
+            map_anchor_counter: 0,
+            needs_full_map: false,
+            member_parent_since: HashMap::new(),
+            member_link_nags: HashMap::new(),
+            reconnect_signaling: None,
+            reconnect_ice: None,
+            auto_rejoin_enabled: false,
+            rejoin_attempts: 0,
+            next_rejoin_frame: 0,
             relay_epoch: 0,
             last_parent_switch_frame: 0,
             stale_parent_events: 0,
@@ -680,7 +629,6 @@ impl NetworkSession {
             latency_ms: HashMap::new(),
             latency_samples: HashMap::new(),
             supernode_scores: HashMap::new(),
-            bad_supernodes: HashSet::new(),
             last_enemy_sync_frame: 0,
             paid_obstacle_confirmations: HashMap::new(),
             paid_ability_confirmations: HashMap::new(),
@@ -765,6 +713,9 @@ impl NetworkSession {
     pub fn create_room(&mut self, signaling_server: &str, ice_config: &IceConfig) -> String {
         self.room_code = Self::generate_room_code();
         self.is_host = true; // Room creator is the host
+        self.auto_rejoin_enabled = true;
+        self.rejoin_attempts = 0;
+        self.next_rejoin_frame = 0;
         let room_code = self.room_code.clone();
         self.connect(signaling_server, &room_code, ice_config);
         self.room_code.clone()
@@ -774,13 +725,16 @@ impl NetworkSession {
     pub fn join_room(&mut self, signaling_server: &str, room_code: &str, ice_config: &IceConfig) {
         self.room_code = room_code.to_uppercase();
         self.is_host = false; // Joiners are not hosts
+        self.auto_rejoin_enabled = true;
+        self.rejoin_attempts = 0;
+        self.next_rejoin_frame = 0;
         let room_code = self.room_code.clone();
         self.connect(signaling_server, &room_code, ice_config);
     }
 
     fn connect(&mut self, signaling_server: &str, room_code: &str, ice_config: &IceConfig) {
-        // Use game-specific room prefix to avoid conflicts with other matchbox games
-        // ?next=2 tells matchbox to start handshake when 2 peers connect
+        // Game-specific room path. Omit `?next=N` so Matchbox keeps the full room membership
+        // (pairwise `next=2` is for 2-player sequential pairing, not N-peer free rooms).
         let room_url = format!("{}/slime_armies_{}", signaling_server, room_code);
 
         web_sys::console::log_1(&format!("Connecting to room: {}", room_url).into());
@@ -802,13 +756,52 @@ impl NetworkSession {
             .build();
         // Start in default full-mesh signaling mode so first-handshake offers are not
         // filtered before we know any peers. We tighten to sparse desired links once
-        // discovery exposes known peers and topology converges.
+        // the root's topology map arrives. All nodes stay attached to signaling for
+        // the lifetime of the session: it is the membership oracle and the only way
+        // to form new WebRTC links (no overlay-relayed signaling yet).
         self.socket = Some(socket);
         self.desired_peer_set.clear();
         self.discovery_attached = true;
-        self.discovery_attach_frame = None;
-        self.bootstrap_full_mesh_active = false;
-        self.frames_without_peer_connection = 0;
+        self.topology_roster.clear();
+        self.roster_peer_strs.clear();
+        self.member_last_seen.clear();
+        self.roster_dirty = false;
+        self.last_map_rx_frame = 0;
+        self.last_join_request_frame = 0;
+        self.pending_map_peers.clear();
+        self.recent_join_forwards.clear();
+        self.undesired_since.clear();
+        self.first_peer_frame = None;
+        self.root_departure_frame = None;
+        self.intentional_drops.clear();
+        // A (re)connect means a fresh identity and a fresh overlay: stale
+        // relay routes from a previous socket would poison the desired set
+        // (e.g. desiring a dead room's root forever) and block admission.
+        self.super_root_id = None;
+        self.supernode_id = None;
+        self.supernode_set.clear();
+        self.relay_parent = None;
+        self.relay_backup_parent = None;
+        self.relay_active_parent = None;
+        self.relay_children.clear();
+        self.relay_fanout = Self::MIN_FANOUT;
+        self.relay_epoch = 0;
+        self.area_authorities.clear();
+        self.peer_link_backoff_until.clear();
+        self.last_peer_message_frames.clear();
+        self.peer_connected_frames.clear();
+        self.latency_ms.clear();
+        self.latency_samples.clear();
+        self.supernode_scores.clear();
+        self.last_topology_broadcast_frame = 0;
+        self.last_broadcast_roster.clear();
+        self.last_broadcast_epoch = 0;
+        self.map_anchor_counter = 0;
+        self.needs_full_map = false;
+        self.member_parent_since.clear();
+        self.member_link_nags.clear();
+        self.reconnect_signaling = Some(signaling_server.to_string());
+        self.reconnect_ice = Some(ice_config.clone());
         self.state = NetworkState::WaitingForPeers;
 
         // Spawn the socket loop - when it completes, set the closed flag
@@ -831,7 +824,6 @@ impl NetworkSession {
         self.supernode_id = None;
         self.super_root_id = None;
         self.supernode_set.clear();
-        self.peer_anchor_supernode.clear();
         self.relay_parent = None;
         self.relay_backup_parent = None;
         self.relay_active_parent = None;
@@ -839,9 +831,31 @@ impl NetworkSession {
         self.relay_children.clear();
         self.desired_peer_set.clear();
         self.discovery_attached = false;
-        self.discovery_attach_frame = None;
-        self.bootstrap_full_mesh_active = false;
-        self.frames_without_peer_connection = 0;
+        self.topology_roster.clear();
+        self.roster_peer_strs.clear();
+        self.member_last_seen.clear();
+        self.roster_dirty = false;
+        self.last_map_rx_frame = 0;
+        self.last_join_request_frame = 0;
+        self.pending_map_peers.clear();
+        self.recent_join_forwards.clear();
+        self.undesired_since.clear();
+        self.first_peer_frame = None;
+        self.flush_counter = 0;
+        self.last_name_announce_frame = 0;
+        self.root_departure_frame = None;
+        self.intentional_drops.clear();
+        self.last_broadcast_roster.clear();
+        self.last_broadcast_epoch = 0;
+        self.map_anchor_counter = 0;
+        self.needs_full_map = false;
+        self.member_parent_since.clear();
+        self.member_link_nags.clear();
+        self.reconnect_signaling = None;
+        self.reconnect_ice = None;
+        self.auto_rejoin_enabled = false;
+        self.rejoin_attempts = 0;
+        self.next_rejoin_frame = 0;
         self.relay_epoch = 0;
         self.last_parent_switch_frame = 0;
         self.stale_parent_events = 0;
@@ -864,7 +878,6 @@ impl NetworkSession {
         self.peer_id_lookup.clear();
         self.peer_hash_lookup.clear();
         self.peer_identity_lookup.clear();
-        self.bad_supernodes.clear();
         self.last_enemy_sync_frame = 0;
         self.paid_obstacle_confirmations.clear();
         self.paid_ability_confirmations.clear();
@@ -902,13 +915,51 @@ impl NetworkSession {
         self.last_update_frame = current_frame;
         // Check if socket loop has ended (connection failed)
         if self.socket_closed.get() {
-            web_sys::console::log_1(&"Network connection closed".into());
             self.socket = None;
+            // Signaling/socket loss is recoverable: rejoin the same room with
+            // backoff instead of dumping the player to the title screen. We
+            // come back under a fresh peer id; the join machinery re-admits
+            // us and the old identity ages out of rosters.
+            if self.auto_rejoin_enabled
+                && !self.room_code.is_empty()
+                && self.reconnect_signaling.is_some()
+            {
+                if self.next_rejoin_frame == 0 {
+                    Self::log_warn("Connection lost; will auto-rejoin");
+                    self.next_rejoin_frame =
+                        current_frame.saturating_add(Self::REJOIN_BASE_DELAY_FRAMES);
+                }
+                self.state = NetworkState::WaitingForPeers;
+                if current_frame >= self.next_rejoin_frame {
+                    self.rejoin_attempts = self.rejoin_attempts.saturating_add(1);
+                    let backoff = Self::REJOIN_BASE_DELAY_FRAMES
+                        .saturating_mul(1u32 << self.rejoin_attempts.min(4))
+                        .min(900);
+                    self.next_rejoin_frame = current_frame.saturating_add(backoff);
+                    let server = self.reconnect_signaling.clone().unwrap_or_default();
+                    let ice = self.reconnect_ice.clone().unwrap_or_default();
+                    let room = self.room_code.clone();
+                    // Solo creators keep root so their room re-forms instantly;
+                    // with others around, rejoin as a regular member (the
+                    // survivors fail over on their own).
+                    let retain_host = self.is_host && self.remote_players.is_empty();
+                    self.local_peer_id = None;
+                    self.local_peer_hash = None;
+                    Self::log_warn(&format!(
+                        "Auto-rejoining room {room} (attempt {})",
+                        self.rejoin_attempts
+                    ));
+                    self.connect(&server, &room, &ice);
+                    self.is_host = retain_host;
+                }
+                return true;
+            }
+            Self::log_info("Network connection closed");
             self.state = NetworkState::Error("Connection failed".to_string());
             return false;
         }
 
-        let (local_id, connected_peers, known_peers) = {
+        let (local_id, connected_peers, known_peers, departures) = {
             let socket = match &mut self.socket {
                 Some(s) => s,
                 None => return true, // No socket is fine, just nothing to update
@@ -987,13 +1038,20 @@ impl NetworkSession {
                             self.peer_identity_lookup.remove(&hash);
                         }
                         if let Some(peer_id) = self.peer_id_lookup.get(&peer_id_str).copied() {
-                            self.bad_supernodes.remove(&peer_id);
                             self.supernode_scores.remove(&peer_id);
                             self.latency_ms.remove(&peer_id);
                             self.latency_samples.remove(&peer_id);
                             self.peer_link_backoff_until.remove(&peer_id);
                             self.last_peer_message_frames.remove(&peer_id);
                             self.peer_connected_frames.remove(&peer_id);
+                            let expected = self.intentional_drops.remove(&peer_id).is_some();
+                            if !expected
+                                && !self.is_host
+                                && Some(peer_id) == self.super_root_id
+                                && self.root_departure_frame.is_none()
+                            {
+                                self.root_departure_frame = Some(current_frame);
+                            }
                         }
                         if self.remote_players.is_empty() {
                             self.state = NetworkState::WaitingForPeers;
@@ -1017,7 +1075,13 @@ impl NetworkSession {
                 self.peer_link_backoff_until.remove(&peer_id);
                 self.relay_telemetry.recv_messages =
                     self.relay_telemetry.recv_messages.saturating_add(1);
+                if self.is_host {
+                    self.member_last_seen.insert(hash, current_frame);
+                }
                 if let Some((origin_hash, payload)) = Self::decode_relay_envelope(&data) {
+                    if self.is_host {
+                        self.member_last_seen.insert(origin_hash, current_frame);
+                    }
                     if let Some(msg) = NetMessage::from_bytes(&payload) {
                         self.pending_messages
                             .push((peer_id_str, Some(origin_hash), msg));
@@ -1053,17 +1117,30 @@ impl NetworkSession {
             Self::sort_peer_ids(&mut known_peers);
             known_peers.dedup();
             Self::cap_discovery_peers(local_id, &connected_peers, &mut known_peers);
-            (local_id, connected_peers, known_peers)
+            let departures = socket.take_signaling_departures();
+            (local_id, connected_peers, known_peers, departures)
         };
 
-        if self.discovery_attached && self.discovery_attach_frame.is_none() && local_id.is_some() {
-            self.discovery_attach_frame = Some(current_frame);
+        // The signaling server broadcasts departures room-wide: the strongest
+        // fast evidence that the topology root is gone.
+        if let Some(root) = self.super_root_id {
+            if departures.contains(&root) && !self.is_host && self.root_departure_frame.is_none() {
+                Self::log_warn(&format!(
+                    "Root {:?} left signaling; arming fast failover",
+                    root
+                ));
+                self.root_departure_frame = Some(current_frame);
+            }
         }
-        if connected_peers.is_empty() {
-            self.frames_without_peer_connection =
-                self.frames_without_peer_connection.saturating_add(1);
-        } else {
-            self.frames_without_peer_connection = 0;
+        self.intentional_drops
+            .retain(|_, frame| current_frame.saturating_sub(*frame) < 600);
+
+        if !connected_peers.is_empty() && self.first_peer_frame.is_none() {
+            self.first_peer_frame = Some(current_frame);
+        }
+        if !connected_peers.is_empty() {
+            self.rejoin_attempts = 0;
+            self.next_rejoin_frame = 0;
         }
 
         let local_peer_str = local_id.map(|id| format!("{:?}", id));
@@ -1071,6 +1148,7 @@ impl NetworkSession {
             known_peers.iter().map(|id| format!("{:?}", id)).collect();
         self.peer_id_lookup.retain(|peer_id, _| {
             known_peer_strs.contains(peer_id)
+                || self.roster_peer_strs.contains(peer_id)
                 || local_peer_str
                     .as_ref()
                     .map(|local| local == peer_id)
@@ -1078,6 +1156,7 @@ impl NetworkSession {
         });
         self.peer_hash_lookup.retain(|_, peer_id| {
             known_peer_strs.contains(peer_id)
+                || self.roster_peer_strs.contains(peer_id)
                 || local_peer_str
                     .as_ref()
                     .map(|local| local == peer_id)
@@ -1131,20 +1210,22 @@ impl NetworkSession {
         let mut chat_messages: Vec<(PeerId, u64, ChatMessage)> = Vec::new();
         let mut vote_mutes: Vec<(PeerId, u64, VoteMute)> = Vec::new();
         let mut player_stats_updates: Vec<(PeerId, u64, PlayerStatsSnapshot)> = Vec::new();
-        let mut player_updates: Vec<(PeerId, PlayerState)> = Vec::new();
+        let mut player_updates: Vec<(PeerId, Option<u64>, PlayerState)> = Vec::new();
         let mut input_frames: Vec<(PeerId, InputFrame)> = Vec::new();
         let mut player_batches: Vec<(PeerId, PlayerStateBatch)> = Vec::new();
         let mut input_batches: Vec<(PeerId, InputFrameBatch)> = Vec::new();
         let mut player_joins: Vec<(PeerId, u64, String)> = Vec::new();
         let mut player_lefts: Vec<(PeerId, u64)> = Vec::new();
         let mut topology_updates: Vec<(PeerId, u64, TopologyUpdate)> = Vec::new();
+        let mut topology_deltas: Vec<(PeerId, TopologyDelta)> = Vec::new();
         let mut area_authority_updates: Vec<(PeerId, u64, AreaAuthorityUpdate)> = Vec::new();
+        let mut join_requests: Vec<(PeerId, JoinRequest)> = Vec::new();
 
         for (peer_id, relay_origin_hash, msg) in self.pending_messages.drain(..) {
             let origin_hash = relay_origin_hash.unwrap_or_else(|| Self::hash_peer_id(&peer_id));
             match msg {
                 NetMessage::PlayerUpdate(state) => {
-                    player_updates.push((peer_id, state));
+                    player_updates.push((peer_id, relay_origin_hash, state));
                 }
                 NetMessage::PlayerJoined(name) => {
                     player_joins.push((peer_id, origin_hash, name));
@@ -1241,20 +1322,31 @@ impl NetworkSession {
                 NetMessage::AreaAuthorityUpdateEvent(update) => {
                     area_authority_updates.push((peer_id, origin_hash, update));
                 }
+                NetMessage::JoinRequestEvent(request) => {
+                    join_requests.push((peer_id, request));
+                }
+                NetMessage::TopologyDeltaEvent(delta) => {
+                    topology_deltas.push((peer_id, delta));
+                }
             }
         }
 
-        for (peer_id, origin_hash, update) in topology_updates {
-            let from_parent = self.is_parent_sender(&peer_id);
-            let from_root = self.is_authoritative_sender(&peer_id);
-            if (from_parent || from_root) && !self.relay_children.is_empty() {
-                self.send_downstream_or_broadcast_routed(
-                    NetMessage::TopologyUpdateEvent(update.clone()).to_bytes(),
-                    self.resolve_peer_id(&peer_id),
-                    Some(origin_hash),
-                );
+        for (peer_id, _origin_hash, update) in topology_updates {
+            // The map is identical for every recipient, so we apply first
+            // (which refreshes our own children) and then forward verbatim.
+            let sender_id = self.resolve_peer_id(&peer_id);
+            if self.apply_topology_map(&peer_id, &update, current_frame) {
+                self.forward_topology_map(&update, sender_id);
             }
-            self.apply_topology_update(&peer_id, update, current_frame);
+        }
+        for (peer_id, delta) in topology_deltas {
+            let sender_id = self.resolve_peer_id(&peer_id);
+            if self.apply_topology_delta(&peer_id, &delta, current_frame) {
+                self.forward_topology_delta(&delta, sender_id);
+            }
+        }
+        for (peer_id, request) in join_requests {
+            self.handle_join_request(&peer_id, request, current_frame);
         }
         for (peer_id, origin_hash, update) in area_authority_updates {
             let from_parent = self.is_parent_sender(&peer_id);
@@ -1276,7 +1368,12 @@ impl NetworkSession {
             );
 
             let mapped_peer_id = self.resolve_or_register_peer_hash(origin_hash);
-            self.migrate_peer_alias(&peer_id, &mapped_peer_id);
+            // Only merge aliases when the direct sender IS the origin; for a
+            // relayed join the sender is just the relayer, and migrating its
+            // state onto the origin's key would corrupt the relayer's entry.
+            if Self::hash_peer_id(&peer_id) == origin_hash {
+                self.migrate_peer_alias(&peer_id, &mapped_peer_id);
+            }
             if self.is_local_peer_str(&mapped_peer_id) {
                 continue;
             }
@@ -1300,7 +1397,7 @@ impl NetworkSession {
             self.peer_identity_lookup.remove(&origin_hash);
         }
 
-        for (peer_id, state) in player_updates {
+        for (peer_id, relay_origin, state) in player_updates {
             let peer_hash = Self::hash_peer_id(&peer_id);
             let mapped_peer_id = self.resolve_or_register_peer_hash(peer_hash);
             self.migrate_peer_alias(&peer_id, &mapped_peer_id);
@@ -1310,7 +1407,12 @@ impl NetworkSession {
             if self.is_local_peer_str(&mapped_peer_id) {
                 continue;
             }
-            if self.is_host
+            // A direct (un-relayed) PlayerUpdate is the sender's own state claim;
+            // accept it regardless of tree role so directly-linked peers are never
+            // "connected but blind" during topology convergence.
+            let direct_self_claim = relay_origin.is_none();
+            if direct_self_claim
+                || self.is_host
                 || self.is_authoritative_sender(&peer_id)
                 || self.is_parent_sender(&peer_id)
                 || self.bootstrap_accept_sender(&peer_id)
@@ -1768,20 +1870,27 @@ impl NetworkSession {
             .retain(|peer_id, _| !self.remote_players.contains_key(peer_id));
 
         let prev_supernode = self.supernode_id;
-        let prev_relay_epoch = self.relay_epoch;
-        let allow_local_topology_recompute = self.discovery_attached
-            || self.is_host
-            || self.detached_overlay_needs_recompute(&connected_peers, current_frame);
-        if allow_local_topology_recompute {
-            self.update_supernode_from(local_id, &connected_peers, &known_peers, current_frame);
-        } else if let Some(id) = local_id {
+        if let Some(id) = local_id {
             self.local_peer_id = Some(id);
+        }
+        self.supernode_scores
+            .retain(|peer_id, _| connected_peers.contains(peer_id));
+        self.latency_ms
+            .retain(|peer_id, _| connected_peers.contains(peer_id));
+        self.latency_samples
+            .retain(|peer_id, _| connected_peers.contains(peer_id));
+
+        // Topology: the root is the single authority; everyone else adopts its
+        // map and never self-elects (except the explicit failover paths below).
+        if self.is_host {
+            self.update_topology_as_root(current_frame, &connected_peers);
+        } else {
+            self.maybe_send_join_request(current_frame, &connected_peers);
+            self.maybe_root_failover(current_frame, &connected_peers);
         }
         self.maybe_failover_parent(current_frame);
         self.maybe_backoff_silent_peers(current_frame, &connected_peers);
-        self.maybe_manage_bootstrap_full_mesh(&known_peers, &connected_peers);
         self.update_desired_peers(&known_peers, &connected_peers);
-        self.maybe_detach_discovery(current_frame, &connected_peers);
         if prev_supernode != self.supernode_id {
             web_sys::console::log_1(
                 &format!(
@@ -1791,16 +1900,6 @@ impl NetworkSession {
                 .into(),
             );
         }
-        if self.is_host && self.relay_epoch != prev_relay_epoch {
-            self.last_topology_broadcast_frame = current_frame;
-            self.last_area_update_broadcast_frame = current_frame;
-            self.broadcast_topology_update();
-            self.broadcast_area_authorities();
-        }
-        if self.is_host && current_frame.saturating_sub(self.last_topology_broadcast_frame) >= 120 {
-            self.last_topology_broadcast_frame = current_frame;
-            self.broadcast_topology_update();
-        }
 
         if !connected_peers.is_empty() {
             self.state = NetworkState::Connected;
@@ -1809,249 +1908,302 @@ impl NetworkSession {
         }
         self.log_sync_trace(current_frame, &connected_peers, &known_peers);
         self.prune_event_confirmations(current_frame);
+        self.maybe_reannounce_name(current_frame, &connected_peers);
         self.tick_latency(current_frame, &connected_peers);
         self.log_telemetry_periodic(current_frame);
 
         true
     }
 
-    fn maybe_manage_bootstrap_full_mesh(
-        &mut self,
-        known_peers: &[matchbox_socket::PeerId],
-        connected_peers: &[matchbox_socket::PeerId],
-    ) {
-        if !self.discovery_attached {
-            self.bootstrap_full_mesh_active = false;
-            return;
-        }
-
-        if self.bootstrap_full_mesh_active {
-            if connected_peers.is_empty() {
-                return;
-            }
-            self.bootstrap_full_mesh_active = false;
-            self.desired_peer_set.clear();
-            self.update_desired_peers(known_peers, connected_peers);
-            web_sys::console::log_1(
-                &"Bootstrap probe mode disabled after first peer connection".into(),
-            );
-            return;
-        }
-
-        if !connected_peers.is_empty() {
-            return;
-        }
-        if self.frames_without_peer_connection < Self::BOOTSTRAP_FULLMESH_TRIGGER_FRAMES {
-            return;
-        }
-        if known_peers.is_empty() {
-            return;
-        }
-
-        let mut probe = known_peers.to_vec();
-        Self::sort_peer_ids(&mut probe);
-        if let Some(local) = self.local_peer_id {
-            probe.retain(|id| *id != local);
-        }
-        if probe.is_empty() {
-            return;
-        }
-        let seed = self
-            .local_peer_id
-            .map(|id| Self::hash_peer_id(&format!("{:?}", id)) as usize)
-            .unwrap_or(0);
-        let rotate = (self.relay_epoch as usize).wrapping_add(seed) % probe.len();
-        probe.rotate_left(rotate);
-        let target = Self::BOOTSTRAP_PROBE_LINKS
-            .min(self.role_link_budget().max(2))
-            .min(probe.len());
-        let probe_set: HashSet<matchbox_socket::PeerId> = probe.into_iter().take(target).collect();
-
-        if let Some(socket) = &mut self.socket {
-            socket.set_desired_peers(probe_set.iter().copied());
-            self.bootstrap_full_mesh_active = true;
-            self.desired_peer_set = probe_set;
-            web_sys::console::log_1(
-                &format!(
-                    "Bootstrap probe mode enabled (known peers: {}, no links for {} frames)",
-                    known_peers.len().saturating_sub(1),
-                    self.frames_without_peer_connection
-                )
-                .into(),
-            );
-        }
-    }
-
-    fn maybe_detach_discovery(
+    /// Periodically re-flood our display name through the tree. Heals races
+    /// where the connect-time PlayerJoined was missed and covers members we
+    /// will never be directly linked to (siblings, other subtrees).
+    fn maybe_reannounce_name(
         &mut self,
         current_frame: u32,
         connected_peers: &[matchbox_socket::PeerId],
     ) {
-        if !self.discovery_attached {
-            return;
-        }
-        if self.is_host || self.local_is_supernode() {
-            return;
-        }
-        if self.relay_epoch == 0 {
-            return;
-        }
-        let attach_frame = self.discovery_attach_frame.unwrap_or(current_frame);
-        if current_frame.saturating_sub(attach_frame) < Self::DISCOVERY_MIN_ATTACH_FRAMES {
-            return;
-        }
+        const NAME_ANNOUNCE_PERIOD_FRAMES: u32 = 600;
         if connected_peers.is_empty() {
             return;
         }
-        let connected_set: HashSet<matchbox_socket::PeerId> =
-            connected_peers.iter().copied().collect();
-        let parent_connected = self
-            .relay_parent
-            .map(|parent| connected_set.contains(&parent))
-            .unwrap_or(false);
-        let backup_connected = self
-            .relay_backup_parent
-            .map(|parent| connected_set.contains(&parent))
-            .unwrap_or(false);
-        if connected_peers.len() < 2 && !(parent_connected && backup_connected) {
-            // With a single live route, detaching signaling can strand peers if parent
-            // churns before the overlay converges. Keep discovery attached in this state.
+        if self.last_name_announce_frame != 0
+            && current_frame.saturating_sub(self.last_name_announce_frame)
+                < NAME_ANNOUNCE_PERIOD_FRAMES
+        {
             return;
         }
-        if let Some(parent) = self.relay_active_parent.or(self.relay_parent) {
-            // Require at least one real message from the active route before detaching.
-            if self.peer_message_age(parent, current_frame).is_none() {
-                return;
-            }
+        self.last_name_announce_frame = current_frame;
+        let msg = NetMessage::PlayerJoined(self.local_player_name.clone()).to_bytes();
+        let origin = self.local_origin_hash();
+        if !self.is_host {
+            self.send_upstream_or_broadcast_routed(msg.clone(), None, origin);
         }
-        let has_overlay_route = self.relay_active_parent.or(self.relay_parent).is_some()
-            || !self.relay_children.is_empty()
-            || self.desired_peer_set.len() >= 2;
-        if !has_overlay_route {
-            return;
-        }
-
-        if let Some(socket) = &mut self.socket {
-            socket.detach_signaling();
-            self.discovery_attached = false;
-            self.bootstrap_full_mesh_active = false;
-            web_sys::console::log_1(
-                &format!(
-                    "Discovery detached: using gameplay overlay links only (f={} conn={} desired={} parent={:?} active={:?} backup={:?} epoch={})",
-                    current_frame,
-                    connected_peers.len(),
-                    self.desired_peer_set.len(),
-                    self.relay_parent,
-                    self.relay_active_parent,
-                    self.relay_backup_parent,
-                    self.relay_epoch
-                )
-                .into(),
-            );
+        if !self.relay_children.is_empty() || self.is_host {
+            self.send_downstream_or_broadcast_routed(msg, None, origin);
         }
     }
 
-    fn update_supernode_from(
+    /// Every hash reachable from `start` by following child edges (including
+    /// `start` itself). Used to avoid creating cycles when reparenting.
+    fn roster_subtree(&self, start: u64) -> HashSet<u64> {
+        let mut subtree = HashSet::new();
+        subtree.insert(start);
+        let mut frontier = vec![start];
+        while let Some(node) = frontier.pop() {
+            for entry in &self.topology_roster {
+                if entry.parent_hash == node && subtree.insert(entry.peer_hash) {
+                    frontier.push(entry.peer_hash);
+                }
+            }
+        }
+        subtree
+    }
+
+    fn pick_parent_excluding(&self, exclude: &HashSet<u64>) -> u64 {
+        let fanout = self.relay_fanout.clamp(Self::MIN_FANOUT, Self::MAX_FANOUT);
+        for entry in &self.topology_roster {
+            if exclude.contains(&entry.peer_hash) {
+                continue;
+            }
+            if self.roster_child_count(entry.peer_hash) < fanout {
+                return entry.peer_hash;
+            }
+        }
+        self.roster_root_hash().unwrap_or(0)
+    }
+
+    /// Root: drop a member and re-home its children (only the orphaned subtree
+    /// roots move; everything else keeps its routes).
+    fn remove_roster_member(&mut self, peer_hash: u64, current_frame: u32) {
+        let Some(pos) = self
+            .topology_roster
+            .iter()
+            .position(|entry| entry.peer_hash == peer_hash)
+        else {
+            return;
+        };
+        self.topology_roster.remove(pos);
+        self.member_last_seen.remove(&peer_hash);
+        self.member_parent_since.remove(&peer_hash);
+        self.member_link_nags.remove(&peer_hash);
+        let orphans: Vec<u64> = self
+            .topology_roster
+            .iter()
+            .filter(|entry| entry.parent_hash == peer_hash)
+            .map(|entry| entry.peer_hash)
+            .collect();
+        for orphan in orphans {
+            let subtree = self.roster_subtree(orphan);
+            let new_parent = self.pick_parent_excluding(&subtree);
+            if let Some(entry) = self
+                .topology_roster
+                .iter_mut()
+                .find(|entry| entry.peer_hash == orphan)
+            {
+                entry.parent_hash = new_parent;
+            }
+            self.member_parent_since.insert(orphan, current_frame);
+        }
+        self.roster_dirty = true;
+    }
+
+    /// Root: keep the roster current (admit connected strangers, prune dead
+    /// members), derive our own links, and broadcast the map on change or on
+    /// the heartbeat cadence.
+    fn update_topology_as_root(
         &mut self,
-        local_id: Option<matchbox_socket::PeerId>,
-        connected_peers: &[matchbox_socket::PeerId],
-        known_peers: &[matchbox_socket::PeerId],
         current_frame: u32,
+        connected_peers: &[matchbox_socket::PeerId],
     ) {
-        if let Some(id) = local_id {
-            self.local_peer_id = Some(id);
-        }
-
-        let local_id = match self.local_peer_id {
-            Some(id) => id,
-            None => return,
-        };
-
-        self.supernode_scores
-            .retain(|peer_id, _| connected_peers.contains(peer_id));
-        self.latency_ms
-            .retain(|peer_id, _| connected_peers.contains(peer_id));
-        self.latency_samples
-            .retain(|peer_id, _| connected_peers.contains(peer_id));
-
-        // While discovery is attached, root topology in the broader room membership view.
-        // Using only the currently-connected subgraph lets separate mini-clusters elect
-        // different roots and prune each other before the overlay converges.
-        let mut all_nodes = if self.discovery_attached {
-            known_peers.to_vec()
-        } else {
-            connected_peers.to_vec()
-        };
-        all_nodes.extend_from_slice(connected_peers);
-        all_nodes.push(local_id);
-        Self::sort_peer_ids(&mut all_nodes);
-        all_nodes.dedup();
-        if all_nodes.is_empty() {
+        let Some(local_id) = self.local_peer_id else {
             return;
-        }
-
-        let mut active_areas: HashSet<u32> = HashSet::new();
-        for node in &all_nodes {
-            let area = self
-                .peer_pos(*node)
-                .map(Self::area_id_from_pos)
-                .unwrap_or(0);
-            active_areas.insert(area);
-        }
-        let target_k = Self::choose_dynamic_supernode_count(all_nodes.len(), active_areas.len());
-        let mut supernodes = self.select_supernodes_dynamic(&all_nodes, target_k);
-        if supernodes.is_empty() {
-            return;
-        }
-        let super_root = all_nodes[0];
-        if !supernodes.contains(&super_root) {
-            supernodes.push(super_root);
-            Self::sort_peer_ids(&mut supernodes);
-        }
-
-        let relay_order = self.build_clustered_relay_order(&all_nodes, &supernodes, super_root);
-        let relay_fanout = Self::choose_dynamic_fanout(all_nodes.len());
-
-        let mut index_by_id: HashMap<matchbox_socket::PeerId, usize> = HashMap::new();
-        for (idx, id) in relay_order.iter().enumerate() {
-            index_by_id.insert(*id, idx);
-        }
-
-        let local_idx = match index_by_id.get(&local_id) {
-            Some(idx) => *idx,
-            None => 0,
         };
+        let local_uuid = Self::uuid_for_peer(local_id);
+        let (local_hash, _) = self.register_peer_uuid(local_uuid);
+        self.local_peer_hash = Some(local_hash);
 
-        let (parent, backup_parent_raw, children) =
-            Self::tree_assignment_for_index(&relay_order, local_idx, relay_fanout);
-        let backup_parent = backup_parent_raw.filter(|id| Some(*id) != parent);
-
-        let topology_changed = self.super_root_id != Some(super_root)
-            || self.relay_parent != parent
-            || self.relay_backup_parent != backup_parent
-            || self.relay_children != children
-            || self.relay_fanout != relay_fanout
-            || self.supernode_set != supernodes;
-        let parent_changed =
-            self.relay_parent != parent || self.relay_backup_parent != backup_parent;
-
-        self.supernode_set = supernodes;
-        self.super_root_id = Some(super_root);
-        // Keep existing callsites working: supernode_id remains the authoritative root.
-        self.supernode_id = Some(super_root);
-        self.is_host = super_root == local_id;
-        let prev_parent = self.relay_parent;
-        let prev_active_parent = self.relay_active_parent;
-        self.relay_parent = parent;
-        self.relay_backup_parent = backup_parent;
-        self.relay_fanout = relay_fanout;
-        if parent_changed && prev_parent.is_some() && prev_parent != self.relay_parent {
-            self.relay_backup_parent = prev_parent;
+        // Claim the root slot; anything else claiming it becomes our child.
+        let needs_root_fix = self
+            .roster_entry(local_hash)
+            .map(|entry| entry.parent_hash != 0)
+            .unwrap_or(true)
+            || self.roster_root_hash() != Some(local_hash);
+        if needs_root_fix {
+            self.topology_roster
+                .retain(|entry| entry.peer_hash != local_hash);
+            for entry in self.topology_roster.iter_mut() {
+                if entry.parent_hash == 0 {
+                    entry.parent_hash = local_hash;
+                }
+            }
+            self.topology_roster.insert(
+                0,
+                TopologyEntry {
+                    peer_hash: local_hash,
+                    uuid: local_uuid,
+                    parent_hash: 0,
+                },
+            );
+            self.roster_dirty = true;
         }
-        self.relay_children = children;
-        if topology_changed {
+
+        // Match fanout to room size before admitting (new members use it).
+        let fanout = Self::choose_dynamic_fanout(self.topology_roster.len().max(1));
+        if fanout != self.relay_fanout {
+            self.relay_fanout = fanout;
+            self.roster_dirty = true;
+        }
+
+        // A live connection is proof of life and an implicit join request.
+        for peer in connected_peers {
+            self.add_roster_member(Self::uuid_for_peer(*peer), current_frame);
+        }
+
+        // Prune members with no signs of life (their traffic refreshes the TTL
+        // through relayed batch entries even at depth >= 2).
+        let connected_hashes: HashSet<u64> = connected_peers
+            .iter()
+            .map(|peer| Self::peer_hash_for_matchbox(*peer))
+            .collect();
+        let dead: Vec<u64> = self
+            .topology_roster
+            .iter()
+            .filter(|entry| {
+                entry.peer_hash != local_hash && !connected_hashes.contains(&entry.peer_hash)
+            })
+            .filter(|entry| {
+                let last_seen = self
+                    .member_last_seen
+                    .get(&entry.peer_hash)
+                    .copied()
+                    .unwrap_or(0);
+                current_frame.saturating_sub(last_seen) > Self::MEMBER_TTL_FRAMES
+            })
+            .map(|entry| entry.peer_hash)
+            .collect();
+        for hash in dead {
+            Self::log_info(&format!(
+                "Root pruned silent member {:#x} from relay tree",
+                hash
+            ));
+            self.remove_roster_member(hash, current_frame);
+        }
+        let roster_hashes: HashSet<u64> = self
+            .topology_roster
+            .iter()
+            .map(|entry| entry.peer_hash)
+            .collect();
+        self.member_last_seen
+            .retain(|hash, _| roster_hashes.contains(hash));
+
+        if self.roster_dirty {
             self.relay_epoch = self.relay_epoch.wrapping_add(1);
         }
+
+        self.derive_links_from_roster(current_frame);
+        self.recompute_area_authorities(current_frame);
+
+        // Heartbeats get cheaper-but-rarer in big rooms; in delta mode the
+        // heartbeat is an empty delta (~30 bytes), not a full map. Membership
+        // changes broadcast immediately in small rooms / when a joiner is
+        // waiting, and are coalesced in big rooms.
+        let heartbeat_period = if self.topology_roster.len() <= 128 {
+            Self::MAP_BROADCAST_PERIOD_FRAMES
+        } else {
+            Self::MAP_BROADCAST_PERIOD_FRAMES * 5
+        };
+        let since_broadcast = current_frame.saturating_sub(self.last_topology_broadcast_frame);
+        let heartbeat_due = since_broadcast >= heartbeat_period;
+        let immediate_dirty = self.topology_roster.len() < Self::DELTA_ROSTER_MIN
+            || !self.pending_map_peers.is_empty()
+            || since_broadcast >= Self::MIN_DIRTY_BROADCAST_FRAMES;
+        if (self.roster_dirty && immediate_dirty)
+            || heartbeat_due
+            || !self.pending_map_peers.is_empty()
+        {
+            self.last_topology_broadcast_frame = current_frame;
+            self.roster_dirty = false;
+            self.broadcast_topology();
+        }
+    }
+
+    /// Everyone: derive parent/backup/children/supernode-set from the roster.
+    /// Pure function of the map, so all nodes agree on every link.
+    fn derive_links_from_roster(&mut self, current_frame: u32) {
+        self.rebuild_roster_peer_strs();
+        let Some(local_hash) = self.local_peer_hash else {
+            return;
+        };
+        let entries = self.topology_roster.clone();
+        for entry in &entries {
+            self.register_peer_uuid(entry.uuid);
+        }
+
+        let root_hash = self.roster_root_hash();
+        let root_id = root_hash.and_then(|hash| self.hash_to_matchbox(hash));
+        self.super_root_id = root_id;
+        self.supernode_id = root_id;
+
+        // Interior nodes (anyone with children) are the supernodes.
+        let parent_hashes: HashSet<u64> = entries
+            .iter()
+            .filter(|entry| entry.parent_hash != 0)
+            .map(|entry| entry.parent_hash)
+            .collect();
+        let mut supernodes: Vec<matchbox_socket::PeerId> = parent_hashes
+            .iter()
+            .filter_map(|hash| self.hash_to_matchbox(*hash))
+            .collect();
+        if let Some(root) = root_id {
+            if !supernodes.contains(&root) {
+                supernodes.push(root);
+            }
+        }
+        Self::sort_peer_ids(&mut supernodes);
+        self.supernode_set = supernodes;
+
+        let my_entry = entries.iter().find(|entry| entry.peer_hash == local_hash);
+        let prev_parent = self.relay_parent;
+        let prev_backup = self.relay_backup_parent;
+        let prev_active = self.relay_active_parent;
+
+        let parent_hash = my_entry.map(|entry| entry.parent_hash).unwrap_or(0);
+        let new_parent = if parent_hash == 0 {
+            None
+        } else {
+            self.hash_to_matchbox(parent_hash)
+        };
+        let grandparent_hash = entries
+            .iter()
+            .find(|entry| entry.peer_hash == parent_hash)
+            .map(|entry| entry.parent_hash)
+            .unwrap_or(0);
+        let mut new_backup = if grandparent_hash != 0 {
+            self.hash_to_matchbox(grandparent_hash)
+        } else {
+            root_id
+        };
+        if new_backup == new_parent || new_backup == self.local_peer_id {
+            new_backup = None;
+        }
+        // Keep the previous parent as backup right after a reassignment: it is
+        // the link most likely to still be alive during the handoff.
+        if prev_parent.is_some() && prev_parent != new_parent && prev_parent != self.local_peer_id {
+            new_backup = prev_parent;
+        }
+
+        self.relay_parent = new_parent;
+        self.relay_backup_parent = new_backup;
+        self.relay_children = entries
+            .iter()
+            .filter(|entry| entry.parent_hash == local_hash)
+            .filter_map(|entry| self.hash_to_matchbox(entry.peer_hash))
+            .collect();
+        self.is_host = my_entry
+            .map(|entry| entry.parent_hash == 0)
+            .unwrap_or(self.is_host);
+
         if self.is_host {
             self.relay_active_parent = None;
         } else if self.relay_active_parent.is_none() {
@@ -2063,11 +2215,730 @@ impl NetworkSession {
                 self.relay_active_parent = self.relay_parent;
             }
         }
-        if prev_active_parent != self.relay_active_parent {
+        if prev_parent != self.relay_parent
+            || prev_backup != self.relay_backup_parent
+            || prev_active != self.relay_active_parent
+        {
             self.last_parent_switch_frame = current_frame;
         }
+    }
 
-        self.recompute_area_authorities(current_frame);
+    fn topology_map_message(&self) -> Option<TopologyUpdate> {
+        let root_hash = self.roster_root_hash()?;
+        Some(TopologyUpdate {
+            epoch: self.relay_epoch,
+            root_hash,
+            fanout: self.relay_fanout as u8,
+            entries: self.topology_roster.clone(),
+        })
+    }
+
+    /// Root: send the map to every directly-connected peer (children plus any
+    /// freshly admitted stragglers); they forward it down the tree.
+    fn broadcast_topology_map(&mut self) {
+        let Some(update) = self.topology_map_message() else {
+            return;
+        };
+        self.pending_map_peers.clear();
+        let msg = NetMessage::TopologyUpdateEvent(update).to_bytes();
+        let socket = match &mut self.socket {
+            Some(s) => s,
+            None => return,
+        };
+        let peers: Vec<_> = socket.connected_peers().collect();
+        for peer_id in peers {
+            socket.send(msg.clone().into_boxed_slice(), peer_id);
+            self.relay_telemetry.sent_downstream =
+                self.relay_telemetry.sent_downstream.saturating_add(1);
+        }
+    }
+
+    /// Root: broadcast the current topology. Small rooms always send the full
+    /// map. Big rooms send deltas against the last broadcast snapshot, an
+    /// empty delta as the liveness heartbeat, and periodic full-map anchors;
+    /// new members and waiting joiners always get the full map (they have no
+    /// base to apply a delta to).
+    fn broadcast_topology(&mut self) {
+        let Some(full) = self.topology_map_message() else {
+            return;
+        };
+        let roster_len = self.topology_roster.len();
+        let checksum = Self::roster_checksum(&self.topology_roster);
+        let anchor_due = self.map_anchor_counter % Self::MAP_FULL_ANCHOR_EVERY == 0;
+        self.map_anchor_counter = self.map_anchor_counter.wrapping_add(1);
+
+        let use_full_for_all = roster_len < Self::DELTA_ROSTER_MIN
+            || self.last_broadcast_roster.is_empty()
+            || anchor_due;
+
+        let delta_msg = if use_full_for_all {
+            None
+        } else {
+            let prev: HashMap<u64, TopologyEntry> = self
+                .last_broadcast_roster
+                .iter()
+                .map(|entry| (entry.peer_hash, *entry))
+                .collect();
+            let current: HashSet<u64> = self
+                .topology_roster
+                .iter()
+                .map(|entry| entry.peer_hash)
+                .collect();
+            let removed: Vec<u64> = prev
+                .keys()
+                .copied()
+                .filter(|hash| !current.contains(hash))
+                .collect();
+            let upserts: Vec<TopologyEntry> = self
+                .topology_roster
+                .iter()
+                .copied()
+                .filter(|entry| prev.get(&entry.peer_hash) != Some(entry))
+                .collect();
+            let delta = TopologyDelta {
+                epoch_from: self.last_broadcast_epoch,
+                epoch_to: self.relay_epoch,
+                root_hash: full.root_hash,
+                fanout: self.relay_fanout as u8,
+                checksum,
+                removed,
+                upserts,
+            };
+            Some((
+                NetMessage::TopologyDeltaEvent(delta.clone()).to_bytes(),
+                delta,
+            ))
+        };
+
+        let full_msg = NetMessage::TopologyUpdateEvent(full).to_bytes();
+        let prev_members: HashSet<u64> = self
+            .last_broadcast_roster
+            .iter()
+            .map(|entry| entry.peer_hash)
+            .collect();
+        let mut full_targets: HashSet<matchbox_socket::PeerId> =
+            self.pending_map_peers.drain(..).collect();
+
+        let socket = match &mut self.socket {
+            Some(s) => s,
+            None => return,
+        };
+        for peer_id in socket.connected_peers().collect::<Vec<_>>() {
+            let needs_full = use_full_for_all
+                || full_targets.contains(&peer_id)
+                || !prev_members.contains(&Self::peer_hash_for_matchbox(peer_id));
+            let payload = if needs_full {
+                full_msg.clone()
+            } else if let Some((bytes, _)) = &delta_msg {
+                bytes.clone()
+            } else {
+                full_msg.clone()
+            };
+            socket.send(payload.into_boxed_slice(), peer_id);
+            self.relay_telemetry.sent_downstream =
+                self.relay_telemetry.sent_downstream.saturating_add(1);
+            full_targets.remove(&peer_id);
+        }
+
+        self.last_broadcast_roster = self.topology_roster.clone();
+        self.last_broadcast_epoch = self.relay_epoch;
+    }
+
+    /// Receiver: apply a delta on top of our roster. Any mismatch (unknown
+    /// base epoch, different root, checksum divergence) falls back to
+    /// requesting a full map rather than guessing. Returns true when the
+    /// delta should be forwarded to our children.
+    fn apply_topology_delta(
+        &mut self,
+        sender: &str,
+        delta: &TopologyDelta,
+        current_frame: u32,
+    ) -> bool {
+        if self.is_host {
+            if Some(delta.root_hash) != self.local_peer_hash {
+                // Another root's stream; show them ours so the merge protocol
+                // (full maps + outranking) can resolve it.
+                self.reply_with_current_map(sender);
+            }
+            return false;
+        }
+        let cur_root = self.roster_root_hash().unwrap_or(0);
+        if self.topology_roster.is_empty() || delta.root_hash != cur_root {
+            if delta.epoch_to > self.relay_epoch {
+                self.needs_full_map = true;
+            }
+            return false;
+        }
+        let from_authority = self.is_parent_sender(sender) || self.is_supernode_sender(sender);
+
+        // Empty heartbeat: proves root liveness and doubles as a divergence
+        // detector (checksum must match what we hold).
+        if delta.epoch_to == self.relay_epoch && delta.epoch_from == delta.epoch_to {
+            if Self::roster_checksum(&self.topology_roster) != delta.checksum {
+                self.needs_full_map = true;
+                return false;
+            }
+            if from_authority {
+                self.last_map_rx_frame = current_frame;
+                self.root_departure_frame = None;
+                return true;
+            }
+            return false;
+        }
+
+        if delta.epoch_to <= self.relay_epoch {
+            return false;
+        }
+        if delta.epoch_from != self.relay_epoch {
+            self.needs_full_map = true;
+            return false;
+        }
+
+        let mut next = self.topology_roster.clone();
+        next.retain(|entry| !delta.removed.contains(&entry.peer_hash));
+        for upsert in &delta.upserts {
+            if let Some(entry) = next
+                .iter_mut()
+                .find(|entry| entry.peer_hash == upsert.peer_hash)
+            {
+                *entry = *upsert;
+            } else {
+                next.push(*upsert);
+            }
+        }
+        if Self::roster_checksum(&next) != delta.checksum {
+            self.needs_full_map = true;
+            return false;
+        }
+
+        self.topology_roster = next;
+        self.relay_epoch = delta.epoch_to;
+        self.relay_fanout = (delta.fanout as usize).clamp(Self::MIN_FANOUT, Self::MAX_FANOUT);
+        // A delta always carries a new epoch: genuinely fresh root output.
+        self.last_map_rx_frame = current_frame;
+        self.root_departure_frame = None;
+        self.needs_full_map = false;
+        self.derive_links_from_roster(current_frame);
+        true
+    }
+
+    /// Non-root: forward a delta to our children; waiting joiners get a full
+    /// map instead (they have no base).
+    fn forward_topology_delta(
+        &mut self,
+        delta: &TopologyDelta,
+        exclude: Option<matchbox_socket::PeerId>,
+    ) {
+        let pending: Vec<matchbox_socket::PeerId> = self.pending_map_peers.drain(..).collect();
+        if !pending.is_empty() {
+            if let Some(full) = self.topology_map_message() {
+                let full_msg = NetMessage::TopologyUpdateEvent(full).to_bytes();
+                if let Some(socket) = &mut self.socket {
+                    for peer_id in &pending {
+                        socket.send(full_msg.clone().into_boxed_slice(), *peer_id);
+                    }
+                }
+            }
+        }
+        let mut targets = self.relay_children.clone();
+        targets.retain(|target| {
+            Some(*target) != exclude
+                && Some(*target) != self.local_peer_id
+                && !pending.contains(target)
+        });
+        if targets.is_empty() {
+            return;
+        }
+        let msg = NetMessage::TopologyDeltaEvent(delta.clone()).to_bytes();
+        let socket = match &mut self.socket {
+            Some(s) => s,
+            None => return,
+        };
+        for target in targets {
+            socket.send(msg.clone().into_boxed_slice(), target);
+            self.relay_telemetry.sent_downstream =
+                self.relay_telemetry.sent_downstream.saturating_add(1);
+        }
+    }
+
+    /// Non-root: forward an accepted map verbatim to our children and anyone
+    /// who recently asked us for a slot.
+    fn forward_topology_map(
+        &mut self,
+        update: &TopologyUpdate,
+        exclude: Option<matchbox_socket::PeerId>,
+    ) {
+        let mut targets = self.relay_children.clone();
+        for peer_id in self.pending_map_peers.drain(..) {
+            if !targets.contains(&peer_id) {
+                targets.push(peer_id);
+            }
+        }
+        targets.retain(|target| Some(*target) != exclude && Some(*target) != self.local_peer_id);
+        if targets.is_empty() {
+            return;
+        }
+        let msg = NetMessage::TopologyUpdateEvent(update.clone()).to_bytes();
+        let socket = match &mut self.socket {
+            Some(s) => s,
+            None => return,
+        };
+        for target in targets {
+            socket.send(msg.clone().into_boxed_slice(), target);
+            self.relay_telemetry.sent_downstream =
+                self.relay_telemetry.sent_downstream.saturating_add(1);
+        }
+    }
+
+    /// Total order over competing maps so concurrent roots converge.
+    fn map_outranks(new_epoch: u32, new_root: u64, cur_epoch: u32, cur_root: u64) -> bool {
+        new_epoch > cur_epoch || (new_epoch == cur_epoch && new_root < cur_root)
+    }
+
+    /// Returns true when the map was adopted (and should be forwarded).
+    fn apply_topology_map(
+        &mut self,
+        sender: &str,
+        update: &TopologyUpdate,
+        current_frame: u32,
+    ) -> bool {
+        if update.entries.is_empty() {
+            return false;
+        }
+        let local_hash = self.local_peer_hash;
+        let prev_epoch = self.relay_epoch;
+        // Same-epoch copies count as a root liveness heartbeat only when they
+        // arrive over the authoritative path (parent or the root itself).
+        // Lateral echoes (e.g. join-request replies between two orphans of a
+        // dead root) must not refresh liveness, or stranded peers would keep
+        // laundering a dead root's freshness for each other and block every
+        // failover path.
+        let mut from_authority = self.is_parent_sender(sender) || self.is_supernode_sender(sender);
+
+        if self.is_host {
+            if Some(update.root_hash) == local_hash {
+                // Our own map echoed back.
+                return false;
+            }
+            let my_root = local_hash.unwrap_or(0);
+            if !Self::map_outranks(update.epoch, update.root_hash, self.relay_epoch, my_root) {
+                // We outrank the other root: tell the sender so the losing
+                // root (or its subtree) hears about us and folds in.
+                self.reply_with_current_map(sender);
+                return false;
+            }
+            Self::log_warn(&format!(
+                "Abdicating root to {:#x} (epoch {} vs local {})",
+                update.root_hash, update.epoch, self.relay_epoch
+            ));
+            self.is_host = false;
+            self.member_last_seen.clear();
+            self.member_parent_since.clear();
+            self.member_link_nags.clear();
+            self.last_broadcast_roster.clear();
+            self.last_broadcast_epoch = 0;
+            self.roster_dirty = false;
+            from_authority = true;
+        } else if !self.topology_roster.is_empty() {
+            let cur_root = self.roster_root_hash().unwrap_or(0);
+            let same_root = update.root_hash == cur_root;
+            let acceptable = if same_root {
+                update.epoch >= self.relay_epoch
+            } else {
+                Self::map_outranks(update.epoch, update.root_hash, self.relay_epoch, cur_root)
+            };
+            if !acceptable {
+                if !same_root {
+                    self.reply_with_current_map(sender);
+                }
+                return false;
+            }
+        }
+
+        self.topology_roster = update.entries.clone();
+        self.relay_epoch = update.epoch;
+        self.relay_fanout = (update.fanout as usize).clamp(Self::MIN_FANOUT, Self::MAX_FANOUT);
+        let fresh_information = update.epoch > prev_epoch || from_authority;
+        if fresh_information {
+            self.last_map_rx_frame = current_frame;
+            // A genuinely live map supersedes any death evidence about its root.
+            self.root_departure_frame = None;
+        }
+        self.derive_links_from_roster(current_frame);
+        fresh_information
+    }
+
+    fn reply_with_current_map(&mut self, sender: &str) {
+        let Some(sender_id) = self.resolve_peer_id(sender) else {
+            return;
+        };
+        let Some(update) = self.topology_map_message() else {
+            return;
+        };
+        let msg = NetMessage::TopologyUpdateEvent(update).to_bytes();
+        if let Some(socket) = &mut self.socket {
+            socket.send(msg.into_boxed_slice(), sender_id);
+        }
+    }
+
+    /// Root: track repeated join requests from members that already have a
+    /// slot; enough of them within a window means their parent link is not
+    /// forming, so move them under a different parent (cooldown applies).
+    fn note_member_link_nag(&mut self, member_hash: u64, current_frame: u32) {
+        let (count, last_frame) = self
+            .member_link_nags
+            .get(&member_hash)
+            .copied()
+            .unwrap_or((0, 0));
+        let count = if current_frame.saturating_sub(last_frame) > Self::LINK_NAG_WINDOW_FRAMES {
+            1
+        } else {
+            count.saturating_add(1)
+        };
+        self.member_link_nags
+            .insert(member_hash, (count, current_frame));
+        if count < Self::LINK_NAG_THRESHOLD {
+            return;
+        }
+        let parent_age = current_frame.saturating_sub(
+            self.member_parent_since
+                .get(&member_hash)
+                .copied()
+                .unwrap_or(0),
+        );
+        if parent_age < Self::REASSIGN_MIN_PARENT_AGE_FRAMES {
+            return;
+        }
+        let Some(current_parent) = self
+            .roster_entry(member_hash)
+            .map(|entry| entry.parent_hash)
+        else {
+            return;
+        };
+        if current_parent == 0 {
+            return;
+        }
+        let mut exclude = self.roster_subtree(member_hash);
+        exclude.insert(current_parent);
+        let new_parent = self.pick_parent_excluding(&exclude);
+        if new_parent == current_parent || new_parent == member_hash {
+            return;
+        }
+        if let Some(entry) = self
+            .topology_roster
+            .iter_mut()
+            .find(|entry| entry.peer_hash == member_hash)
+        {
+            entry.parent_hash = new_parent;
+        }
+        self.member_parent_since.insert(member_hash, current_frame);
+        self.member_link_nags.remove(&member_hash);
+        self.roster_dirty = true;
+        Self::log_warn(&format!(
+            "Reassigned member {member_hash:#x} from unreachable parent {current_parent:#x} to {new_parent:#x}"
+        ));
+    }
+
+    fn handle_join_request(&mut self, sender: &str, request: JoinRequest, current_frame: u32) {
+        let (origin_hash, _) = self.register_peer_uuid(request.uuid);
+        if Some(origin_hash) == self.local_peer_hash {
+            return;
+        }
+        let sender_id = self.resolve_peer_id(sender);
+
+        if self.is_host {
+            if self.roster_contains(origin_hash) {
+                // An in-roster member that keeps asking for a slot has a
+                // route problem: most likely the WebRTC link to its assigned
+                // parent never forms (e.g. two hard NATs). Reassign it to a
+                // different parent instead of letting it starve — the tree
+                // itself is the relay fallback, no TURN required.
+                self.note_member_link_nag(origin_hash, current_frame);
+            } else {
+                self.add_roster_member(request.uuid, current_frame);
+            }
+            self.member_last_seen.insert(origin_hash, current_frame);
+            if let Some(sender_id) = sender_id {
+                if !self.pending_map_peers.contains(&sender_id) {
+                    self.pending_map_peers.push(sender_id);
+                }
+            }
+            return;
+        }
+
+        // Forward up the tree (deduped per origin) so it reaches the root.
+        let last_forward = self
+            .recent_join_forwards
+            .get(&origin_hash)
+            .copied()
+            .unwrap_or(0);
+        let recently_forwarded = last_forward != 0
+            && current_frame.saturating_sub(last_forward) < Self::JOIN_FORWARD_DEDUP_FRAMES;
+        if !recently_forwarded {
+            self.recent_join_forwards.insert(origin_hash, current_frame);
+            self.recent_join_forwards.retain(|_, frame| {
+                current_frame.saturating_sub(*frame) < Self::JOIN_FORWARD_DEDUP_FRAMES * 4
+            });
+            self.send_upstream_or_broadcast_routed(
+                NetMessage::JoinRequestEvent(request).to_bytes(),
+                sender_id,
+                Some(origin_hash),
+            );
+        }
+
+        // Hand the requester our current map right away so it can bootstrap,
+        // and queue it for the next refresh that flows through us.
+        if let Some(sender_id) = sender_id {
+            if let Some(map) = self.topology_map_message() {
+                let msg = NetMessage::TopologyUpdateEvent(map).to_bytes();
+                if let Some(socket) = &mut self.socket {
+                    socket.send(msg.into_boxed_slice(), sender_id);
+                }
+            }
+            if !self.pending_map_peers.contains(&sender_id) {
+                self.pending_map_peers.push(sender_id);
+            }
+        }
+    }
+
+    /// Non-root: ask for a tree slot while we don't have one (or our route died).
+    fn maybe_send_join_request(
+        &mut self,
+        current_frame: u32,
+        connected_peers: &[matchbox_socket::PeerId],
+    ) {
+        if connected_peers.is_empty() {
+            return;
+        }
+        let Some(local_id) = self.local_peer_id else {
+            return;
+        };
+        let local_hash = self
+            .local_peer_hash
+            .unwrap_or_else(|| Self::peer_hash_for_matchbox(local_id));
+        let in_roster = self.roster_contains(local_hash);
+        let route_starved = match self.relay_active_parent.or(self.relay_parent) {
+            Some(parent) => {
+                !self.peer_seen_recently(parent, current_frame)
+                    && current_frame.saturating_sub(self.last_map_rx_frame)
+                        > Self::RELAY_PARENT_STALE_FRAMES
+            }
+            None => true,
+        };
+        if !self.needs_full_map && in_roster && !route_starved {
+            return;
+        }
+        if self.last_join_request_frame != 0
+            && current_frame.saturating_sub(self.last_join_request_frame)
+                < Self::JOIN_REQUEST_PERIOD_FRAMES
+        {
+            return;
+        }
+        self.last_join_request_frame = current_frame;
+        self.needs_full_map = false;
+        let request = JoinRequest {
+            peer_hash: local_hash,
+            uuid: Self::uuid_for_peer(local_id),
+        };
+        let msg = NetMessage::JoinRequestEvent(request).to_bytes();
+        if let Some(socket) = &mut self.socket {
+            for peer_id in connected_peers {
+                socket.send(msg.clone().into_boxed_slice(), *peer_id);
+            }
+        }
+    }
+
+    /// Non-root: replace a provably dead root. All nodes share the same last
+    /// map, so the successor order (uuid order, staggered takeover) is agreed
+    /// without extra coordination; rare double-promotions converge via
+    /// `map_outranks` + abdication.
+    fn maybe_root_failover(
+        &mut self,
+        current_frame: u32,
+        connected_peers: &[matchbox_socket::PeerId],
+    ) {
+        if self.is_host {
+            return;
+        }
+        let Some(local_id) = self.local_peer_id else {
+            return;
+        };
+        let local_hash = self
+            .local_peer_hash
+            .unwrap_or_else(|| Self::peer_hash_for_matchbox(local_id));
+
+        if self.topology_roster.is_empty() {
+            // Never saw a map. If nobody claims the room for a long time the
+            // lowest-uuid connected node takes it (creator left early).
+            if self.last_map_rx_frame != 0 {
+                return;
+            }
+            let Some(first_peer_frame) = self.first_peer_frame else {
+                return;
+            };
+            if current_frame.saturating_sub(first_peer_frame) < Self::BOOTSTRAP_NO_ROOT_FRAMES {
+                return;
+            }
+            let mut ids = connected_peers.to_vec();
+            ids.push(local_id);
+            Self::sort_peer_ids(&mut ids);
+            if ids.first() == Some(&local_id) {
+                self.promote_self_to_root(current_frame, "no root seen after bootstrap");
+            }
+            return;
+        }
+
+        if let Some(root) = self.super_root_id {
+            match self.root_departure_frame {
+                Some(evidence_frame) => {
+                    // Only a message from the root *after* the departure
+                    // observation disproves it; "seen recently" naturally
+                    // includes traffic from just before it died.
+                    let spoke_after_evidence = self
+                        .last_peer_message_frames
+                        .get(&root)
+                        .map(|frame| *frame > evidence_frame)
+                        .unwrap_or(false);
+                    if spoke_after_evidence {
+                        self.root_departure_frame = None;
+                        return;
+                    }
+                }
+                None => {
+                    if self.peer_seen_recently(root, current_frame) {
+                        // Live root, no evidence against it: nothing to do.
+                        return;
+                    }
+                }
+            }
+        }
+        let map_age = current_frame.saturating_sub(self.last_map_rx_frame);
+        let evidence_age = self
+            .root_departure_frame
+            .map(|frame| current_frame.saturating_sub(frame));
+        // Without positive evidence, only prolonged silence triggers takeover.
+        if evidence_age.is_none() && map_age < Self::ROOT_STALE_FRAMES {
+            return;
+        }
+        let root_hash = self.roster_root_hash().unwrap_or(0);
+        let mut candidates: Vec<&TopologyEntry> = self
+            .topology_roster
+            .iter()
+            .filter(|entry| entry.peer_hash != root_hash)
+            .collect();
+        candidates.sort_by(|a, b| a.uuid.cmp(&b.uuid));
+        let Some(rank) = candidates
+            .iter()
+            .position(|entry| entry.peer_hash == local_hash)
+        else {
+            return;
+        };
+        let rank = rank as u32;
+        let due = if let Some(evidence_age) = evidence_age {
+            // Clean departure: take over within seconds, staggered by rank.
+            let fast_due = Self::ROOT_DEPARTURE_TAKEOVER_BASE_FRAMES
+                .saturating_add(rank.saturating_mul(Self::ROOT_DEPARTURE_TAKEOVER_STAGGER_FRAMES));
+            if evidence_age < fast_due {
+                return;
+            }
+            fast_due
+        } else {
+            let slow_due = Self::ROOT_STALE_FRAMES
+                .saturating_add(rank.saturating_mul(Self::ROOT_TAKEOVER_STAGGER_FRAMES));
+            if map_age < slow_due {
+                return;
+            }
+            slow_due
+        };
+        let _ = due;
+        self.promote_self_to_root(current_frame, "root presumed dead");
+    }
+
+    /// Test/debug: the exact state the failover predicate evaluates.
+    pub fn failover_debug(&self) -> String {
+        let now = self.last_update_frame;
+        let local_hash = self
+            .local_peer_hash
+            .or(self.local_peer_id.map(Self::peer_hash_for_matchbox));
+        let root_hash = self.roster_root_hash().unwrap_or(0);
+        let mut candidates: Vec<&TopologyEntry> = self
+            .topology_roster
+            .iter()
+            .filter(|entry| entry.peer_hash != root_hash)
+            .collect();
+        candidates.sort_by(|a, b| a.uuid.cmp(&b.uuid));
+        let rank =
+            local_hash.and_then(|hash| candidates.iter().position(|entry| entry.peer_hash == hash));
+        let root_msg_age = self
+            .super_root_id
+            .and_then(|root| self.last_peer_message_frames.get(&root))
+            .map(|frame| now.saturating_sub(*frame) as i64)
+            .unwrap_or(-1);
+        format!(
+            "now={now};is_host={};evidence_age={:?};map_age={};epoch={};roster={};rank={:?};root_resolved={};root_msg_age={root_msg_age}",
+            self.is_host,
+            self.root_departure_frame.map(|f| now.saturating_sub(f)),
+            now.saturating_sub(self.last_map_rx_frame),
+            self.relay_epoch,
+            self.topology_roster.len(),
+            rank,
+            self.super_root_id.is_some(),
+        )
+    }
+
+    fn promote_self_to_root(&mut self, current_frame: u32, reason: &str) {
+        let Some(local_id) = self.local_peer_id else {
+            return;
+        };
+        let local_uuid = Self::uuid_for_peer(local_id);
+        let (local_hash, _) = self.register_peer_uuid(local_uuid);
+        self.local_peer_hash = Some(local_hash);
+        Self::log_warn(&format!(
+            "Promoting self to relay root ({reason}); epoch {} -> {}",
+            self.relay_epoch,
+            self.relay_epoch.wrapping_add(1)
+        ));
+
+        let old_root = self.roster_root_hash();
+        self.topology_roster
+            .retain(|entry| entry.peer_hash != local_hash && Some(entry.peer_hash) != old_root);
+        for entry in self.topology_roster.iter_mut() {
+            if Some(entry.parent_hash) == old_root || entry.parent_hash == 0 {
+                entry.parent_hash = local_hash;
+            }
+        }
+        self.topology_roster.insert(
+            0,
+            TopologyEntry {
+                peer_hash: local_hash,
+                uuid: local_uuid,
+                parent_hash: 0,
+            },
+        );
+        // Fresh TTL for inherited members so we don't prune the whole room.
+        self.member_last_seen.clear();
+        let roster_snapshot: Vec<u64> = self
+            .topology_roster
+            .iter()
+            .map(|entry| entry.peer_hash)
+            .collect();
+        for hash in roster_snapshot {
+            self.member_last_seen.insert(hash, current_frame);
+            self.member_parent_since.insert(hash, current_frame);
+        }
+        self.member_link_nags.clear();
+        // New epoch lineage: the next broadcast must be a full-map anchor.
+        self.last_broadcast_roster.clear();
+        self.last_broadcast_epoch = 0;
+        self.map_anchor_counter = 0;
+        self.is_host = true;
+        self.relay_parent = None;
+        self.relay_backup_parent = None;
+        self.relay_active_parent = None;
+        self.relay_epoch = self.relay_epoch.wrapping_add(1);
+        self.roster_dirty = true;
+        self.last_map_rx_frame = current_frame;
+        self.root_departure_frame = None;
     }
 
     fn recompute_area_authorities(&mut self, current_frame: u32) {
@@ -2317,22 +3188,14 @@ impl NetworkSession {
                 desired.insert(backup);
             }
             desired.extend(self.relay_children.iter().copied());
-            if self.relay_parent.is_none() {
+            // No parent assigned, or our active route is dead: desire the root
+            // directly. Recovery pairs with the root's rescue links below: for
+            // any pair, the side that joined signaling first knows the other
+            // and can initiate, so one of the two always forms the link.
+            if self.relay_parent.is_none() || self.relay_active_parent.is_none() {
                 if let Some(root) = self.super_root_id {
                     desired.insert(root);
                 }
-            }
-        }
-
-        // Keep one deterministic witness edge for 2-of-N confirmation paths.
-        if let Some(local) = local_id {
-            let mut sorted = known_peers.to_vec();
-            Self::sort_peer_ids(&mut sorted);
-            sorted.retain(|id| *id != local);
-            if !sorted.is_empty() {
-                let idx_seed = (self.relay_epoch as usize) % sorted.len();
-                let witness = sorted[idx_seed];
-                optional.push(witness);
             }
         }
 
@@ -2348,30 +3211,48 @@ impl NetworkSession {
             }
         }
 
-        // Discovery admission window: supernodes/root keep a few spare candidate links
-        // so newly joining peers can latch onto the gameplay overlay quickly.
-        if self.discovery_attached && (self.is_host || self.local_is_supernode()) {
-            let connected: HashSet<matchbox_socket::PeerId> =
-                connected_peers.iter().copied().collect();
+        // Admission: root/supernodes desire peers that joined signaling but have
+        // no roster slot yet, so newcomers always get an initial offer. Stable
+        // (uuid order, no epoch rotation) so links never churn on epoch bumps.
+        if self.is_host || self.local_is_supernode() {
             let mut candidates: Vec<matchbox_socket::PeerId> = known_peers
                 .iter()
                 .copied()
                 .filter(|id| Some(*id) != local_id)
                 .filter(|id| !desired.contains(id))
+                .filter(|id| !self.roster_contains(Self::peer_hash_for_matchbox(*id)))
                 .collect();
             Self::sort_peer_ids(&mut candidates);
-            candidates.sort_by_key(|id| connected.contains(id));
-            if !candidates.is_empty() {
-                let local_seed = local_id
-                    .map(|id| Self::hash_peer_id(&format!("{:?}", id)) as usize)
-                    .unwrap_or(0);
-                let rotate =
-                    (self.relay_epoch as usize).wrapping_add(local_seed) % candidates.len();
-                candidates.rotate_left(rotate);
-                let admission_target = if self.is_host { 3 } else { 2 };
-                for peer in candidates.into_iter().take(admission_target) {
-                    optional.push(peer);
-                }
+            let admission_target = if self.is_host { 4 } else { 2 };
+            for peer in candidates.into_iter().take(admission_target) {
+                optional.push(peer);
+            }
+        }
+
+        // Rescue: the root reaches out to roster members that went quiet (their
+        // relay path likely died) so a stranded subtree regains a route before
+        // it gets pruned. Halfway through the TTL is the trigger.
+        if self.is_host {
+            let connected: HashSet<matchbox_socket::PeerId> =
+                connected_peers.iter().copied().collect();
+            let mut rescues: Vec<matchbox_socket::PeerId> = self
+                .topology_roster
+                .iter()
+                .filter(|entry| Some(entry.peer_hash) != self.local_peer_hash)
+                .filter(|entry| {
+                    let last_seen = self
+                        .member_last_seen
+                        .get(&entry.peer_hash)
+                        .copied()
+                        .unwrap_or(0);
+                    self.last_update_frame.saturating_sub(last_seen) > Self::MEMBER_TTL_FRAMES / 2
+                })
+                .filter_map(|entry| self.hash_to_matchbox(entry.peer_hash))
+                .filter(|id| !connected.contains(id) && !desired.contains(id))
+                .collect();
+            Self::sort_peer_ids(&mut rescues);
+            for peer in rescues.into_iter().take(4) {
+                optional.push(peer);
             }
         }
 
@@ -2397,134 +3278,51 @@ impl NetworkSession {
         desired
     }
 
-    fn desired_set_needs_enforcement(
-        desired: &HashSet<matchbox_socket::PeerId>,
-        connected_peers: &[matchbox_socket::PeerId],
-    ) -> bool {
-        connected_peers.iter().any(|peer_id| !desired.contains(peer_id))
-    }
-
-    fn detached_overlay_needs_recompute(
-        &self,
-        connected_peers: &[matchbox_socket::PeerId],
-        current_frame: u32,
-    ) -> bool {
-        if self.discovery_attached || self.is_host || connected_peers.is_empty() {
-            return false;
-        }
-
-        let connected: HashSet<matchbox_socket::PeerId> =
-            connected_peers.iter().copied().collect();
-        let route_live = |peer: Option<matchbox_socket::PeerId>| {
-            peer.map(|id| connected.contains(&id) && self.peer_seen_recently(id, current_frame))
-                .unwrap_or(false)
-        };
-
-        !(route_live(self.relay_active_parent)
-            || route_live(self.relay_parent)
-            || route_live(self.relay_backup_parent))
-    }
-
     fn update_desired_peers(
         &mut self,
         known_peers: &[matchbox_socket::PeerId],
         connected_peers: &[matchbox_socket::PeerId],
     ) {
-        if self.bootstrap_full_mesh_active {
-            return;
-        }
         let desired = self.desired_peer_links(known_peers, connected_peers);
-        let needs_enforcement = Self::desired_set_needs_enforcement(&desired, connected_peers);
-        if desired == self.desired_peer_set && !needs_enforcement {
-            return;
-        }
-        if let Some(socket) = &mut self.socket {
-            if needs_enforcement {
-                for peer_id in connected_peers {
-                    if !desired.contains(peer_id) {
-                        web_sys::console::warn_1(
-                            &format!(
-                                "[sync-trace f={}] force-drop undesired peer {:?}; desired={:?}; connected={:?}",
-                                self.last_update_frame,
-                                peer_id,
-                                desired,
-                                connected_peers
-                            )
-                            .into(),
-                        );
-                        socket.drop_peer(*peer_id);
-                    }
-                }
+        let current_frame = self.last_update_frame;
+
+        // Make-before-break: a live link that fell out of the desired set is
+        // kept through a grace window (replacement tree links form first),
+        // then dropped lazily. Never force-drop on a mere desired-set delta.
+        let mut to_drop: Vec<matchbox_socket::PeerId> = Vec::new();
+        for peer_id in connected_peers {
+            if desired.contains(peer_id) {
+                self.undesired_since.remove(peer_id);
+                continue;
             }
-            socket.set_desired_peers(desired.iter().copied());
+            let since = *self
+                .undesired_since
+                .entry(*peer_id)
+                .or_insert(current_frame);
+            if current_frame.saturating_sub(since) >= Self::UNDESIRED_LINK_GRACE_FRAMES {
+                to_drop.push(*peer_id);
+            }
+        }
+        let connected_set: HashSet<matchbox_socket::PeerId> =
+            connected_peers.iter().copied().collect();
+        self.undesired_since
+            .retain(|peer_id, _| connected_set.contains(peer_id));
+
+        if let Some(socket) = &mut self.socket {
+            for peer_id in to_drop {
+                Self::log_info(&format!(
+                    "[sync-trace f={current_frame}] dropping link {:?} after undesired grace",
+                    peer_id
+                ));
+                self.undesired_since.remove(&peer_id);
+                self.intentional_drops.insert(peer_id, current_frame);
+                socket.drop_peer(peer_id);
+            }
+            if desired != self.desired_peer_set {
+                socket.set_desired_peers(desired.iter().copied());
+            }
         }
         self.desired_peer_set = desired;
-    }
-
-    fn apply_topology_update(&mut self, sender: &str, update: TopologyUpdate, current_frame: u32) {
-        if self.is_host || self.relay_epoch > update.epoch {
-            return;
-        }
-        if let Some(sender_id) = self.peer_id_lookup.get(sender).copied() {
-            if let Some(root) = self.super_root_id {
-                let sender_hash = Self::hash_peer_id(&format!("{:?}", sender_id));
-                if sender_id != root && sender_hash != update.super_root_hash {
-                    return;
-                }
-            }
-        }
-
-        let prev_parent = self.relay_parent;
-        let prev_backup = self.relay_backup_parent;
-        let prev_active = self.relay_active_parent;
-        let prev_fanout = self.relay_fanout;
-        self.relay_epoch = update.epoch;
-        self.super_root_id = self.hash_to_matchbox(update.super_root_hash);
-        self.supernode_id = self.super_root_id;
-        self.supernode_set = update
-            .supernode_hashes
-            .iter()
-            .filter_map(|hash| self.hash_to_matchbox(*hash))
-            .collect();
-        self.relay_parent = if update.parent_hash == 0 {
-            None
-        } else {
-            self.hash_to_matchbox(update.parent_hash)
-        };
-        self.relay_backup_parent = if update.backup_parent_hash == 0 {
-            None
-        } else {
-            self.hash_to_matchbox(update.backup_parent_hash)
-        };
-        let parent_changed = prev_parent != self.relay_parent;
-        if parent_changed && prev_parent.is_some() && prev_parent != self.relay_parent {
-            self.relay_backup_parent = prev_parent;
-        }
-        self.relay_children = update
-            .child_hashes
-            .iter()
-            .filter_map(|hash| self.hash_to_matchbox(*hash))
-            .collect();
-        self.relay_fanout = (update.fanout as usize).clamp(Self::MIN_FANOUT, Self::MAX_FANOUT);
-        self.is_host = self.local_peer_id.is_some() && self.local_peer_id == self.super_root_id;
-        if self.is_host {
-            self.relay_active_parent = None;
-        } else if self.relay_active_parent.is_none() {
-            self.relay_active_parent = self.relay_parent;
-        } else if let Some(active) = self.relay_active_parent {
-            let valid =
-                Some(active) == self.relay_parent || Some(active) == self.relay_backup_parent;
-            if !valid {
-                self.relay_active_parent = self.relay_parent;
-            }
-        }
-        if prev_parent != self.relay_parent
-            || prev_backup != self.relay_backup_parent
-            || prev_active != self.relay_active_parent
-            || prev_fanout != self.relay_fanout
-        {
-            self.last_parent_switch_frame = current_frame;
-        }
     }
 
     fn apply_area_authority_update(&mut self, sender: &str, update: AreaAuthorityUpdate) {
@@ -2543,99 +3341,6 @@ impl NetworkSession {
             .into_iter()
             .map(|entry| (entry.area_id, entry.authority_hash))
             .collect();
-    }
-
-    fn broadcast_topology_update(&mut self) {
-        if !self.is_host {
-            return;
-        }
-        let connected_peers: Vec<matchbox_socket::PeerId> = {
-            let socket = match &mut self.socket {
-                Some(s) => s,
-                None => return,
-            };
-            socket.connected_peers().collect()
-        };
-        let local_id = match self.local_peer_id {
-            Some(id) => id,
-            None => return,
-        };
-        let mut all_nodes: Vec<matchbox_socket::PeerId> = connected_peers.clone();
-        all_nodes.push(local_id);
-        Self::sort_peer_ids(&mut all_nodes);
-        all_nodes.dedup();
-        if all_nodes.is_empty() {
-            return;
-        }
-
-        let mut supernodes = self.supernode_set.clone();
-        supernodes.retain(|id| all_nodes.contains(id));
-        Self::sort_peer_ids(&mut supernodes);
-        if supernodes.is_empty() {
-            let mut active_areas: HashSet<u32> = HashSet::new();
-            for node in &all_nodes {
-                let area = self
-                    .peer_pos(*node)
-                    .map(Self::area_id_from_pos)
-                    .unwrap_or(0);
-                active_areas.insert(area);
-            }
-            let target_k =
-                Self::choose_dynamic_supernode_count(all_nodes.len(), active_areas.len());
-            supernodes = self.select_supernodes_dynamic(&all_nodes, target_k);
-            if supernodes.is_empty() {
-                supernodes.push(all_nodes[0]);
-            }
-        }
-        let super_root = all_nodes[0];
-        if !supernodes.contains(&super_root) {
-            supernodes.push(super_root);
-            Self::sort_peer_ids(&mut supernodes);
-        }
-        let relay_order = self.build_clustered_relay_order(&all_nodes, &supernodes, super_root);
-        let relay_fanout = Self::choose_dynamic_fanout(all_nodes.len());
-        let mut index_by_id: HashMap<matchbox_socket::PeerId, usize> = HashMap::new();
-        for (idx, id) in relay_order.iter().enumerate() {
-            index_by_id.insert(*id, idx);
-        }
-
-        let super_root_hash = Self::hash_peer_id(&format!("{:?}", super_root));
-        let supernode_hashes: Vec<u64> = supernodes
-            .iter()
-            .map(|id| Self::hash_peer_id(&format!("{:?}", id)))
-            .collect();
-
-        let socket = match &mut self.socket {
-            Some(s) => s,
-            None => return,
-        };
-        for peer_id in connected_peers {
-            let local_idx = match index_by_id.get(&peer_id) {
-                Some(idx) => *idx,
-                None => continue,
-            };
-            let (parent, backup_parent, children) =
-                Self::tree_assignment_for_index(&relay_order, local_idx, relay_fanout);
-            let update = TopologyUpdate {
-                epoch: self.relay_epoch,
-                super_root_hash,
-                supernode_hashes: supernode_hashes.clone(),
-                fanout: relay_fanout as u8,
-                parent_hash: parent
-                    .map(|id| Self::hash_peer_id(&format!("{:?}", id)))
-                    .unwrap_or(0),
-                backup_parent_hash: backup_parent
-                    .filter(|id| Some(*id) != parent)
-                    .map(|id| Self::hash_peer_id(&format!("{:?}", id)))
-                    .unwrap_or(0),
-                child_hashes: children
-                    .iter()
-                    .map(|id| Self::hash_peer_id(&format!("{:?}", id)))
-                    .collect(),
-            };
-            let msg = NetMessage::TopologyUpdateEvent(update).to_bytes();
-            socket.send(msg.into_boxed_slice(), peer_id);
-        }
     }
 
     fn broadcast_area_authorities(&mut self) {
@@ -2686,11 +3391,15 @@ impl NetworkSession {
         true
     }
 
+    /// The authoritative route went quiet. With a sticky root we no longer
+    /// poison the root globally; we fail over to the backup parent immediately
+    /// and ask the root for a fresh tree slot.
     pub fn mark_supernode_bad(&mut self, current_frame: u32) {
-        if let Some(supernode) = self.supernode_id {
-            self.bad_supernodes.insert(supernode);
-        }
-        self.last_enemy_sync_frame = current_frame.saturating_sub(1000);
+        self.relay_active_parent = None;
+        self.last_parent_switch_frame = 0;
+        self.last_join_request_frame = 0;
+        // Reset the detection window so we don't re-trigger every frame.
+        self.last_enemy_sync_frame = current_frame;
     }
 
     pub fn is_supernode_sender(&self, peer_id: &str) -> bool {
@@ -2782,7 +3491,8 @@ impl NetworkSession {
             return false;
         }
         let no_route = self.relay_active_parent.or(self.relay_parent).is_none();
-        let tiny_room = self.known_peer_count() <= 2;
+        // Include 3-peer LAN parties: bootstrap acceptance relaxes stricter relay admission.
+        let tiny_room = self.known_peer_count() <= 3;
         // Allow tiny/no-route bootstrap acceptance even after discovery detach so
         // direct peers don't become "connected but blind" during parent churn.
         self.relay_epoch == 0 || no_route || tiny_room
@@ -2964,6 +3674,10 @@ impl NetworkSession {
         }
     }
 
+    /// Tree flood for control-plane events (names, etc.): forward to every
+    /// tree neighbor except the link the message arrived on. From a child the
+    /// message goes up AND to the sibling subtrees; from the parent it goes
+    /// down. The origin-hash envelope prevents echoes to the originator.
     fn relay_control_message(
         &mut self,
         sender: &str,
@@ -2983,9 +3697,14 @@ impl NetworkSession {
         }
 
         if from_child {
-            if self.relay_parent_or_root().is_some() {
-                self.send_upstream_or_broadcast_routed(msg, sender_matchbox, Some(origin_hash));
-            } else if !self.relay_children.is_empty() {
+            if !self.is_host && self.relay_parent_or_root().is_some() {
+                self.send_upstream_or_broadcast_routed(
+                    msg.clone(),
+                    sender_matchbox,
+                    Some(origin_hash),
+                );
+            }
+            if !self.relay_children.is_empty() {
                 self.send_downstream_or_broadcast_routed(msg, sender_matchbox, Some(origin_hash));
             }
             return;
@@ -3005,57 +3724,12 @@ impl NetworkSession {
         msg: Vec<u8>,
         relay_origin_hash: Option<u64>,
     ) {
-        let sender_matchbox = self.peer_id_lookup.get(sender).copied();
-        let from_parent = self.is_parent_sender(sender);
-        let from_child = self.is_child_sender(sender);
-        let origin_hash = relay_origin_hash.unwrap_or_else(|| Self::hash_peer_id(sender));
-
-        if from_parent {
-            if !self.relay_children.is_empty() {
-                self.send_low_priority_downstream_or_broadcast_routed(
-                    topic,
-                    msg,
-                    sender_matchbox,
-                    Some(origin_hash),
-                );
-            }
+        // Consume the topic budget once for the whole flood step, then reuse
+        // the plain tree-flood (up + sibling subtrees, minus the inbound link).
+        if !self.allow_low_priority_topic(topic) {
             return;
         }
-
-        if from_child {
-            if self.relay_parent_or_root().is_some() {
-                self.send_low_priority_upstream_or_broadcast_routed(
-                    topic,
-                    msg,
-                    sender_matchbox,
-                    Some(origin_hash),
-                );
-            } else if !self.relay_children.is_empty() {
-                self.send_low_priority_downstream_or_broadcast_routed(
-                    topic,
-                    msg,
-                    sender_matchbox,
-                    Some(origin_hash),
-                );
-            }
-            return;
-        }
-
-        if self.is_host {
-            self.send_low_priority_downstream_or_broadcast_routed(
-                topic,
-                msg,
-                sender_matchbox,
-                Some(origin_hash),
-            );
-        } else {
-            self.send_low_priority_upstream_or_broadcast_routed(
-                topic,
-                msg,
-                sender_matchbox,
-                Some(origin_hash),
-            );
-        }
+        self.relay_control_message(sender, msg, relay_origin_hash);
     }
 
     pub fn record_paid_obstacle_confirmation(
@@ -4186,6 +4860,16 @@ impl NetworkSession {
     pub fn flush_relay_batches(&mut self) {
         let parent = self.relay_active_parent.or(self.relay_parent);
         let children = self.relay_children.clone();
+        // Periodically bypass interest filtering for player-state batches so
+        // far-away players still reach everyone at a low rate (roster, player
+        // list, minimap). Cadence widens with room size to bound the cost.
+        self.flush_counter = self.flush_counter.wrapping_add(1);
+        let bypass_stride: u32 = if self.topology_roster.len() <= 128 {
+            8
+        } else {
+            32
+        };
+        let bypass_interest = self.flush_counter % bypass_stride == 0;
         let identity_lookup = self.peer_identity_lookup.clone();
         let mut remote_positions: HashMap<PeerId, Vec2> = self
             .remote_players
@@ -4276,7 +4960,7 @@ impl NetworkSession {
                     let mut filtered: Vec<PlayerStateEntry> = entries
                         .iter()
                         .filter(|entry| {
-                            if entry.peer_hash == target_hash {
+                            if bypass_interest || entry.peer_hash == target_hash {
                                 return true;
                             }
                             if let Some(area) = target_area {
@@ -4332,7 +5016,7 @@ impl NetworkSession {
                         .entries
                         .iter()
                         .filter(|entry| {
-                            if entry.peer_hash == target_hash {
+                            if bypass_interest || entry.peer_hash == target_hash {
                                 return true;
                             }
                             if let Some(area) = target_area {
@@ -5151,20 +5835,11 @@ impl NetworkSession {
             return;
         }
 
-        let socket = match &mut self.socket {
-            Some(s) => s,
-            None => return,
-        };
-
         let sync = PaidObstacleSync {
             obstacles: obstacles.to_vec(),
         };
         let msg = NetMessage::PaidObstacleSyncEvent(sync).to_bytes();
-        let peers: Vec<_> = socket.connected_peers().collect();
-
-        for peer_id in peers {
-            socket.send(msg.clone().into_boxed_slice(), peer_id);
-        }
+        self.send_downstream_or_broadcast(msg, None);
     }
 
     pub fn send_paid_names_to_peers(
@@ -5199,20 +5874,11 @@ impl NetworkSession {
             return;
         }
 
-        let socket = match &mut self.socket {
-            Some(s) => s,
-            None => return,
-        };
-
         let sync = PaidNameSync {
             reservations: reservations.to_vec(),
         };
         let msg = NetMessage::PaidNameSyncEvent(sync).to_bytes();
-        let peers: Vec<_> = socket.connected_peers().collect();
-
-        for peer_id in peers {
-            socket.send(msg.clone().into_boxed_slice(), peer_id);
-        }
+        self.send_downstream_or_broadcast(msg, None);
     }
 
     pub fn take_new_peers_needing_state(&mut self) -> Vec<matchbox_socket::PeerId> {
@@ -5682,40 +6348,519 @@ mod tests {
         );
     }
 
-    #[test]
-    fn discovery_membership_prevents_split_root_election() {
-        let root = peer_from(0);
-        let mid = peer_from(1);
-        let leaf = peer_from(2);
+    fn hash_for(peer: matchbox_socket::PeerId) -> u64 {
+        NetworkSession::hash_peer_id(&format!("{:?}", peer))
+    }
 
-        let mut session = NetworkSession::new();
-        session.discovery_attached = true;
-        session.local_peer_id = Some(mid);
-
-        session.update_supernode_from(Some(mid), &[leaf], &[root, leaf], 60);
-
-        assert_eq!(session.super_root_id, Some(root));
-        assert_eq!(session.supernode_id, Some(root));
-        assert!(!session.is_host);
-        assert_eq!(session.relay_parent, Some(root));
+    fn entry_for(peer: matchbox_socket::PeerId, parent: u64) -> TopologyEntry {
+        TopologyEntry {
+            peer_hash: hash_for(peer),
+            uuid: NetworkSession::uuid_for_peer(peer),
+            parent_hash: parent,
+        }
     }
 
     #[test]
-    fn detached_overlay_election_uses_connected_subgraph() {
+    fn root_admits_members_with_sticky_parents() {
+        let root = peer_from(0);
+        let a = peer_from(1);
+        let b = peer_from(2);
+
+        let mut session = NetworkSession::new();
+        session.is_host = true;
+        session.local_peer_id = Some(root);
+
+        session.update_topology_as_root(10, &[a]);
+        let a_parent = session
+            .roster_entry(hash_for(a))
+            .map(|entry| entry.parent_hash);
+        assert_eq!(a_parent, Some(hash_for(root)));
+        assert_eq!(session.roster_root_hash(), Some(hash_for(root)));
+        let epoch_after_a = session.relay_epoch;
+
+        // Another join must not move A's slot.
+        session.update_topology_as_root(20, &[a, b]);
+        assert_eq!(
+            session
+                .roster_entry(hash_for(a))
+                .map(|entry| entry.parent_hash),
+            a_parent
+        );
+        assert!(session.roster_contains(hash_for(b)));
+        assert!(session.relay_epoch > epoch_after_a);
+
+        // A frame with no membership change must not bump the epoch.
+        let stable_epoch = session.relay_epoch;
+        session.update_topology_as_root(30, &[a, b]);
+        assert_eq!(session.relay_epoch, stable_epoch);
+        assert!(session.is_host);
+    }
+
+    #[test]
+    fn joiner_adopts_map_and_never_self_elects() {
         let root = peer_from(0);
         let mid = peer_from(1);
         let leaf = peer_from(2);
 
         let mut session = NetworkSession::new();
-        session.discovery_attached = false;
         session.local_peer_id = Some(mid);
+        session.local_peer_hash = Some(hash_for(mid));
 
-        session.update_supernode_from(Some(mid), &[leaf], &[root, leaf], 60);
+        let map = TopologyUpdate {
+            epoch: 3,
+            root_hash: hash_for(root),
+            fanout: 2,
+            entries: vec![
+                entry_for(root, 0),
+                entry_for(mid, hash_for(root)),
+                entry_for(leaf, hash_for(mid)),
+            ],
+        };
+        assert!(session.apply_topology_map("sender", &map, 60));
 
-        assert_eq!(session.super_root_id, Some(mid));
-        assert_eq!(session.supernode_id, Some(mid));
+        assert!(!session.is_host);
+        assert_eq!(session.super_root_id, Some(root));
+        assert_eq!(session.relay_parent, Some(root));
+        assert_eq!(session.relay_children, vec![leaf]);
+        assert_eq!(session.relay_epoch, 3);
+
+        // A stale map (older epoch, same root) must be rejected.
+        let stale = TopologyUpdate {
+            epoch: 2,
+            root_hash: hash_for(root),
+            fanout: 2,
+            entries: vec![entry_for(root, 0), entry_for(mid, hash_for(root))],
+        };
+        assert!(!session.apply_topology_map("sender", &stale, 61));
+        assert_eq!(session.relay_epoch, 3);
+    }
+
+    #[test]
+    fn root_failover_promotes_candidates_in_uuid_order_with_stagger() {
+        let root = peer_from(0);
+        let first = peer_from(1);
+        let second = peer_from(2);
+
+        let map_entries = vec![
+            entry_for(root, 0),
+            entry_for(first, hash_for(root)),
+            entry_for(second, hash_for(root)),
+        ];
+        let candidate_rank = |peer: matchbox_socket::PeerId| {
+            let mut candidates = vec![
+                NetworkSession::uuid_for_peer(first),
+                NetworkSession::uuid_for_peer(second),
+            ];
+            candidates.sort();
+            candidates
+                .iter()
+                .position(|uuid| *uuid == NetworkSession::uuid_for_peer(peer))
+                .unwrap() as u32
+        };
+
+        for peer in [first, second] {
+            let mut session = NetworkSession::new();
+            session.local_peer_id = Some(peer);
+            session.local_peer_hash = Some(hash_for(peer));
+            session.topology_roster = map_entries.clone();
+            session.relay_epoch = 5;
+            session.last_map_rx_frame = 100;
+
+            let rank = candidate_rank(peer);
+            let not_yet = 100
+                + NetworkSession::ROOT_STALE_FRAMES
+                + rank * NetworkSession::ROOT_TAKEOVER_STAGGER_FRAMES
+                - 1;
+            session.maybe_root_failover(not_yet, &[]);
+            assert!(!session.is_host, "rank {rank} promoted too early");
+
+            let due = not_yet + 1;
+            session.maybe_root_failover(due, &[]);
+            assert!(session.is_host, "rank {rank} failed to promote when due");
+            assert_eq!(session.roster_root_hash(), Some(hash_for(peer)));
+            assert!(session.relay_epoch > 5);
+            // The dead root is gone; the other candidate is re-homed under us.
+            assert!(!session.roster_contains(hash_for(root)));
+        }
+    }
+
+    #[test]
+    fn root_scales_to_two_thousand_members_with_bounded_tree() {
+        let root = peer_from(0);
+        let mut session = NetworkSession::new();
+        session.is_host = true;
+        session.local_peer_id = Some(root);
+        session.local_peer_hash = Some(hash_for(root));
+        session.topology_roster.push(entry_for(root, 0));
+
+        const N: usize = 2_000;
+        for i in 1..=N {
+            // Fanout grows with the room, as update_topology_as_root does.
+            session.relay_fanout =
+                NetworkSession::choose_dynamic_fanout(session.topology_roster.len());
+            session.add_roster_member(NetworkSession::uuid_for_peer(peer_from(i as u128)), 10);
+        }
+        assert_eq!(session.topology_roster.len(), N + 1);
+
+        // Structure: bounded fanout, no orphans, bounded depth, acyclic.
+        let parents: HashMap<u64, u64> = session
+            .topology_roster
+            .iter()
+            .map(|e| (e.peer_hash, e.parent_hash))
+            .collect();
+        let mut child_counts: HashMap<u64, usize> = HashMap::new();
+        for entry in &session.topology_roster {
+            if entry.parent_hash != 0 {
+                assert!(
+                    parents.contains_key(&entry.parent_hash),
+                    "orphaned member: parent not in roster"
+                );
+                *child_counts.entry(entry.parent_hash).or_insert(0) += 1;
+            }
+        }
+        let max_children = child_counts.values().copied().max().unwrap_or(0);
+        assert!(
+            max_children <= NetworkSession::MAX_FANOUT,
+            "fanout exceeded: {max_children}"
+        );
+        let mut max_depth = 0usize;
+        for entry in &session.topology_roster {
+            let mut depth = 0;
+            let mut cursor = entry.peer_hash;
+            while let Some(parent) = parents.get(&cursor).copied() {
+                if parent == 0 {
+                    break;
+                }
+                depth += 1;
+                cursor = parent;
+                assert!(depth <= 64, "cycle or absurd depth in tree");
+            }
+            max_depth = max_depth.max(depth);
+        }
+        assert!(max_depth <= 5, "tree too deep for 2k members: {max_depth}");
+
+        // Wire sizes: full map is ~32B/member; a single-join delta is tiny.
+        let full = session.topology_map_message().expect("map");
+        let full_bytes = NetMessage::TopologyUpdateEvent(full).to_bytes().len();
+        assert!(
+            full_bytes > 60_000,
+            "expected ~64KB full map, got {full_bytes}"
+        );
+        let delta = TopologyDelta {
+            epoch_from: 1,
+            epoch_to: 2,
+            root_hash: hash_for(root),
+            fanout: session.relay_fanout as u8,
+            checksum: NetworkSession::roster_checksum(&session.topology_roster),
+            removed: vec![],
+            upserts: vec![*session.topology_roster.last().unwrap()],
+        };
+        let delta_bytes = NetMessage::TopologyDeltaEvent(delta).to_bytes().len();
+        assert!(
+            delta_bytes < 100,
+            "single-join delta should be tiny: {delta_bytes}"
+        );
+    }
+
+    #[test]
+    fn delta_applies_with_checksum_and_rejects_desync() {
+        let root = peer_from(0);
+        let a = peer_from(1);
+        let b = peer_from(2);
+        let c = peer_from(3);
+
+        let mut session = NetworkSession::new();
+        session.local_peer_id = Some(a);
+        session.local_peer_hash = Some(hash_for(a));
+        let base = TopologyUpdate {
+            epoch: 5,
+            root_hash: hash_for(root),
+            fanout: 4,
+            entries: vec![
+                entry_for(root, 0),
+                entry_for(a, hash_for(root)),
+                entry_for(b, hash_for(root)),
+            ],
+        };
+        assert!(session.apply_topology_map("sender", &base, 10));
+        assert_eq!(session.relay_epoch, 5);
+
+        // Valid delta: c joins under a.
+        let mut next = base.entries.clone();
+        next.push(entry_for(c, hash_for(a)));
+        let delta = TopologyDelta {
+            epoch_from: 5,
+            epoch_to: 6,
+            root_hash: hash_for(root),
+            fanout: 4,
+            checksum: NetworkSession::roster_checksum(&next),
+            removed: vec![],
+            upserts: vec![entry_for(c, hash_for(a))],
+        };
+        assert!(session.apply_topology_delta("sender", &delta, 20));
+        assert_eq!(session.relay_epoch, 6);
+        assert!(session.roster_contains(hash_for(c)));
+        assert_eq!(session.relay_children, vec![c]);
+        assert!(!session.needs_full_map);
+
+        // Replay of the same delta: stale, ignored, no desync flag.
+        assert!(!session.apply_topology_delta("sender", &delta, 21));
+        assert!(!session.needs_full_map);
+
+        // Gap in the epoch stream: must request a full map.
+        let gap = TopologyDelta {
+            epoch_from: 8,
+            epoch_to: 9,
+            root_hash: hash_for(root),
+            fanout: 4,
+            checksum: 0,
+            removed: vec![],
+            upserts: vec![],
+        };
+        assert!(!session.apply_topology_delta("sender", &gap, 22));
+        assert!(session.needs_full_map);
+        session.needs_full_map = false;
+
+        // Corrupt checksum: rejected, roster untouched, full map requested.
+        let bad = TopologyDelta {
+            epoch_from: 6,
+            epoch_to: 7,
+            root_hash: hash_for(root),
+            fanout: 4,
+            checksum: 0xDEAD,
+            removed: vec![hash_for(b)],
+            upserts: vec![],
+        };
+        assert!(!session.apply_topology_delta("sender", &bad, 23));
+        assert!(session.needs_full_map);
+        assert!(session.roster_contains(hash_for(b)));
+        assert_eq!(session.relay_epoch, 6);
+    }
+
+    #[test]
+    fn heartbeat_delta_refreshes_liveness_only_from_parent() {
+        let root = peer_from(0);
+        let a = peer_from(1);
+        let stranger = peer_from(9);
+
+        let mut session = NetworkSession::new();
+        session.local_peer_id = Some(a);
+        session.local_peer_hash = Some(hash_for(a));
+        let base = TopologyUpdate {
+            epoch: 3,
+            root_hash: hash_for(root),
+            fanout: 4,
+            entries: vec![entry_for(root, 0), entry_for(a, hash_for(root))],
+        };
+        assert!(session.apply_topology_map("sender", &base, 10));
+        session.last_map_rx_frame = 10;
+        // Resolve sender strings to matchbox ids for authority checks.
+        let root_str = format!("{:?}", root);
+        let stranger_str = format!("{:?}", stranger);
+        session.peer_id_lookup.insert(root_str.clone(), root);
+        session
+            .peer_id_lookup
+            .insert(stranger_str.clone(), stranger);
+
+        let heartbeat = TopologyDelta {
+            epoch_from: 3,
+            epoch_to: 3,
+            root_hash: hash_for(root),
+            fanout: 4,
+            checksum: NetworkSession::roster_checksum(&session.topology_roster),
+            removed: vec![],
+            upserts: vec![],
+        };
+        // From a stranger: not liveness, not forwarded.
+        assert!(!session.apply_topology_delta(&stranger_str, &heartbeat, 500));
+        assert_eq!(session.last_map_rx_frame, 10);
+        // From our parent (the root): refreshes liveness and forwards.
+        assert!(session.apply_topology_delta(&root_str, &heartbeat, 600));
+        assert_eq!(session.last_map_rx_frame, 600);
+        // Divergent checksum from parent: triggers a full-map request.
+        let bad_heartbeat = TopologyDelta {
+            checksum: 0xBAD,
+            ..heartbeat
+        };
+        assert!(!session.apply_topology_delta(&root_str, &bad_heartbeat, 700));
+        assert!(session.needs_full_map);
+    }
+
+    #[test]
+    fn repeated_join_nags_reassign_unreachable_parent() {
+        let root = peer_from(0);
+        let parent_a = peer_from(1);
+        let parent_b = peer_from(2);
+        let leaf = peer_from(3);
+
+        let mut session = NetworkSession::new();
+        session.is_host = true;
+        session.local_peer_id = Some(root);
+        session.local_peer_hash = Some(hash_for(root));
+        session.relay_fanout = 4;
+        session.topology_roster = vec![
+            entry_for(root, 0),
+            entry_for(parent_a, hash_for(root)),
+            entry_for(parent_b, hash_for(root)),
+            entry_for(leaf, hash_for(parent_a)),
+        ];
+        session.member_parent_since.insert(hash_for(leaf), 0);
+
+        let request = JoinRequest {
+            peer_hash: hash_for(leaf),
+            uuid: NetworkSession::uuid_for_peer(leaf),
+        };
+        // First nag at a mature parent age: tracked but below threshold.
+        session.handle_join_request("sender", request, 700);
+        assert_eq!(
+            session.roster_entry(hash_for(leaf)).unwrap().parent_hash,
+            hash_for(parent_a)
+        );
+        // Second nag within the window: reassigned away from parent_a.
+        session.handle_join_request("sender", request, 790);
+        let new_parent = session.roster_entry(hash_for(leaf)).unwrap().parent_hash;
+        assert_ne!(new_parent, hash_for(parent_a));
+        assert!(session.roster_dirty);
+        // Cooldown: immediate further nags do not bounce it again.
+        let parent_after = new_parent;
+        session.handle_join_request("sender", request, 850);
+        session.handle_join_request("sender", request, 900);
+        assert_eq!(
+            session.roster_entry(hash_for(leaf)).unwrap().parent_hash,
+            parent_after
+        );
+    }
+
+    #[test]
+    fn root_departure_evidence_triggers_fast_failover() {
+        let root = peer_from(0);
+        let first = peer_from(1);
+        let second = peer_from(2);
+
+        let mut session = NetworkSession::new();
+        session.local_peer_id = Some(first);
+        session.local_peer_hash = Some(hash_for(first));
+        session.topology_roster = vec![
+            entry_for(root, 0),
+            entry_for(first, hash_for(root)),
+            entry_for(second, hash_for(root)),
+        ];
+        session.relay_epoch = 5;
+        session.last_map_rx_frame = 100;
+        // Map is fresh; without evidence nothing happens.
+        session.maybe_root_failover(200, &[]);
+        assert!(!session.is_host);
+
+        // Departure evidence arms the fast path even with a fresh map.
+        session.root_departure_frame = Some(200);
+        let rank = {
+            let mut uuids = vec![
+                NetworkSession::uuid_for_peer(first),
+                NetworkSession::uuid_for_peer(second),
+            ];
+            uuids.sort();
+            uuids
+                .iter()
+                .position(|u| *u == NetworkSession::uuid_for_peer(first))
+                .unwrap() as u32
+        };
+        let due = 200
+            + NetworkSession::ROOT_DEPARTURE_TAKEOVER_BASE_FRAMES
+            + rank * NetworkSession::ROOT_DEPARTURE_TAKEOVER_STAGGER_FRAMES;
+        session.maybe_root_failover(due - 1, &[]);
+        assert!(!session.is_host, "promoted before fast window elapsed");
+        session.maybe_root_failover(due, &[]);
+        assert!(session.is_host, "fast failover did not promote");
+        assert_eq!(session.roster_root_hash(), Some(hash_for(first)));
+        // The other member survives the takeover with a fresh slot.
+        assert!(session.roster_contains(hash_for(second)));
+    }
+
+    #[test]
+    fn host_defers_only_to_outranking_root() {
+        let me = peer_from(5);
+        let other_low = peer_from(1);
+
+        let mut session = NetworkSession::new();
+        session.is_host = true;
+        session.local_peer_id = Some(me);
+        session.update_topology_as_root(10, &[]);
+        let my_epoch = session.relay_epoch;
+
+        // Same epoch, higher uuid-hash root: we keep the room.
+        let weak = TopologyUpdate {
+            epoch: my_epoch,
+            root_hash: u64::MAX,
+            fanout: 2,
+            entries: vec![TopologyEntry {
+                peer_hash: u64::MAX,
+                uuid: [9u8; 16],
+                parent_hash: 0,
+            }],
+        };
+        assert!(!session.apply_topology_map("sender", &weak, 20));
         assert!(session.is_host);
-        assert_eq!(session.relay_parent, None);
+
+        // Strictly newer epoch: we abdicate and adopt.
+        let strong = TopologyUpdate {
+            epoch: my_epoch + 10,
+            root_hash: hash_for(other_low),
+            fanout: 2,
+            entries: vec![entry_for(other_low, 0), entry_for(me, hash_for(other_low))],
+        };
+        assert!(session.apply_topology_map("sender", &strong, 30));
+        assert!(!session.is_host);
+        assert_eq!(session.super_root_id, Some(other_low));
+        assert_eq!(session.relay_parent, Some(other_low));
+    }
+
+    #[test]
+    fn desired_links_are_stable_across_epoch_bumps() {
+        let peers = known_peers(12);
+        let local = peers[0];
+
+        let mut session = NetworkSession::new();
+        session.local_peer_id = Some(local);
+        session.is_host = false;
+        session.relay_parent = Some(peers[1]);
+        session.relay_backup_parent = Some(peers[2]);
+        session.relay_children = vec![peers[3], peers[4]];
+
+        session.relay_epoch = 7;
+        let first = session.desired_peer_links(&peers, &peers);
+        session.relay_epoch = 8;
+        let second = session.desired_peer_links(&peers, &peers);
+        assert_eq!(first, second, "epoch bumps must not rotate links");
+    }
+
+    #[test]
+    fn undesired_links_get_grace_before_drop() {
+        let peers = known_peers(3);
+        let local = peers[0];
+        let stray = peers[2];
+
+        let mut session = NetworkSession::new();
+        session.local_peer_id = Some(local);
+        session.is_host = true;
+        session.relay_children = vec![peers[1]];
+        // All three are roster members, so the stray is neither a tree link
+        // nor an admission candidate for us.
+        session.topology_roster = vec![
+            entry_for(local, 0),
+            entry_for(peers[1], hash_for(local)),
+            entry_for(stray, hash_for(peers[1])),
+        ];
+
+        session.last_update_frame = 100;
+        session.update_desired_peers(&peers, &[peers[1], stray]);
+        // The stray link is tracked but kept during the grace window.
+        assert!(session.undesired_since.contains_key(&stray));
+
+        // Becoming desired again clears the timer.
+        session.relay_children = vec![peers[1], stray];
+        session.last_update_frame = 200;
+        session.update_desired_peers(&peers, &[peers[1], stray]);
+        assert!(!session.undesired_since.contains_key(&stray));
     }
 
     #[test]
@@ -5739,42 +6884,5 @@ mod tests {
 
         assert!(!desired.contains(&silent));
         assert!(desired.contains(&healthy));
-    }
-
-    #[test]
-    fn desired_set_reenforces_when_connected_peer_is_no_longer_desired() {
-        let peers = known_peers(3);
-        let mut desired = HashSet::new();
-        desired.insert(peers[1]);
-
-        assert!(NetworkSession::desired_set_needs_enforcement(
-            &desired,
-            &[peers[1], peers[2]]
-        ));
-        assert!(!NetworkSession::desired_set_needs_enforcement(
-            &desired,
-            &[peers[1]]
-        ));
-    }
-
-    #[test]
-    fn detached_overlay_recomputes_when_all_parent_routes_are_lost() {
-        let root = peer_from(0);
-        let mid = peer_from(1);
-        let leaf = peer_from(2);
-
-        let mut session = NetworkSession::new();
-        session.discovery_attached = false;
-        session.local_peer_id = Some(mid);
-        session.relay_parent = Some(root);
-        session.relay_active_parent = Some(root);
-        session.super_root_id = Some(root);
-
-        assert!(session.detached_overlay_needs_recompute(&[leaf], 60));
-
-        session.relay_parent = Some(leaf);
-        session.relay_active_parent = Some(leaf);
-        session.peer_connected_frames.insert(leaf, 50);
-        assert!(!session.detached_overlay_needs_recompute(&[leaf], 60));
     }
 }

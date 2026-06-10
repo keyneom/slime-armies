@@ -277,6 +277,7 @@ impl<C: BuildablePlurality> WebRtcSocketBuilder<C> {
 
         let (peer_state_tx, peer_state_rx) = futures_channel::mpsc::unbounded();
         let (known_peer_tx, known_peer_rx) = futures_channel::mpsc::unbounded();
+        let (peer_left_tx, peer_left_rx) = futures_channel::mpsc::unbounded();
         let (control_tx, control_rx) = futures_channel::mpsc::unbounded();
 
         let (messages_from_peers_tx, messages_from_peers_rx) =
@@ -298,6 +299,7 @@ impl<C: BuildablePlurality> WebRtcSocketBuilder<C> {
             peer_state_tx,
             messages_from_peers_tx,
             known_peer_tx,
+            peer_left_tx,
             control_rx,
         )
         // Transform the source into a user-error.
@@ -318,6 +320,7 @@ impl<C: BuildablePlurality> WebRtcSocketBuilder<C> {
                 id_rx,
                 peer_state_rx,
                 known_peer_rx,
+                peer_left_rx,
                 peers: Default::default(),
                 known_peers: Default::default(),
                 control_tx,
@@ -405,6 +408,11 @@ pub struct WebRtcSocket<C: ChannelPlurality = SingleChannel> {
     id_rx: futures_channel::oneshot::Receiver<PeerId>,
     peer_state_rx: futures_channel::mpsc::UnboundedReceiver<(PeerId, PeerState)>,
     known_peer_rx: futures_channel::mpsc::UnboundedReceiver<(PeerId, bool)>,
+    /// Peers the signaling server reported as having left the room. Unlike
+    /// `known_peers`, this fires for every member (matchbox broadcasts the
+    /// removal room-wide), so it works as a liveness signal for peers that
+    /// joined before us and were therefore never in our known set.
+    peer_left_rx: futures_channel::mpsc::UnboundedReceiver<PeerId>,
     peers: HashMap<PeerId, PeerState>,
     known_peers: HashSet<PeerId>,
     control_tx: futures_channel::mpsc::UnboundedSender<SocketControl>,
@@ -554,6 +562,17 @@ impl<C: ChannelPlurality> WebRtcSocket<C> {
     /// Returns all peers currently known by signaling (connected or not).
     pub fn known_peers(&'_ self) -> impl std::iter::Iterator<Item = PeerId> + '_ {
         self.known_peers.iter().copied()
+    }
+
+    /// Drains peers that the signaling server reported as departed since the
+    /// last call. Fires for any room member, including ones that joined
+    /// before us (which never appear in `known_peers`).
+    pub fn take_signaling_departures(&mut self) -> Vec<PeerId> {
+        let mut departed = Vec::new();
+        while let Ok(Some(peer_id)) = self.peer_left_rx.try_next() {
+            departed.push(peer_id);
+        }
+        departed
     }
 
     /// Enables sparse connectivity mode and sets the desired peer set.
@@ -791,6 +810,7 @@ pub struct MessageLoopChannels {
     pub peer_state_tx: futures_channel::mpsc::UnboundedSender<(PeerId, PeerState)>,
     pub messages_from_peers_tx: Vec<futures_channel::mpsc::UnboundedSender<(PeerId, Packet)>>,
     pub known_peer_tx: futures_channel::mpsc::UnboundedSender<(PeerId, bool)>,
+    pub peer_left_tx: futures_channel::mpsc::UnboundedSender<PeerId>,
     pub control_receiver: futures_channel::mpsc::UnboundedReceiver<SocketControl>,
 }
 
@@ -801,6 +821,7 @@ async fn run_socket(
     peer_state_tx: futures_channel::mpsc::UnboundedSender<(PeerId, PeerState)>,
     messages_from_peers_tx: Vec<futures_channel::mpsc::UnboundedSender<(PeerId, Packet)>>,
     known_peer_tx: futures_channel::mpsc::UnboundedSender<(PeerId, bool)>,
+    peer_left_tx: futures_channel::mpsc::UnboundedSender<PeerId>,
     control_receiver: futures_channel::mpsc::UnboundedReceiver<SocketControl>,
 ) -> Result<(), SignalingError> {
     debug!("Starting WebRtcSocket");
@@ -823,6 +844,7 @@ async fn run_socket(
         peer_state_tx,
         messages_from_peers_tx,
         known_peer_tx,
+        peer_left_tx,
         control_receiver,
     };
     let message_loop_fut = message_loop::<UseMessenger>(

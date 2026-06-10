@@ -1,6 +1,172 @@
 # P2P Scaling Research + Execution Plan
 
-Last updated: 2026-03-06
+Last updated: 2026-06-09
+
+## 2026-06-09 redesign: sticky-root topology map (CURRENT ARCHITECTURE)
+
+The per-node election + per-peer topology assignment design below (kept for
+history) proved structurally unstable: every node elected a root over a
+different membership view (stock matchbox only tells you about peers that
+joined *after* you), tree assignments depended on player positions/RTT (so
+normal movement reshuffled routes), epoch bumps rotated witness/admission
+links, and both the session and the socket fork force-closed any channel that
+fell out of the desired set. The result was the observed constant peer churn
+and split rooms. The current implementation replaces the control plane:
+
+- `Single sticky root`: the room creator is the topology authority. Nobody
+  else ever self-elects while a root is alive. The root assigns each member a
+  parent once (BFS by join order, capacity = dynamic fanout) and never
+  reshuffles existing routes on join/movement/latency changes.
+- `One room-wide TopologyUpdate map` (epoch, root, fanout, entries of
+  `{peer_hash, uuid, parent_hash}`), broadcast by the root and forwarded
+  verbatim down the tree. Identical for all recipients: each node derives its
+  own parent/children/backup/supernode-set from it, so forwarding can never
+  poison anyone's routes (the old per-peer updates were applied by
+  grandchildren as their own). The uuids let any node resolve any member to a
+  connectable transport id.
+- `JoinRequest` messages relay up the tree; the root admits members, prunes
+  members silent for ~10s (liveness piggybacks on relayed batch traffic), and
+  re-homes orphaned subtrees without touching anything else.
+- `Root failover`: the root is a replaceable coordinator role, never a fixed
+  dependency. A clean departure is broadcast room-wide by the signaling
+  server and triggers fast succession (~3s, uuid order from the shared map,
+  staggered by rank); silent death (crash, network loss) falls back to a
+  ~30s map-staleness timeout. Competing roots converge via a total order on
+  (epoch, root hash) plus abdication + "reply with winning map". Same-epoch
+  map echoes between orphans of a dead root do not count as liveness; only
+  higher-epoch maps or copies arriving from the parent/root path do.
+- `Link policy is make-before-break`: desired peers only gate *outgoing*
+  offers; incoming offers are always accepted; healthy-but-undesired links
+  survive a grace window (~10s) before being dropped; nothing force-drops on
+  a desired-set delta. Admission (root/supernodes -> roster-less newcomers)
+  and rescue (root -> silent members) links are stable, not epoch-rotated.
+- `Everyone stays attached to signaling`. The matchbox room is the membership
+  oracle and the only way to mint new WebRTC links. An idle WebSocket per
+  client is cheap at the hundreds-to-low-thousands scale; gameplay data still
+  rides the sparse supernode tree, so per-node WebRTC link counts stay
+  bounded. The old "detach after bootstrap" path stranded nodes permanently
+  (no re-attach existed) and was the main source of split rooms; the socket
+  fork keeps `detach_signaling` for a future overlay-relayed-signaling mode.
+
+## Dependency stance: matchbox for discovery, pure P2P after — and STUN
+
+Goal: the public matchbox server is the only third-party dependency; after
+discovery, everything is peer-to-peer. Where that stands:
+
+- `Gameplay data`: already pure P2P, before and after this redesign. No server
+  ever carries game traffic; the relay tree is made of direct WebRTC links
+  between players.
+- `Membership/links`: the matchbox room is the membership oracle and the only
+  place new WebRTC links can be minted (browsers cannot exchange SDP without
+  *some* rendezvous). Staying attached costs exactly ONE websocket per
+  client — to the server, not per peer. Browser connection-limit math, since
+  it keeps coming up:
+  - Websockets: 1 per tab total (limits are ~200-255 per tab; irrelevant).
+  - WebRTC: RTCPeerConnections are not websockets and not bound by HTTP
+    connection limits (Chrome allows ~500 per tab). Our tree caps per-node
+    links far below that regardless of room size: leaves <= 7, supernodes
+    <= 24, root <= 28. A 1,000-player room never asks any single browser to
+    hold more than ~28 connections; fanout 12 at depth 3 spans ~1,700 nodes.
+  - The O(N) cost lives on the signaling SERVER (N idle websockets, a
+    NewPeer broadcast per join) — trivial for a websocket service, but note
+    the public match-0-13.helsing.studio is someone's free community server:
+    fine for playtests and hundreds of players, but parking thousands of
+    concurrent users on it is freeloading and a single point of failure we
+    do not control. `set_signaling_server()` retargets any
+    matchbox-protocol-compatible deployment if/when that day comes.
+  True detach requires overlay-relayed signaling (peers forwarding SDP through
+  the tree) — planned, not yet built.
+- `STUN`: cannot be fully removed for internet play, and here is why. Two
+  browsers behind different NATs can only connect if each learns the public
+  address:port its NAT assigned — that information only exists outside the
+  NAT, so *someone* outside must echo it back. That is all STUN is: a
+  stateless one-shot "what is my address?" echo used during link setup; no
+  game data ever touches it, any STUN server is interchangeable, and the
+  browser offers no other API to learn the mapping (native apps can observe
+  peers' source addresses themselves; browser WebRTC cannot).
+
+  We do not run any STUN infrastructure and never have: the game has always
+  piggybacked on free public STUN (Google's, since the first networking
+  commit). The default list now carries two independent operators —
+  `stun.l.google.com:19302` / `stun1.l.google.com:19302` (Google) and
+  `stun.cloudflare.com:3478` (Cloudflare) — queried in parallel, so one
+  provider disappearing costs nothing. More free ones exist (Twilio,
+  stunprotocol.org, Mozilla) if these ever rot.
+
+  Ideas evaluated for replacing STUN, and why they don't work:
+  - "Learn our UDP address from Ethereum / a wallet RPC / any web service":
+    impossible — those are TCP/HTTPS connections, so they can only observe
+    the TCP flow's NAT mapping (the same thing matchbox sees). NAT mappings
+    are per-socket; the UDP socket WebRTC opens has its own mapping that can
+    only be observed by something that *receives a UDP packet from it*. Any
+    service that does that is, definitionally, a STUN server.
+  - "Fall back to TCP when UDP info is unavailable": browser-to-browser
+    ICE-TCP across NATs effectively does not work (TCP NAT traversal is
+    harder than UDP, and browsers only generate passive/relay TCP
+    candidates). TCP fallback in WebRTC really means TURN-over-TCP, i.e. a
+    relay server — the thing we refuse to depend on.
+  - "Tunnel game data through the matchbox websocket": technically possible
+    (the Signal message relays arbitrary payloads) but it turns the
+    signaling server into a data relay — worst of all worlds, and an abuse
+    of a free community service.
+  - Pay-per-use x402/crypto ICE service: STUN itself is too cheap to meter
+    (hence all the free ones); the idea is sound for `TURN`, where bandwidth
+    costs real money. The runtime hooks for that already exist
+    (`set_ice_servers`, `set_turn_fallback`) — a paid TURN endpoint can be
+    plugged in at runtime later with zero code changes here.
+
+  The infrastructure-free fallback for pairs that cannot connect even with
+  STUN (two symmetric/"hard" NATs) is the relay tree itself: every node only
+  needs a working link to *somebody*, and the root can learn from failed
+  link attempts and assign parents by connectivity rather than capacity
+  alone. Peer-relaying replaces TURN as long as each player can reach at
+  least one other player. (Connectivity-aware parent reassignment is future
+  work; capacity-based assignment is what ships today.)
+  - `set_ice_servers("none", "", "")`: zero ICE servers — works on a LAN
+    (mDNS/host candidates), used by tests; not viable across NATs.
+
+## Scaling mechanics (implemented 2026-06-10)
+
+- `Delta topology maps`: rooms above 32 members broadcast roster deltas
+  (~40 bytes per join) instead of full maps, with an empty delta as the
+  ~30-byte liveness heartbeat and a full-map anchor every 10th broadcast.
+  Every delta carries a checksum of the resulting roster; any receiver that
+  desyncs (missed epoch, divergent checksum) detects it immediately and
+  requests a full map through the join machinery. Membership-change
+  broadcasts are coalesced (0.5s) in big rooms; joiners waiting on a map
+  still get theirs immediately. Verified by unit tests up to 2,000 members:
+  bounded fanout, tree depth <= 5, ~64KB full map vs <100B join delta.
+- `Auto-rejoin`: losing the signaling websocket (server restart, network
+  blip) no longer dumps the player to the title screen or strands the node.
+  The session reconnects to the same room with backoff under a fresh peer
+  id; the join machinery re-admits everyone and old identities age out.
+  Drill: matchbox server killed for 12s under a live 3-player room -> all
+  clients rejoined, a new coordinator emerged, full roster re-formed with
+  game positions preserved.
+- `Connectivity-aware reassignment`: an in-roster member that keeps sending
+  join requests is telling the root its assigned parent link never forms
+  (e.g. two hard NATs). The root moves it under a different parent
+  (threshold + cooldown), making the tree itself the relay fallback for
+  unreachable pairs — no TURN dependency.
+- `Hidden/backgrounded tabs`: a 500ms watchdog drives the game tick when
+  rAF stalls and the network clock is wall-time based, so throttled tabs
+  stay in the room (slow-motion locally, live on the network).
+
+Known limits / next steps:
+- Verified in-browser at small scale plus 2,000-member unit-level tree
+  tests; a real load test (hundreds of headless clients) needs a native
+  session harness or a fleet, neither of which exists yet.
+- Parking thousands of concurrent players on the public community matchbox
+  server is freeloading and a single point of failure; self-host the same
+  binary when rooms get big (`set_signaling_server` retargets at runtime).
+- For tens of thousands: shard signaling and overlay-relayed signaling so
+  leaves can finally detach from the room websocket (the original two-layer
+  ideal); deferred because it only pays off at that scale and weakens the
+  departure-broadcast failure detection the current design relies on.
+
+---
+
+## Historical plan (pre-2026-06-09, superseded above)
 
 ## Why this exists
 Current networking has one elected supernode and a batch relay path. That reduced message volume, but it still centralizes relaying and authority too much for true massive rooms.

@@ -1239,119 +1239,195 @@ impl InputFrameBatch {
     }
 }
 
-#[derive(Debug, Clone)]
+/// One member of the relay tree, as assigned by the root.
+/// `uuid` is the raw matchbox PeerId so any node can resolve `peer_hash`
+/// to a connectable transport id even for peers it has never seen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopologyEntry {
+    pub peer_hash: u64,
+    pub uuid: [u8; 16],
+    /// 0 = this entry is the root (no parent).
+    pub parent_hash: u64,
+}
+
+/// Room-wide relay tree map, broadcast by the root and forwarded verbatim
+/// down the tree. Identical for every recipient: each node derives its own
+/// parent/children/backup from the entries, so forwarding can never assign
+/// a node someone else's routes.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopologyUpdate {
     pub epoch: u32,
-    pub super_root_hash: u64,
-    pub supernode_hashes: Vec<u64>,
+    pub root_hash: u64,
     pub fanout: u8,
-    pub parent_hash: u64,
-    pub backup_parent_hash: u64,
-    pub child_hashes: Vec<u64>,
+    pub entries: Vec<TopologyEntry>,
 }
 
 impl TopologyUpdate {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
+        let mut bytes = Vec::with_capacity(4 + 8 + 1 + 2 + self.entries.len() * 32);
         bytes.extend_from_slice(&self.epoch.to_le_bytes());
-        bytes.extend_from_slice(&self.super_root_hash.to_le_bytes());
-        bytes.extend_from_slice(&(self.supernode_hashes.len() as u16).to_le_bytes());
-        for hash in &self.supernode_hashes {
-            bytes.extend_from_slice(&hash.to_le_bytes());
-        }
+        bytes.extend_from_slice(&self.root_hash.to_le_bytes());
         bytes.push(self.fanout);
-        bytes.extend_from_slice(&self.parent_hash.to_le_bytes());
-        bytes.extend_from_slice(&self.backup_parent_hash.to_le_bytes());
-        bytes.extend_from_slice(&(self.child_hashes.len() as u16).to_le_bytes());
-        for hash in &self.child_hashes {
-            bytes.extend_from_slice(&hash.to_le_bytes());
+        bytes.extend_from_slice(&(self.entries.len() as u16).to_le_bytes());
+        for entry in &self.entries {
+            bytes.extend_from_slice(&entry.peer_hash.to_le_bytes());
+            bytes.extend_from_slice(&entry.uuid);
+            bytes.extend_from_slice(&entry.parent_hash.to_le_bytes());
         }
         bytes
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < 4 + 8 + 2 + 1 + 8 + 8 + 2 {
+        if bytes.len() < 4 + 8 + 1 + 2 {
             return None;
         }
-        let epoch = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let super_root_hash = u64::from_le_bytes([
-            bytes[4], bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
-        ]);
-        let mut offset = 12;
-        let super_count = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) as usize;
-        offset += 2;
-        let mut supernode_hashes = Vec::with_capacity(super_count);
-        for _ in 0..super_count {
-            if offset + 8 > bytes.len() {
+        let epoch = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+        let root_hash = u64::from_le_bytes(bytes[4..12].try_into().ok()?);
+        let fanout = bytes[12];
+        let count = u16::from_le_bytes(bytes[13..15].try_into().ok()?) as usize;
+        let mut offset = 15;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            if offset + 32 > bytes.len() {
                 return None;
             }
-            supernode_hashes.push(u64::from_le_bytes([
-                bytes[offset],
-                bytes[offset + 1],
-                bytes[offset + 2],
-                bytes[offset + 3],
-                bytes[offset + 4],
-                bytes[offset + 5],
-                bytes[offset + 6],
-                bytes[offset + 7],
-            ]));
-            offset += 8;
-        }
-        if offset + 1 + 8 + 8 + 2 > bytes.len() {
-            return None;
-        }
-        let fanout = bytes[offset];
-        offset += 1;
-        let parent_hash = u64::from_le_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-            bytes[offset + 4],
-            bytes[offset + 5],
-            bytes[offset + 6],
-            bytes[offset + 7],
-        ]);
-        offset += 8;
-        let backup_parent_hash = u64::from_le_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-            bytes[offset + 4],
-            bytes[offset + 5],
-            bytes[offset + 6],
-            bytes[offset + 7],
-        ]);
-        offset += 8;
-        let child_count = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) as usize;
-        offset += 2;
-        let mut child_hashes = Vec::with_capacity(child_count);
-        for _ in 0..child_count {
-            if offset + 8 > bytes.len() {
-                return None;
-            }
-            child_hashes.push(u64::from_le_bytes([
-                bytes[offset],
-                bytes[offset + 1],
-                bytes[offset + 2],
-                bytes[offset + 3],
-                bytes[offset + 4],
-                bytes[offset + 5],
-                bytes[offset + 6],
-                bytes[offset + 7],
-            ]));
-            offset += 8;
+            let peer_hash = u64::from_le_bytes(bytes[offset..offset + 8].try_into().ok()?);
+            let uuid: [u8; 16] = bytes[offset + 8..offset + 24].try_into().ok()?;
+            let parent_hash = u64::from_le_bytes(bytes[offset + 24..offset + 32].try_into().ok()?);
+            entries.push(TopologyEntry {
+                peer_hash,
+                uuid,
+                parent_hash,
+            });
+            offset += 32;
         }
         Some(Self {
             epoch,
-            super_root_hash,
-            supernode_hashes,
+            root_hash,
             fanout,
-            parent_hash,
-            backup_parent_hash,
-            child_hashes,
+            entries,
         })
+    }
+}
+
+/// Incremental change to the relay-tree map: applies on top of `epoch_from`
+/// and yields `epoch_to`. `checksum` is over the resulting full roster so a
+/// receiver that diverged detects it immediately and falls back to requesting
+/// a full map. At scale this replaces rebroadcasting the whole roster on
+/// every membership change (a join is ~40 bytes instead of 32B x members).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopologyDelta {
+    pub epoch_from: u32,
+    pub epoch_to: u32,
+    pub root_hash: u64,
+    pub fanout: u8,
+    /// FNV over the resulting roster's (peer_hash, parent_hash) pairs in
+    /// peer_hash order.
+    pub checksum: u64,
+    pub removed: Vec<u64>,
+    pub upserts: Vec<TopologyEntry>,
+}
+
+impl TopologyDelta {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(
+            4 + 4 + 8 + 1 + 8 + 2 + self.removed.len() * 8 + 2 + self.upserts.len() * 32,
+        );
+        bytes.extend_from_slice(&self.epoch_from.to_le_bytes());
+        bytes.extend_from_slice(&self.epoch_to.to_le_bytes());
+        bytes.extend_from_slice(&self.root_hash.to_le_bytes());
+        bytes.push(self.fanout);
+        bytes.extend_from_slice(&self.checksum.to_le_bytes());
+        bytes.extend_from_slice(&(self.removed.len() as u16).to_le_bytes());
+        for hash in &self.removed {
+            bytes.extend_from_slice(&hash.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(self.upserts.len() as u16).to_le_bytes());
+        for entry in &self.upserts {
+            bytes.extend_from_slice(&entry.peer_hash.to_le_bytes());
+            bytes.extend_from_slice(&entry.uuid);
+            bytes.extend_from_slice(&entry.parent_hash.to_le_bytes());
+        }
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 4 + 4 + 8 + 1 + 8 + 2 {
+            return None;
+        }
+        let epoch_from = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+        let epoch_to = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+        let root_hash = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+        let fanout = bytes[16];
+        let checksum = u64::from_le_bytes(bytes[17..25].try_into().ok()?);
+        let mut offset = 25;
+        let removed_count = u16::from_le_bytes(bytes[offset..offset + 2].try_into().ok()?) as usize;
+        offset += 2;
+        let mut removed = Vec::with_capacity(removed_count);
+        for _ in 0..removed_count {
+            if offset + 8 > bytes.len() {
+                return None;
+            }
+            removed.push(u64::from_le_bytes(
+                bytes[offset..offset + 8].try_into().ok()?,
+            ));
+            offset += 8;
+        }
+        if offset + 2 > bytes.len() {
+            return None;
+        }
+        let upsert_count = u16::from_le_bytes(bytes[offset..offset + 2].try_into().ok()?) as usize;
+        offset += 2;
+        let mut upserts = Vec::with_capacity(upsert_count);
+        for _ in 0..upsert_count {
+            if offset + 32 > bytes.len() {
+                return None;
+            }
+            let peer_hash = u64::from_le_bytes(bytes[offset..offset + 8].try_into().ok()?);
+            let uuid: [u8; 16] = bytes[offset + 8..offset + 24].try_into().ok()?;
+            let parent_hash = u64::from_le_bytes(bytes[offset + 24..offset + 32].try_into().ok()?);
+            upserts.push(TopologyEntry {
+                peer_hash,
+                uuid,
+                parent_hash,
+            });
+            offset += 32;
+        }
+        Some(Self {
+            epoch_from,
+            epoch_to,
+            root_hash,
+            fanout,
+            checksum,
+            removed,
+            upserts,
+        })
+    }
+}
+
+/// Sent by a node that wants (or needs to refresh) a slot in the relay tree.
+/// Relayed up the tree until it reaches the root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinRequest {
+    pub peer_hash: u64,
+    pub uuid: [u8; 16],
+}
+
+impl JoinRequest {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(24);
+        bytes.extend_from_slice(&self.peer_hash.to_le_bytes());
+        bytes.extend_from_slice(&self.uuid);
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 24 {
+            return None;
+        }
+        let peer_hash = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+        let uuid: [u8; 16] = bytes[8..24].try_into().ok()?;
+        Some(Self { peer_hash, uuid })
     }
 }
 
@@ -1476,10 +1552,14 @@ pub enum NetMessage {
     PlayerStateBatchEvent(PlayerStateBatch),
     /// Batched input frames (supernode relay)
     InputFrameBatchEvent(InputFrameBatch),
-    /// Topology update (multi-supernode relay tree)
+    /// Topology update (room-wide relay tree map from the root)
     TopologyUpdateEvent(TopologyUpdate),
     /// Area authority update (area ownership map)
     AreaAuthorityUpdateEvent(AreaAuthorityUpdate),
+    /// Relay-tree membership request, relayed up to the root
+    JoinRequestEvent(JoinRequest),
+    /// Incremental relay-tree map change (root-originated)
+    TopologyDeltaEvent(TopologyDelta),
 }
 
 impl NetMessage {
@@ -1634,6 +1714,16 @@ impl NetMessage {
                 bytes.extend_from_slice(&update.to_bytes());
                 bytes
             }
+            NetMessage::JoinRequestEvent(request) => {
+                let mut bytes = vec![30u8]; // Message type 30
+                bytes.extend_from_slice(&request.to_bytes());
+                bytes
+            }
+            NetMessage::TopologyDeltaEvent(delta) => {
+                let mut bytes = vec![31u8]; // Message type 31
+                bytes.extend_from_slice(&delta.to_bytes());
+                bytes
+            }
         }
     }
 
@@ -1685,6 +1775,8 @@ impl NetMessage {
             22 => TopologyUpdate::from_bytes(&bytes[1..]).map(NetMessage::TopologyUpdateEvent),
             23 => AreaAuthorityUpdate::from_bytes(&bytes[1..])
                 .map(NetMessage::AreaAuthorityUpdateEvent),
+            30 => JoinRequest::from_bytes(&bytes[1..]).map(NetMessage::JoinRequestEvent),
+            31 => TopologyDelta::from_bytes(&bytes[1..]).map(NetMessage::TopologyDeltaEvent),
             _ => None,
         }
     }
@@ -1704,6 +1796,69 @@ mod tests {
         let decoded = InputFrame::from_bytes(&bytes).expect("decode");
         assert_eq!(decoded.frame, frame.frame);
         assert_eq!(decoded.input, frame.input);
+    }
+
+    #[test]
+    fn topology_map_roundtrip() {
+        let update = TopologyUpdate {
+            epoch: 42,
+            root_hash: 0xDEAD_BEEF_CAFE_F00D,
+            fanout: 6,
+            entries: vec![
+                TopologyEntry {
+                    peer_hash: 0xDEAD_BEEF_CAFE_F00D,
+                    uuid: [1u8; 16],
+                    parent_hash: 0,
+                },
+                TopologyEntry {
+                    peer_hash: 7,
+                    uuid: [2u8; 16],
+                    parent_hash: 0xDEAD_BEEF_CAFE_F00D,
+                },
+            ],
+        };
+        let bytes = NetMessage::TopologyUpdateEvent(update.clone()).to_bytes();
+        let decoded = NetMessage::from_bytes(&bytes).expect("decode");
+        match decoded {
+            NetMessage::TopologyUpdateEvent(decoded) => assert_eq!(decoded, update),
+            other => panic!("wrong message type: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn topology_delta_roundtrip() {
+        let delta = TopologyDelta {
+            epoch_from: 7,
+            epoch_to: 9,
+            root_hash: 0xAA,
+            fanout: 8,
+            checksum: 0x1234_5678,
+            removed: vec![1, 2],
+            upserts: vec![TopologyEntry {
+                peer_hash: 3,
+                uuid: [4u8; 16],
+                parent_hash: 0xAA,
+            }],
+        };
+        let bytes = NetMessage::TopologyDeltaEvent(delta.clone()).to_bytes();
+        match NetMessage::from_bytes(&bytes).expect("decode") {
+            NetMessage::TopologyDeltaEvent(decoded) => assert_eq!(decoded, delta),
+            other => panic!("wrong message type: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_request_roundtrip() {
+        let request = JoinRequest {
+            peer_hash: 0x1234_5678_9ABC_DEF0,
+            uuid: [9u8; 16],
+        };
+        let bytes = NetMessage::JoinRequestEvent(request).to_bytes();
+        let decoded = NetMessage::from_bytes(&bytes).expect("decode");
+        match decoded {
+            NetMessage::JoinRequestEvent(decoded) => assert_eq!(decoded, request),
+            other => panic!("wrong message type: {other:?}"),
+        }
     }
 
     #[test]

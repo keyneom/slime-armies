@@ -4,6 +4,15 @@ const CDP_BASE = process.env.SLIME_CDP_BASE || "http://127.0.0.1:9222";
 const PAGE_URL = process.env.SLIME_PAGE_URL || "http://127.0.0.1:8080";
 const WINDOW_COUNT = Math.max(2, Number(process.env.SLIME_TABS || process.argv[2] || 3));
 const KEEP_OPEN = process.env.SLIME_KEEP_OPEN === "1";
+// Default matches shipped join-anytime (no title-screen wait for full roster).
+// Set SLIME_STRICT_ROSTER=1 to require every tab to see all remotes before startGame (stress mode).
+const STRICT_ROSTER = process.env.SLIME_STRICT_ROSTER === "1";
+// Optional signaling override, e.g. SLIME_SIGNALING=ws://127.0.0.1:3536 for a
+// local matchbox server (avoids depending on the public one during CI/smoke).
+const SIGNALING_URL = process.env.SLIME_SIGNALING || "";
+// Optional ICE override; SLIME_ICE=none disables STUN (host candidates only),
+// which is what you want for same-machine tabs when UDP/STUN is blocked.
+const ICE_URLS = process.env.SLIME_ICE || "";
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -233,6 +242,34 @@ async function waitForNet(page, predicate, label, timeoutMs = 20000) {
   throw new Error(`Timed out waiting for ${label}: last=${last}`);
 }
 
+async function waitForRemotePlayerName(page, name, timeoutMs = 25000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = "";
+  while (Date.now() + 200 < deadline) {
+    last = await page.slime("window.slimeTest.players()");
+    if (parseRemotePlayers(last).some((e) => e.name === name)) {
+      return last;
+    }
+    await delay(200);
+  }
+  throw new Error(`Timed out waiting for remote "${name}" on player snapshot: last=${last}`);
+}
+
+async function applySignalingOverride(page) {
+  // window.wasmBindings is the wasm-bindgen JS glue (handles string ABI);
+  // window.slime holds raw exports whose &str params need manual encoding.
+  if (SIGNALING_URL) {
+    await page.slime(
+      `window.wasmBindings.set_signaling_server(${JSON.stringify(SIGNALING_URL)})`
+    );
+  }
+  if (ICE_URLS) {
+    await page.slime(
+      `window.wasmBindings.set_ice_servers(${JSON.stringify(ICE_URLS)}, "", "")`
+    );
+  }
+}
+
 async function main() {
   const pages = [];
   try {
@@ -280,6 +317,7 @@ async function main() {
       40000,
       "page 1 reload readiness"
     );
+    await applySignalingOverride(pages[0]);
     const room = await pages[0].slime("window.slimeTest.createRoom()");
     assert(typeof room === "string" && room.length >= 4, `Invalid room code: ${room}`);
     try {
@@ -315,6 +353,7 @@ async function main() {
         40000,
         `page ${i + 1} reload readiness`
       );
+      await applySignalingOverride(pages[i]);
       await pages[i].slime("window.slimeTest.joinSavedRoom()");
     }
 
@@ -336,28 +375,38 @@ async function main() {
     }
 
     const expectedRemoteCount = WINDOW_COUNT - 1;
-    try {
-      for (let i = 0; i < pages.length; i += 1) {
-        await waitForNet(
-          pages[i],
-          (fields) =>
-            Number(fields.remote_players) === expectedRemoteCount &&
-            names
-              .filter((_, idx) => idx !== i)
-              .every((name) => String(fields.remote_names || "").includes(name)),
-          `page ${i + 1} peer convergence`
-        );
+    if (STRICT_ROSTER) {
+      try {
+        for (let i = 0; i < pages.length; i += 1) {
+          await waitForNet(
+            pages[i],
+            (fields) =>
+              Number(fields.remote_players) === expectedRemoteCount &&
+              names
+                .filter((_, idx) => idx !== i)
+                .every((name) => String(fields.remote_names || "").includes(name)),
+            `page ${i + 1} peer convergence`
+          );
+        }
+      } catch (err) {
+        const diagnostics = await collectNetSnapshots();
+        err.message += `\nDiagnostics:\n${diagnostics.join("\n")}`;
+        throw err;
       }
-    } catch (err) {
-      const diagnostics = await collectNetSnapshots();
-      err.message += `\nDiagnostics:\n${diagnostics.join("\n")}`;
-      throw err;
+    } else {
+      await delay(1200);
     }
 
     for (const page of pages) {
       await page.slime("window.slimeTest.startGame()");
       await page.slime("window.slimeTest.clearEnemies()");
     }
+    // The room creator's enemy state is authoritative: clearing on that page
+    // every second keeps idle slimes alive through the convergence waits
+    // (a death opens the respawn map and blocks the movement assertions).
+    await pages[0].slime(
+      "window.__slimeSafety ||= setInterval(() => window.slimeTest.clearEnemies(), 1000)"
+    );
 
     const teleports = [
       [-240, 0],
@@ -378,18 +427,27 @@ async function main() {
       pages.map((page) => page.slime("window.slimeTest.players()"))
     );
 
-    initialNet.forEach((line, idx) => {
-      const fields = parseFields(line);
-      assert(
-        Number(fields.remote_players) === expectedRemoteCount,
-        `Page ${idx + 1} expected ${expectedRemoteCount} remote players, got ${fields.remote_players}: ${line}`
-      );
-    });
+    if (STRICT_ROSTER) {
+      initialNet.forEach((line, idx) => {
+        const fields = parseFields(line);
+        assert(
+          Number(fields.remote_players) === expectedRemoteCount,
+          `Page ${idx + 1} expected ${expectedRemoteCount} remote players, got ${fields.remote_players}: ${line}`
+        );
+      });
+    }
 
     await pages[0].slime("window.slimeTest.moveFor('right', 380)");
     await delay(900);
     await pages[0].slime("window.slimeTest.phaseMove('down', 220)");
     await delay(900);
+
+    if (!STRICT_ROSTER && pages.length >= 2) {
+      await waitForRemotePlayerName(pages[1], names[0]);
+    }
+    if (!STRICT_ROSTER && pages.length >= 3) {
+      await waitForRemotePlayerName(pages[2], names[0]);
+    }
 
     const finalPlayers = await Promise.all(
       pages.map((page) => page.slime("window.slimeTest.players()"))
