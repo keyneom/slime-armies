@@ -137,6 +137,29 @@ players could not see each other. Root causes found (see
 - [x] Added `test_enemy_snapshot()` probe (tick, last sync tick, counts,
       sample positions) for sync debugging.
 
+### Smoothness session (2026-06-11, later)
+- [x] Client-side enemy prediction: all clients run the enemy movement AI
+      every local frame; host syncs are corrections (blend 35%, snap >240px
+      or on revival). Replaces the interpolate-between-syncs model that left
+      enemies frozen/stuttering whenever syncs slowed. Authoritative side
+      effects (waves, shrine, cannon shots, guardian regen) stay host-only;
+      clients discard predicted cannon-fire events.
+- [x] Throttled-root handoff: a root that detects sustained background
+      throttling (3+ watchdog-rate ticks) reassigns the root slot to another
+      member via the normal map mechanism and abdicates; cascades until a
+      foreground node holds it. Map-acquired hosts seed member liveness so
+      the first root pass cannot mass-prune.
+- [x] Fanout override (`test_set_fanout`, SLIME_FANOUT env in the smoke
+      harness) forces deep topologies in small rooms; 3-tab chain smoke
+      (root -> child -> grandchild) passes: names, movement, enemy sync all
+      replicate through depth 2.
+- [x] Verified live: baseline client enemy motion in 15/15 consecutive
+      500ms samples; naturally occluded host hands off within seconds and
+      the foreground player continues the world at full rate (31 unit tests
+      green).
+- [ ] Next (recommended): per-area enemy authority assigned to the nearest
+      player, with root spot-checks — see NETWORK_SCALING_PLAN.md.
+
 ### Also fixed along the way (pre-existing, exposed by the smoke run)
 - Handshakes stalled forever when STUN was unreachable: the vendored socket
   waited for ICE gathering to complete before sending any offer/answer, while

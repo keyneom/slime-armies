@@ -13,6 +13,9 @@ const SIGNALING_URL = process.env.SLIME_SIGNALING || "";
 // Optional ICE override; SLIME_ICE=none disables STUN (host candidates only),
 // which is what you want for same-machine tabs when UDP/STUN is blocked.
 const ICE_URLS = process.env.SLIME_ICE || "";
+// Optional fanout override; SLIME_FANOUT=1 turns a 3-tab room into a chain
+// (root -> child -> grandchild) to exercise depth >= 2 relay paths.
+const FANOUT = Number(process.env.SLIME_FANOUT || 0);
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -267,6 +270,9 @@ async function applySignalingOverride(page) {
     await page.slime(
       `window.wasmBindings.set_ice_servers(${JSON.stringify(ICE_URLS)}, "", "")`
     );
+  }
+  if (FANOUT > 0) {
+    await page.slime(`window.wasmBindings.test_set_fanout(${FANOUT})`);
   }
 }
 

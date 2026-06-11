@@ -152,6 +152,50 @@ discovery, everything is peer-to-peer. Where that stands:
   rAF stalls and the network clock is wall-time based, so throttled tabs
   stay in the room (slow-motion locally, live on the network).
 
+## Smoothness model (implemented 2026-06-11)
+
+- `Client-side enemy prediction`: every client runs the same enemy movement
+  AI locally each frame (motion is always smooth at the local frame rate);
+  the host remains the single authority — its periodic syncs *correct* the
+  prediction (small errors blend at 35%/sync, >240px or revivals snap), and
+  only the host produces side effects (wave/shrine spawns, cannon shot
+  events, guardian HP regen). Wave-start RNG reseeding keeps deterministic
+  spawns intact even though clients consume RNG for placeholders.
+- `Throttled-root handoff`: browsers stop rAF for occluded/backgrounded
+  tabs; the watchdog keeps such a tab alive at ~1Hz (sim catch-up ~30fps
+  effective), but that is still a poor world authority. A root that detects
+  sustained throttling hands the role to another member through the normal
+  map mechanism (epoch bump, successor's entry becomes parentless) and
+  becomes a regular member; if the successor is also throttled it hands off
+  again, cascading to a foreground node. Verified live: occluding the host
+  window migrates the role to the foreground player within ~3s and enemies
+  keep moving at full rate for everyone.
+
+## Toward area authority (recommendation, not yet implemented)
+
+The end-state the project always sketched: the player nearest an enemy
+simulates it authoritatively (their prediction is already the best source),
+with the root only arbitrating membership and area ownership. What exists
+today: area ids on hot-path entries, an area->authority map broadcast by the
+root, and now identical enemy AI running on every client. The remaining
+steps, in safe order:
+
+1. Partition authority by enemy, not by message: the root's area map assigns
+   each area's enemies to the member closest to that area (it already has
+   coarse positions). The assigned member includes only *its* areas' enemies
+   in its EnemySync; the host stops syncing those areas.
+2. Everyone else treats those syncs as corrections exactly as they treat the
+   host's today (the prediction/correction split just landed makes this a
+   routing change, not a simulation change).
+3. Conflict and anti-cheat: keep kills/deaths on the existing 2-of-N
+   confirmation path; the root spot-checks area authorities by re-simulating
+   a sampled area for a few frames and reassigns an authority whose stream
+   diverges wildly or whose kill rate is anomalous. Authority gives smooth
+   *motion*; it must not be allowed to unilaterally decide *outcomes*.
+4. Handoff hysteresis: area ownership follows the sticky-anchor rule (only
+   reassign on decisive distance change) so authority does not flap at area
+   borders.
+
 Known limits / next steps:
 - Verified in-browser at small scale plus 2,000-member unit-level tree
   tests; a real load test (hundreds of headless clients) needs a native

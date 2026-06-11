@@ -153,6 +153,9 @@ pub struct NetworkSession {
     map_anchor_counter: u32,
     /// Receiver fell out of sync with the delta stream; ask for a full map.
     needs_full_map: bool,
+    /// Test/debug override for tree fanout (forces deep topologies with few
+    /// nodes, e.g. fanout 1 turns a 3-player room into a chain).
+    fanout_override: Option<usize>,
     /// Root only: when each member's current parent was assigned.
     member_parent_since: HashMap<u64, u32>,
     /// Root only: repeated join requests from an in-roster member signal the
@@ -478,7 +481,7 @@ impl NetworkSession {
     /// roster member (root first, then join order) with spare fanout, so a
     /// join never reshuffles existing routes.
     fn pick_parent_for_new_member(&self) -> u64 {
-        let fanout = self.relay_fanout.clamp(Self::MIN_FANOUT, Self::MAX_FANOUT);
+        let fanout = self.relay_fanout.clamp(1, Self::MAX_FANOUT);
         for entry in &self.topology_roster {
             if self.roster_child_count(entry.peer_hash) < fanout {
                 return entry.peer_hash;
@@ -561,6 +564,7 @@ impl NetworkSession {
             last_broadcast_epoch: 0,
             map_anchor_counter: 0,
             needs_full_map: false,
+            fanout_override: None,
             member_parent_since: HashMap::new(),
             member_link_nags: HashMap::new(),
             reconnect_signaling: None,
@@ -1966,7 +1970,7 @@ impl NetworkSession {
     }
 
     fn pick_parent_excluding(&self, exclude: &HashSet<u64>) -> u64 {
-        let fanout = self.relay_fanout.clamp(Self::MIN_FANOUT, Self::MAX_FANOUT);
+        let fanout = self.relay_fanout.clamp(1, Self::MAX_FANOUT);
         for entry in &self.topology_roster {
             if exclude.contains(&entry.peer_hash) {
                 continue;
@@ -2054,7 +2058,10 @@ impl NetworkSession {
         }
 
         // Match fanout to room size before admitting (new members use it).
-        let fanout = Self::choose_dynamic_fanout(self.topology_roster.len().max(1));
+        let fanout = self
+            .fanout_override
+            .unwrap_or_else(|| Self::choose_dynamic_fanout(self.topology_roster.len().max(1)))
+            .clamp(1, Self::MAX_FANOUT);
         if fanout != self.relay_fanout {
             self.relay_fanout = fanout;
             self.roster_dirty = true;
@@ -2205,9 +2212,26 @@ impl NetworkSession {
             .filter(|entry| entry.parent_hash == local_hash)
             .filter_map(|entry| self.hash_to_matchbox(entry.peer_hash))
             .collect();
+        let was_host = self.is_host;
         self.is_host = my_entry
             .map(|entry| entry.parent_hash == 0)
             .unwrap_or(self.is_host);
+        if self.is_host && !was_host {
+            // Gained the root role via a map (e.g. a throttled root handed
+            // off to us). Seed liveness for inherited members so the TTL
+            // prune doesn't wipe everyone we aren't directly linked to, and
+            // force the next broadcast to be a full-map anchor.
+            for entry in &entries {
+                self.member_last_seen.insert(entry.peer_hash, current_frame);
+                self.member_parent_since
+                    .entry(entry.peer_hash)
+                    .or_insert(current_frame);
+            }
+            self.member_link_nags.clear();
+            self.last_broadcast_roster.clear();
+            self.last_broadcast_epoch = 0;
+            self.root_departure_frame = None;
+        }
 
         if self.is_host {
             self.relay_active_parent = None;
@@ -2889,6 +2913,60 @@ impl NetworkSession {
             rank,
             self.super_root_id.is_some(),
         )
+    }
+
+    /// Test/debug: force a specific tree fanout (0 clears the override).
+    pub fn set_fanout_override(&mut self, fanout: usize) {
+        self.fanout_override = if fanout == 0 { None } else { Some(fanout) };
+    }
+
+    /// Voluntary root handoff: a throttled/backgrounded root runs the world
+    /// at ~1Hz, which degrades the whole room. Reassign the root slot to
+    /// another member through the normal map mechanism and become a regular
+    /// member. If the successor is also throttled it hands off again, so the
+    /// role cascades to a foreground node.
+    pub fn handoff_root(&mut self, current_frame: u32) {
+        if !self.is_host || self.topology_roster.len() < 2 {
+            return;
+        }
+        let Some(local_hash) = self.local_peer_hash else {
+            return;
+        };
+        let successor = self
+            .topology_roster
+            .iter()
+            .filter(|entry| entry.peer_hash != local_hash)
+            .min_by(|a, b| a.uuid.cmp(&b.uuid))
+            .map(|entry| entry.peer_hash);
+        let Some(successor) = successor else {
+            return;
+        };
+        Self::log_warn(&format!(
+            "Throttled root handing off to {successor:#x} (epoch {} -> {})",
+            self.relay_epoch,
+            self.relay_epoch.wrapping_add(1)
+        ));
+        for entry in self.topology_roster.iter_mut() {
+            if entry.peer_hash == successor {
+                entry.parent_hash = 0;
+            } else if entry.peer_hash == local_hash {
+                entry.parent_hash = successor;
+            }
+        }
+        self.member_parent_since.insert(local_hash, current_frame);
+        self.member_parent_since.insert(successor, current_frame);
+        self.relay_epoch = self.relay_epoch.wrapping_add(1);
+        self.last_topology_broadcast_frame = current_frame;
+        self.roster_dirty = false;
+        // Broadcast while we still hold the role, then derive (which drops
+        // our host status since our entry now has a parent).
+        self.last_broadcast_roster.clear();
+        self.broadcast_topology_map();
+        self.last_broadcast_roster = self.topology_roster.clone();
+        self.last_broadcast_epoch = self.relay_epoch;
+        self.member_last_seen.clear();
+        self.member_link_nags.clear();
+        self.derive_links_from_roster(current_frame);
     }
 
     fn promote_self_to_root(&mut self, current_frame: u32, reason: &str) {
@@ -6732,6 +6810,74 @@ mod tests {
             session.roster_entry(hash_for(leaf)).unwrap().parent_hash,
             parent_after
         );
+    }
+
+    #[test]
+    fn throttled_root_hands_off_and_recipient_seeds_liveness() {
+        let root = peer_from(0);
+        let a = peer_from(1);
+        let b = peer_from(2);
+
+        let mut session = NetworkSession::new();
+        session.is_host = true;
+        session.local_peer_id = Some(root);
+        session.local_peer_hash = Some(hash_for(root));
+        session.relay_fanout = 4;
+        session.relay_epoch = 7;
+        session.topology_roster = vec![
+            entry_for(root, 0),
+            entry_for(a, hash_for(root)),
+            entry_for(b, hash_for(root)),
+        ];
+
+        session.handoff_root(100);
+        assert!(!session.is_host, "old root must drop the role");
+        // Successor is the lowest-uuid member.
+        assert_eq!(session.roster_root_hash(), Some(hash_for(a)));
+        assert_eq!(session.relay_parent, Some(a));
+        assert!(session.relay_epoch > 7);
+
+        // The successor adopts the map and must seed liveness for inherited
+        // members so its first root pass doesn't prune everyone.
+        let map = TopologyUpdate {
+            epoch: session.relay_epoch,
+            root_hash: hash_for(a),
+            fanout: 4,
+            entries: session.topology_roster.clone(),
+        };
+        let mut successor = NetworkSession::new();
+        successor.local_peer_id = Some(a);
+        successor.local_peer_hash = Some(hash_for(a));
+        assert!(successor.apply_topology_map("sender", &map, 200));
+        assert!(
+            successor.is_host,
+            "successor must take the role from the map"
+        );
+        successor.update_topology_as_root(210, &[]);
+        assert!(successor.roster_contains(hash_for(b)));
+        assert!(successor.roster_contains(hash_for(root)));
+    }
+
+    #[test]
+    fn fanout_override_builds_chains() {
+        let root = peer_from(0);
+        let mut session = NetworkSession::new();
+        session.is_host = true;
+        session.local_peer_id = Some(root);
+        session.local_peer_hash = Some(hash_for(root));
+        session.set_fanout_override(1);
+        session.topology_roster.push(entry_for(root, 0));
+        session.update_topology_as_root(10, &[]);
+        for i in 1..=3u128 {
+            session.add_roster_member(NetworkSession::uuid_for_peer(peer_from(i)), 10);
+        }
+        // Chain: each member has exactly one child.
+        for entry in &session.topology_roster {
+            assert!(
+                session.roster_child_count(entry.peer_hash) <= 1,
+                "fanout 1 must build a chain"
+            );
+        }
     }
 
     #[test]

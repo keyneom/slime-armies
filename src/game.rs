@@ -185,8 +185,6 @@ pub struct Game {
     /// This ensures host and client see enemies at the same visual update rate
     pub enemy_render_snapshot: Option<EnemyRenderSnapshot>,
     pub last_enemy_sync_tick: u32,
-    enemy_sync_age_frames: u32,
-    enemy_interp: EnemyInterpCache,
     pub shockwave_cooldown: i32,
     pub shockwave_timer: i32,
     pub slow_spawn_timer: i32,
@@ -213,25 +211,6 @@ pub struct EnemyRenderSnapshot {
     pub snake_positions: Vec<(Vec2, Vec2, f32, bool)>, // (pos, dir, size, alive)
     pub wisp_positions: Vec<(Vec2, Vec2, bool)>,   // (pos, dir, alive)
     pub guardian_positions: Vec<(Vec2, Vec2, bool, bool, Vec2)>, // (pos, dir, alive, strike_active, strike_pos)
-}
-
-#[derive(Clone, Copy, Default)]
-struct EnemyInterpState {
-    initialized: bool,
-    target_pos: Vec2,
-    target_dir: Vec2,
-    target_size: f32,
-    velocity: Vec2,
-}
-
-#[derive(Default)]
-struct EnemyInterpCache {
-    spiders: Vec<EnemyInterpState>,
-    cannons: Vec<EnemyInterpState>,
-    snakes: Vec<EnemyInterpState>,
-    wisps: Vec<EnemyInterpState>,
-    guardians: Vec<EnemyInterpState>,
-    window_frames: f32,
 }
 
 pub struct ChatLine {
@@ -601,8 +580,6 @@ impl Game {
             pending_respawn: false,
             enemy_render_snapshot: None,
             last_enemy_sync_tick: 0,
-            enemy_sync_age_frames: 0,
-            enemy_interp: EnemyInterpCache::default(),
             shockwave_cooldown: 0,
             shockwave_timer: 0,
             slow_spawn_timer: 0,
@@ -729,11 +706,18 @@ impl Game {
         });
     }
 
-    fn ensure_interp_slot(slots: &mut Vec<EnemyInterpState>, id: usize) -> &mut EnemyInterpState {
-        while slots.len() <= id {
-            slots.push(EnemyInterpState::default());
+    /// Reconcile a locally predicted enemy position with the authoritative
+    /// one from a host sync: small errors blend smoothly (prediction keeps
+    /// motion fluid between syncs), large errors or revivals snap.
+    fn correct_prediction(pos: &mut Vec2, authoritative: Vec2, smooth: bool) {
+        const SNAP_DIST: f32 = 240.0;
+        const BLEND: f32 = 0.35;
+        let err = authoritative - *pos;
+        if !smooth || err.length() > SNAP_DIST {
+            *pos = authoritative;
+        } else {
+            *pos += err * BLEND;
         }
-        &mut slots[id]
     }
 
     fn normalized_or(v: Vec2, fallback: Vec2) -> Vec2 {
@@ -741,136 +725,6 @@ impl Game {
             v.normalize()
         } else {
             fallback
-        }
-    }
-
-    fn blend_direction(current: Vec2, target: Vec2, velocity: Vec2) -> Vec2 {
-        let fallback = if current.length_squared() > 0.0001 {
-            current.normalize()
-        } else {
-            Vec2::new(0.0, -1.0)
-        };
-        let desired = if target.length_squared() > 0.0001 {
-            target.normalize()
-        } else if velocity.length_squared() > 0.0001 {
-            velocity.normalize()
-        } else {
-            fallback
-        };
-        Self::normalized_or(current.lerp(desired, 0.25), desired)
-    }
-
-    fn advance_enemy_interpolation(&mut self, run_enemy_ai: bool) {
-        if run_enemy_ai {
-            self.enemy_sync_age_frames = 0;
-            return;
-        }
-
-        self.enemy_sync_age_frames = self.enemy_sync_age_frames.saturating_add(1);
-        let window = self.enemy_interp.window_frames.max(2.0);
-        let base_blend = (1.2 / window).clamp(0.12, 0.35);
-        let stale_frames = (self.enemy_sync_age_frames as f32 - window).max(0.0);
-        let extrap_frames = stale_frames.min(4.0) * 0.35;
-
-        for (id, spider) in self.spiders.iter_mut().enumerate() {
-            let Some(slot) = self.enemy_interp.spiders.get_mut(id) else {
-                continue;
-            };
-            if !slot.initialized {
-                continue;
-            }
-            let mut target_pos = slot.target_pos;
-            if extrap_frames > 0.0 {
-                target_pos += slot.velocity * extrap_frames;
-            }
-            spider.pos = spider.pos.lerp(target_pos, base_blend);
-            spider.dir = Self::blend_direction(spider.dir, slot.target_dir, slot.velocity);
-            spider.speed = slot.velocity;
-        }
-
-        for (id, cannon) in self.cannons.iter_mut().enumerate() {
-            let Some(slot) = self.enemy_interp.cannons.get_mut(id) else {
-                continue;
-            };
-            if !slot.initialized {
-                continue;
-            }
-            let mut target_pos = slot.target_pos;
-            if extrap_frames > 0.0 {
-                target_pos += slot.velocity * extrap_frames;
-            }
-            let prev_pos = cannon.pos;
-            cannon.pos = cannon.pos.lerp(target_pos, base_blend);
-            cannon.look_dir =
-                Self::blend_direction(cannon.look_dir, slot.target_dir, slot.velocity);
-            let delta = cannon.pos - prev_pos;
-            if delta.length_squared() > 0.0001 {
-                cannon.dir = delta.normalize();
-                cannon.speed = delta;
-            } else {
-                cannon.dir = Self::blend_direction(cannon.dir, slot.target_dir, slot.velocity);
-                cannon.speed = slot.velocity;
-            }
-        }
-
-        for (id, snake) in self.snakes.iter_mut().enumerate() {
-            let Some(slot) = self.enemy_interp.snakes.get_mut(id) else {
-                continue;
-            };
-            if !slot.initialized {
-                continue;
-            }
-            let mut target_pos = slot.target_pos;
-            if extrap_frames > 0.0 {
-                target_pos += slot.velocity * extrap_frames;
-            }
-            let prev_pos = snake.pos;
-            snake.pos = snake.pos.lerp(target_pos, base_blend);
-            snake.dir = Self::blend_direction(snake.dir, slot.target_dir, slot.velocity);
-            snake.size += (slot.target_size - snake.size) * 0.25;
-            let delta = snake.pos - prev_pos;
-            snake.speed = if delta.length_squared() > 0.0001 {
-                delta
-            } else {
-                slot.velocity
-            };
-        }
-
-        for (id, wisp) in self.wisps.iter_mut().enumerate() {
-            let Some(slot) = self.enemy_interp.wisps.get_mut(id) else {
-                continue;
-            };
-            if !slot.initialized {
-                continue;
-            }
-            let mut target_pos = slot.target_pos;
-            if extrap_frames > 0.0 {
-                target_pos += slot.velocity * extrap_frames;
-            }
-            wisp.pos = wisp.pos.lerp(target_pos, base_blend);
-            wisp.dir = Self::blend_direction(wisp.dir, slot.target_dir, slot.velocity);
-        }
-
-        for (id, guardian) in self.guardians.iter_mut().enumerate() {
-            let Some(slot) = self.enemy_interp.guardians.get_mut(id) else {
-                continue;
-            };
-            if !slot.initialized {
-                continue;
-            }
-            let mut target_pos = slot.target_pos;
-            if extrap_frames > 0.0 {
-                target_pos += slot.velocity * extrap_frames;
-            }
-            let prev_pos = guardian.pos;
-            guardian.pos = guardian.pos.lerp(target_pos, base_blend);
-            guardian.dir = Self::blend_direction(guardian.dir, slot.target_dir, slot.velocity);
-            let delta = guardian.pos - prev_pos;
-            guardian.speed = if delta.length_squared() > 0.0001 {
-                delta
-            } else {
-                slot.velocity
-            };
         }
     }
 
@@ -1076,17 +930,19 @@ impl Game {
         // Player count includes self + all remote players (alive or dead, they're still in the game)
         let player_count = 1 + remote_players.len();
 
-        // Host runs enemy AI (authoritative simulation)
-        // Clients do NOT run enemy AI - they receive positions from host via enemy sync
-        let run_enemy_ai = is_host;
-        self.update_game_with_targets(input, &target_positions, run_enemy_ai, player_count);
+        // Everyone runs the enemy movement AI locally so motion stays smooth
+        // at the local frame rate no matter how often (or rarely) the host
+        // ticks; the host's simulation remains authoritative — its periodic
+        // syncs correct our prediction, and only the host produces side
+        // effects (wave spawns, shrine bosses, cannon shot events).
+        self.update_game_with_targets(input, &target_positions, is_host, player_count);
     }
 
     fn update_game_with_targets(
         &mut self,
         input: &Input,
         target_positions: &[Vec2],
-        run_enemy_ai: bool,
+        authoritative: bool,
         player_count: usize,
     ) {
         let player_pos = self.player.pos;
@@ -1123,7 +979,7 @@ impl Game {
         self.update_slime_trail();
 
         let player_stationary = input.axis.length() < 0.05;
-        if run_enemy_ai && !self.guardians.is_empty() {
+        if authoritative && !self.guardians.is_empty() {
             for guardian in &mut self.guardians {
                 guardian.regen_tick(player_stationary, SPAWN_CHUNK_COOLDOWN_FRAMES);
             }
@@ -1144,12 +1000,12 @@ impl Game {
         // Update chunks around all active players (host uses all for enemy AI)
         self.chunks.update_for_positions(target_positions);
 
-        if run_enemy_ai && self.wave == 0 && self.player.alive {
+        if authoritative && self.wave == 0 && self.player.alive {
             self.spawn_wave_for_players(player_count, target_positions);
         }
 
         let view_radius = half_w.max(half_h) * 1.2;
-        self.check_shrine_boss(target_positions, run_enemy_ai, view_radius);
+        self.check_shrine_boss(target_positions, authoritative, view_radius);
         if self.player.pos.distance(SHRINE_POS) < SHRINE_TRIGGER_DISTANCE {
             if !self.shrine_badge_unlocked {
                 self.shrine_badge_unlocked = true;
@@ -1166,7 +1022,7 @@ impl Game {
             self.explored_chunks.insert((cx, cy));
         }
 
-        if run_enemy_ai && self.wave > 0 {
+        if authoritative && self.wave > 0 {
             self.update_spawn_budget(target_positions, player_count);
             self.try_spawn_from_budget(target_positions, frame_count);
         }
@@ -1203,9 +1059,6 @@ impl Game {
         // Get visible bounds (for future culling optimizations)
         let _visible_bounds = self.camera.visible_bounds();
 
-        // On clients, move enemies smoothly between authoritative sync packets.
-        self.advance_enemy_interpolation(run_enemy_ai);
-
         // Collect actions to avoid borrow conflicts
         let mut player_killed = false;
         let mut player_killed_by: Option<(u8, u16)> = None;
@@ -1227,8 +1080,8 @@ impl Game {
         // Update spiders and collect collisions (with obstacle awareness)
         for (i, spider) in self.spiders.iter_mut().enumerate() {
             if spider.alive {
-                // Only run enemy AI if we're the host (or single player)
-                if run_enemy_ai {
+                // Movement runs everywhere (local prediction); host syncs correct it.
+                {
                     // Find closest player for this enemy
                     let target = Self::find_closest_target(spider.pos, target_positions);
                     let prev_pos = spider.pos;
@@ -1278,7 +1131,7 @@ impl Game {
         // Update wisps and collect collisions
         for (i, wisp) in self.wisps.iter_mut().enumerate() {
             if wisp.alive {
-                if run_enemy_ai {
+                {
                     let target = Self::find_closest_target(wisp.pos, target_positions);
                     let prev_pos = wisp.pos;
                     let prev_dir = wisp.dir;
@@ -1342,7 +1195,7 @@ impl Game {
                     }
                 }
                 let closest_target = Self::find_closest_target(guardian.pos, target_positions);
-                if run_enemy_ai {
+                {
                     let home = guardian.home_pos;
                     let dist_from_home = guardian.pos.distance(home);
                     let leash_strength = (dist_from_home / 200.0).clamp(0.0, 1.0);
@@ -1466,7 +1319,7 @@ impl Game {
         // Update cannons and collect collisions (with obstacle awareness)
         for (i, cannon) in self.cannons.iter_mut().enumerate() {
             if cannon.alive {
-                if run_enemy_ai {
+                {
                     // Cannons shoot when on screen for any player camera
                     let on_screen = target_positions.iter().any(|target| {
                         cannon.pos.x + 50.0 >= target.x - half_w
@@ -1485,18 +1338,23 @@ impl Game {
                             event = None;
                         }
                     }
-                    if let Some(event) = event {
-                        match event {
-                            CannonEvent::Shoot { pos, speed } => {
-                                let shot = crate::net::CannonShot {
-                                    id: self.projectiles.reserve_id(),
-                                    x: pos.x,
-                                    y: pos.y,
-                                    vx: speed.x,
-                                    vy: speed.y,
-                                };
-                                new_projectiles.push(shot);
-                                self.pending_cannon_shots.push(shot);
+                    // Aiming/cooldowns are predicted everywhere, but actual
+                    // shots are host events: clients receive CannonShotEvent
+                    // and must not double-spawn projectiles locally.
+                    if authoritative {
+                        if let Some(event) = event {
+                            match event {
+                                CannonEvent::Shoot { pos, speed } => {
+                                    let shot = crate::net::CannonShot {
+                                        id: self.projectiles.reserve_id(),
+                                        x: pos.x,
+                                        y: pos.y,
+                                        vx: speed.x,
+                                        vy: speed.y,
+                                    };
+                                    new_projectiles.push(shot);
+                                    self.pending_cannon_shots.push(shot);
+                                }
                             }
                         }
                     }
@@ -1521,7 +1379,7 @@ impl Game {
         }
 
         // Update snakes (back to front for segment following)
-        if run_enemy_ai {
+        {
             for i in (0..self.snakes.len()).rev() {
                 if self.snakes[i].alive {
                     let previous = if i > 0
@@ -1813,7 +1671,7 @@ impl Game {
         self.explosions.update();
 
         // Check for wave progression based on kill target
-        if run_enemy_ai && self.wave_targets_met() {
+        if authoritative && self.wave_targets_met() {
             self.spawn_wave_for_players(player_count, target_positions);
         }
 
@@ -1830,10 +1688,10 @@ impl Game {
     fn check_shrine_boss(
         &mut self,
         target_positions: &[Vec2],
-        run_enemy_ai: bool,
+        authoritative: bool,
         view_radius: f32,
     ) {
-        if self.shrine_triggered || !run_enemy_ai {
+        if self.shrine_triggered || !authoritative {
             return;
         }
         let triggered = target_positions
@@ -3007,8 +2865,6 @@ impl Game {
         self.remote_simulations.clear();
         self.remote_predictions.clear();
         self.last_enemy_sync_tick = 0;
-        self.enemy_sync_age_frames = 0;
-        self.enemy_interp = EnemyInterpCache::default();
         self.enemy_render_snapshot = None;
         self.wave_kill_counts = [0; 4];
         self.wave_kill_targets = [0; 4];
@@ -3087,8 +2943,6 @@ impl Game {
         self.remote_simulations.clear();
         self.remote_predictions.clear();
         self.last_enemy_sync_tick = 0;
-        self.enemy_sync_age_frames = 0;
-        self.enemy_interp = EnemyInterpCache::default();
         self.enemy_render_snapshot = None;
         self.wave_kill_counts = [0; 4];
         self.wave_kill_targets = [0; 4];
@@ -3632,11 +3486,7 @@ impl Game {
         if sync.tick <= self.last_enemy_sync_tick {
             return;
         }
-        let previous_tick = self.last_enemy_sync_tick;
-        let sync_dt = sync.tick.saturating_sub(previous_tick).max(1) as f32;
         self.last_enemy_sync_tick = sync.tick;
-        self.enemy_sync_age_frames = 0;
-        self.enemy_interp.window_frames = sync_dt.clamp(2.0, 18.0);
 
         // Update wave if it changed
         if sync.wave != self.wave {
@@ -3647,7 +3497,6 @@ impl Game {
             self.snakes.clear();
             self.wisps.clear();
             self.guardians.clear();
-            self.enemy_interp = EnemyInterpCache::default();
         }
 
         // Process each enemy in the sync
@@ -3674,21 +3523,12 @@ impl Game {
                         ));
                     }
                     let spider = &mut self.spiders[id];
-                    let slot = Self::ensure_interp_slot(&mut self.enemy_interp.spiders, id);
-
-                    if slot.initialized {
-                        let observed_velocity = (target_pos - slot.target_pos) / sync_dt;
-                        slot.velocity = slot.velocity * 0.45 + observed_velocity * 0.55;
-                    } else {
-                        slot.initialized = true;
-                        slot.velocity = Vec2::ZERO;
-                        spider.pos = target_pos;
-                    }
-
-                    slot.target_pos = target_pos;
-                    slot.target_dir = Self::normalized_or(target_dir, spider.dir);
+                    let was_alive = spider.alive;
                     spider.alive = alive;
-                    if !alive {
+                    if alive {
+                        Self::correct_prediction(&mut spider.pos, target_pos, was_alive);
+                        spider.dir = Self::normalized_or(target_dir, spider.dir);
+                    } else {
                         spider.pos = target_pos;
                         spider.speed = Vec2::ZERO;
                     }
@@ -3704,21 +3544,12 @@ impl Game {
                         ));
                     }
                     let cannon = &mut self.cannons[id];
-                    let slot = Self::ensure_interp_slot(&mut self.enemy_interp.cannons, id);
-
-                    if slot.initialized {
-                        let observed_velocity = (target_pos - slot.target_pos) / sync_dt;
-                        slot.velocity = slot.velocity * 0.45 + observed_velocity * 0.55;
-                    } else {
-                        slot.initialized = true;
-                        slot.velocity = Vec2::ZERO;
-                        cannon.pos = target_pos;
-                    }
-
-                    slot.target_pos = target_pos;
-                    slot.target_dir = Self::normalized_or(target_dir, cannon.look_dir);
+                    let was_alive = cannon.alive;
                     cannon.alive = alive;
-                    if !alive {
+                    if alive {
+                        Self::correct_prediction(&mut cannon.pos, target_pos, was_alive);
+                        cannon.look_dir = Self::normalized_or(target_dir, cannon.look_dir);
+                    } else {
                         cannon.pos = target_pos;
                         cannon.speed = Vec2::ZERO;
                     }
@@ -3740,27 +3571,16 @@ impl Game {
                         ));
                     }
                     let snake = &mut self.snakes[id];
-                    let slot = Self::ensure_interp_slot(&mut self.enemy_interp.snakes, id);
                     let target_size = enemy_state.snake_size();
-
-                    if slot.initialized {
-                        let observed_velocity = (target_pos - slot.target_pos) / sync_dt;
-                        slot.velocity = slot.velocity * 0.45 + observed_velocity * 0.55;
-                    } else {
-                        slot.initialized = true;
-                        slot.velocity = Vec2::ZERO;
-                        snake.pos = target_pos;
-                        snake.size = target_size;
-                    }
-
-                    slot.target_pos = target_pos;
-                    slot.target_dir = Self::normalized_or(target_dir, snake.dir);
-                    slot.target_size = target_size;
+                    let was_alive = snake.alive;
                     snake.alive = alive;
-                    if !alive {
+                    snake.size = target_size;
+                    if alive {
+                        Self::correct_prediction(&mut snake.pos, target_pos, was_alive);
+                        snake.dir = Self::normalized_or(target_dir, snake.dir);
+                    } else {
                         snake.pos = target_pos;
                         snake.speed = Vec2::ZERO;
-                        snake.size = target_size;
                     }
                 }
                 EnemyType::Wisp => {
@@ -3773,21 +3593,12 @@ impl Game {
                         ));
                     }
                     let wisp = &mut self.wisps[id];
-                    let slot = Self::ensure_interp_slot(&mut self.enemy_interp.wisps, id);
-
-                    if slot.initialized {
-                        let observed_velocity = (target_pos - slot.target_pos) / sync_dt;
-                        slot.velocity = slot.velocity * 0.45 + observed_velocity * 0.55;
-                    } else {
-                        slot.initialized = true;
-                        slot.velocity = Vec2::ZERO;
-                        wisp.pos = target_pos;
-                    }
-
-                    slot.target_pos = target_pos;
-                    slot.target_dir = Self::normalized_or(target_dir, wisp.dir);
+                    let was_alive = wisp.alive;
                     wisp.alive = alive;
-                    if !alive {
+                    if alive {
+                        Self::correct_prediction(&mut wisp.pos, target_pos, was_alive);
+                        wisp.dir = Self::normalized_or(target_dir, wisp.dir);
+                    } else {
                         wisp.pos = target_pos;
                     }
                 }
@@ -3800,21 +3611,12 @@ impl Game {
                         ));
                     }
                     let guardian = &mut self.guardians[id];
-                    let slot = Self::ensure_interp_slot(&mut self.enemy_interp.guardians, id);
-
-                    if slot.initialized {
-                        let observed_velocity = (target_pos - slot.target_pos) / sync_dt;
-                        slot.velocity = slot.velocity * 0.45 + observed_velocity * 0.55;
-                    } else {
-                        slot.initialized = true;
-                        slot.velocity = Vec2::ZERO;
-                        guardian.pos = target_pos;
-                    }
-
-                    slot.target_pos = target_pos;
-                    slot.target_dir = Self::normalized_or(target_dir, guardian.dir);
+                    let was_alive = guardian.alive;
                     guardian.alive = alive;
-                    if !alive {
+                    if alive {
+                        Self::correct_prediction(&mut guardian.pos, target_pos, was_alive);
+                        guardian.dir = Self::normalized_or(target_dir, guardian.dir);
+                    } else {
                         guardian.pos = target_pos;
                         guardian.speed = Vec2::ZERO;
                     }

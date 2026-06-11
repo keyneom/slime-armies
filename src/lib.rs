@@ -464,6 +464,7 @@ pub fn main() -> Result<(), JsValue> {
         last_supernode_id: None,
         last_enemy_sync_sent_frame: 0,
         last_tick_net_frame: 0,
+        throttled_ticks: 0,
     }));
 
     // Store state in thread-local for JS access
@@ -977,6 +978,23 @@ pub fn test_enemy_snapshot() -> String {
     })
 }
 
+/// Test/debug: force a relay-tree fanout (0 clears). Lets small test rooms
+/// form deep chains to exercise depth >= 2 relay paths.
+#[wasm_bindgen]
+pub fn test_set_fanout(fanout: u32) {
+    GAME_STATE.with(|gs| {
+        let Ok(game_state) = gs.try_borrow() else {
+            return;
+        };
+        if let Some(state) = game_state.as_ref() {
+            let Ok(mut state_ref) = state.try_borrow_mut() else {
+                return;
+            };
+            state_ref.network.set_fanout_override(fanout as usize);
+        }
+    })
+}
+
 /// Test/debug: root-failover predicate internals.
 #[wasm_bindgen]
 pub fn test_failover_diag() -> String {
@@ -1150,6 +1168,8 @@ struct GameState {
     last_enemy_sync_sent_frame: u32,
     /// Wall-clock net frame of the previous tick (sim catch-up bookkeeping).
     last_tick_net_frame: u32,
+    /// Consecutive heavily-throttled ticks (background tab detection).
+    throttled_ticks: u32,
 }
 
 fn persist_name_reservation_cache(network: &NetworkSession) {
@@ -2549,6 +2569,22 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
             // a long stall fast-forwards gradually instead of in one burst.
             let net_delta = frame_count.saturating_sub(state_ref.last_tick_net_frame);
             state_ref.last_tick_net_frame = frame_count;
+            // Background/occluded tab detection: rAF has stalled and the
+            // watchdog is driving us at ~1-2Hz. A throttled node makes a poor
+            // world authority, so a throttled root hands the role to another
+            // member (cascading until a foreground node holds it).
+            if net_delta >= 20 {
+                state_ref.throttled_ticks = state_ref.throttled_ticks.saturating_add(1);
+            } else {
+                state_ref.throttled_ticks = 0;
+            }
+            if state_ref.throttled_ticks >= 3
+                && state_ref.network.is_host
+                && state_ref.network.peer_count() > 0
+            {
+                state_ref.network.handoff_root(frame_count);
+                state_ref.throttled_ticks = 0;
+            }
             let sim_steps = if state_ref.game.scene == Scene::Game {
                 net_delta.clamp(1, 30)
             } else {
