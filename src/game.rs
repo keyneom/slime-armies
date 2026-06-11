@@ -184,7 +184,7 @@ pub struct Game {
     /// Snapshot of enemy positions for consistent rendering (updated at sync rate)
     /// This ensures host and client see enemies at the same visual update rate
     pub enemy_render_snapshot: Option<EnemyRenderSnapshot>,
-    last_enemy_sync_tick: u32,
+    pub last_enemy_sync_tick: u32,
     enemy_sync_age_frames: u32,
     enemy_interp: EnemyInterpCache,
     pub shockwave_cooldown: i32,

@@ -163,7 +163,11 @@ where
     F: Future<Output = HandshakeResult<D, M>>,
     D: PeerDataSender,
 {
-    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(6);
+    // Worst case before the answer even arrives: offerer ICE-gathering cap
+    // (3s) + signaling latency + answerer ICE-gathering cap (3s) + data
+    // channel open. 6s used to deterministically timeout slow-ICE peers into
+    // an infinite retry loop.
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
     let mut timeout = Delay::new(HANDSHAKE_TIMEOUT).fuse();
     let mut future = Box::pin(future).fuse();

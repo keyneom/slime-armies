@@ -1453,6 +1453,10 @@ impl NetworkSession {
                 continue;
             }
             for entry in &batch.entries {
+                // Root liveness: a member whose state is still flowing up the
+                // tree is alive, even at depth >= 2 where it never talks to
+                // the root directly.
+                self.note_member_seen(entry.peer_hash, current_frame);
                 let peer_id = self.resolve_or_register_peer_hash(entry.peer_hash);
                 if self.is_local_peer_str(&peer_id) {
                     continue;
@@ -1494,6 +1498,7 @@ impl NetworkSession {
                 continue;
             }
             for entry in &batch.entries {
+                self.note_member_seen(entry.peer_hash, current_frame);
                 let peer_id = self.resolve_or_register_peer_hash(entry.peer_hash);
                 self.pending_input_frames.push((peer_id, entry.frame));
             }
@@ -3329,12 +3334,10 @@ impl NetworkSession {
         if self.relay_epoch > update.epoch {
             return;
         }
-        if let Some(root) = self.super_root_id {
-            if let Some(sender_id) = self.peer_id_lookup.get(sender) {
-                if *sender_id != root {
-                    return;
-                }
-            }
+        // The map is root-originated but arrives via the tree: depth >= 2
+        // nodes receive it from their parent, not from the root directly.
+        if !(self.is_supernode_sender(sender) || self.is_parent_sender(sender)) {
+            return;
         }
         self.area_authorities = update
             .entries

@@ -462,6 +462,8 @@ pub fn main() -> Result<(), JsValue> {
         send_counter: 0,
         input_send_counter: 0,
         last_supernode_id: None,
+        last_enemy_sync_sent_frame: 0,
+        last_tick_net_frame: 0,
     }));
 
     // Store state in thread-local for JS access
@@ -926,6 +928,55 @@ pub fn test_runtime_state() -> String {
     })
 }
 
+/// Test/debug: enemy counts and a few live positions, to observe whether the
+/// authoritative simulation and enemy sync are actually moving things.
+#[wasm_bindgen]
+pub fn test_enemy_snapshot() -> String {
+    GAME_STATE.with(|gs| {
+        let Ok(game_state) = gs.try_borrow() else {
+            return "busy".to_string();
+        };
+        if let Some(state) = game_state.as_ref() {
+            let Ok(state_ref) = state.try_borrow() else {
+                return "busy".to_string();
+            };
+            let game = &state_ref.game;
+            let alive = |count: usize| -> String { count.to_string() };
+            let mut out = format!(
+                "tick={};sync_tick={};wave={};spiders={};cannons={};snakes={};wisps={}",
+                game.frame_count,
+                game.last_enemy_sync_tick,
+                game.wave,
+                alive(game.spiders.iter().filter(|e| e.alive).count()),
+                alive(game.cannons.iter().filter(|e| e.alive).count()),
+                alive(game.snakes.iter().filter(|e| e.alive).count()),
+                alive(game.wisps.iter().filter(|e| e.alive).count()),
+            );
+            for spider in game.spiders.iter().filter(|e| e.alive).take(3) {
+                out.push_str(&format!(
+                    ";spider{}={:.1},{:.1}",
+                    spider.id, spider.pos.x, spider.pos.y
+                ));
+            }
+            for snake in game.snakes.iter().filter(|e| e.alive).take(2) {
+                out.push_str(&format!(
+                    ";snake{}={:.1},{:.1}",
+                    snake.id, snake.pos.x, snake.pos.y
+                ));
+            }
+            for wisp in game.wisps.iter().filter(|e| e.alive).take(2) {
+                out.push_str(&format!(
+                    ";wisp{}={:.1},{:.1}",
+                    wisp.id, wisp.pos.x, wisp.pos.y
+                ));
+            }
+            out
+        } else {
+            "uninitialized".to_string()
+        }
+    })
+}
+
 /// Test/debug: root-failover predicate internals.
 #[wasm_bindgen]
 pub fn test_failover_diag() -> String {
@@ -1092,6 +1143,13 @@ struct GameState {
     send_counter: u32,       // Send network updates every N frames
     input_send_counter: u32, // Send input frames every N frames
     last_supernode_id: Option<matchbox_socket::PeerId>,
+    /// Wall-clock net frame when the host last sent an enemy sync. Cadence
+    /// must be delta-based: a throttled tab's net clock jumps in fixed steps
+    /// (e.g. exactly 30 or 60 per watchdog tick), so `frame % stride == 0`
+    /// can lock onto a non-zero residue and never fire again.
+    last_enemy_sync_sent_frame: u32,
+    /// Wall-clock net frame of the previous tick (sim catch-up bookkeeping).
+    last_tick_net_frame: u32,
 }
 
 fn persist_name_reservation_cache(network: &NetworkSession) {
@@ -2484,15 +2542,35 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
             }
 
             let prev_scene = state_ref.game.scene;
-            if in_multiplayer_room {
-                // Clone remote players to avoid borrow conflict
-                let remote_players = state_ref.network.remote_players.clone();
-                let is_host = state_ref.network.is_host;
-                state_ref
-                    .game
-                    .update_multiplayer(&input_snapshot, &remote_players, is_host);
+            // Sim catch-up: occluded/background tabs tick at ~1-2Hz (rAF stops,
+            // the watchdog drives the loop) while wall time keeps moving. Run
+            // extra sim steps to track real time so a backgrounded host does
+            // not freeze the authoritative world for everyone else. Capped so
+            // a long stall fast-forwards gradually instead of in one burst.
+            let net_delta = frame_count.saturating_sub(state_ref.last_tick_net_frame);
+            state_ref.last_tick_net_frame = frame_count;
+            let sim_steps = if state_ref.game.scene == Scene::Game {
+                net_delta.clamp(1, 30)
             } else {
-                state_ref.game.update(&input_snapshot);
+                1
+            };
+            let mut step_input = input_snapshot.clone();
+            for step in 0..sim_steps {
+                if in_multiplayer_room {
+                    // Clone remote players to avoid borrow conflict
+                    let remote_players = state_ref.network.remote_players.clone();
+                    let is_host = state_ref.network.is_host;
+                    state_ref
+                        .game
+                        .update_multiplayer(&step_input, &remote_players, is_host);
+                } else {
+                    state_ref.game.update(&step_input);
+                }
+                if step + 1 < sim_steps {
+                    // Degrade edge-triggered inputs to holds for the
+                    // fast-forwarded steps, exactly as real frames would.
+                    step_input.end_frame();
+                }
             }
             state_ref.input.end_frame();
 
@@ -3004,13 +3082,19 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 if state_ref.network.is_host {
                     // Host: increase cadence in small rooms for smoother remote motion,
                     // then back off under congestion.
-                    let enemy_sync_stride = match congestion {
+                    let enemy_sync_stride: u32 = match congestion {
                         0 if low_fanout_room => 4,
                         0 => 5,
                         1 => 6,
                         _ => 8,
                     };
-                    if frame_count % enemy_sync_stride == 0 {
+                    // Delta-based, never modulo: the wall-clock frame counter
+                    // advances in fixed jumps on throttled tabs, which makes
+                    // `% stride` lock onto a non-zero residue forever.
+                    if frame_count.saturating_sub(state_ref.last_enemy_sync_sent_frame)
+                        >= enemy_sync_stride
+                    {
+                        state_ref.last_enemy_sync_sent_frame = frame_count;
                         let enemy_sync = state_ref.game.create_enemy_sync();
                         state_ref.network.send_enemy_sync(enemy_sync);
                     }

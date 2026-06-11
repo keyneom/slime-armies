@@ -112,6 +112,31 @@ players could not see each other. Root causes found (see
 - [x] 29 unit tests green; smoke PASS; server-restart drill PASS;
       creator-kill drill PASS (chained after the server outage).
 
+### Live-test fixes (2026-06-11, from real two-profile testing + review)
+- [x] Frozen enemies: enemy-sync cadence used `frame % stride == 0` on the
+      wall-clock net frame counter. Occluded/background tabs tick on the
+      watchdog at exactly 500/1000ms, so the counter advances in fixed jumps
+      (30/60) and the modulo locks onto a non-zero residue — enemy sync never
+      fires again while player updates (counter-based) keep flowing. Cadence
+      is now delta-based. Repro showed client spiders frozen bit-identical
+      for 30s; post-fix they track the host in lockstep.
+- [x] Sim catch-up: a hidden host used to simulate at ~1 frame/s (frozen
+      world for everyone). The tick now runs up to 30 extra sim steps to
+      track wall time, with edge inputs degraded to holds across the
+      fast-forwarded steps. A fully occluded host now simulates ~30 fps
+      effective.
+- [x] Review P1: root member TTL is now refreshed from relayed batch entries
+      (`note_member_seen` per entry), so depth >= 2 members aren't pruned
+      while their state is actively flowing.
+- [x] Review P1: handshake timeout raised 6s -> 15s (the wasm ICE-gathering
+      cap can eat 3s on each side before the answer is even sent; 6s could
+      deterministically timeout slow-ICE peers into a retry loop).
+- [x] Review P2: area-authority updates are now accepted from the parent
+      path (they're root-originated but tree-forwarded), so depth >= 2 nodes
+      get real area maps instead of keeping stale/empty ones.
+- [x] Added `test_enemy_snapshot()` probe (tick, last sync tick, counts,
+      sample positions) for sync debugging.
+
 ### Also fixed along the way (pre-existing, exposed by the smoke run)
 - Handshakes stalled forever when STUN was unreachable: the vendored socket
   waited for ICE gathering to complete before sending any offer/answer, while
