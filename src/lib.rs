@@ -2578,7 +2578,7 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
             } else {
                 state_ref.throttled_ticks = 0;
             }
-            if state_ref.throttled_ticks >= 3
+            if state_ref.throttled_ticks >= 5
                 && state_ref.network.is_host
                 && state_ref.network.peer_count() > 0
             {
@@ -3107,38 +3107,48 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     state_ref.game.apply_projectile_reflection(reflection);
                 }
 
-                // AUTHORITATIVE HOST MODEL:
-                // Host runs the enemy simulation and sends positions to all clients.
-                // Clients do NOT run enemy AI - they only receive and interpolate positions.
-                // This ensures all players see enemies in the same locations.
+                // PER-AREA AUTHORITY MODEL:
+                // Every node simulates all enemies locally (prediction). The
+                // player nearest an area owns its enemies and broadcasts
+                // corrections for them; the host covers unassigned areas and
+                // remains sole authority for world events (waves, spawns).
                 let congestion = state_ref.network.relay_congestion_level();
                 let room_players = state_ref.network.peer_count() + 1;
                 let low_fanout_room = room_players <= 8;
+                let is_host = state_ref.network.is_host;
 
-                if state_ref.network.is_host {
-                    // Host: increase cadence in small rooms for smoother remote motion,
-                    // then back off under congestion.
-                    let enemy_sync_stride: u32 = match congestion {
-                        0 if low_fanout_room => 4,
-                        0 => 5,
-                        1 => 6,
-                        _ => 8,
-                    };
-                    // Delta-based, never modulo: the wall-clock frame counter
-                    // advances in fixed jumps on throttled tabs, which makes
-                    // `% stride` lock onto a non-zero residue forever.
-                    if frame_count.saturating_sub(state_ref.last_enemy_sync_sent_frame)
-                        >= enemy_sync_stride
-                    {
-                        state_ref.last_enemy_sync_sent_frame = frame_count;
-                        let enemy_sync = state_ref.game.create_enemy_sync();
-                        state_ref.network.send_enemy_sync(enemy_sync);
+                let enemy_sync_stride: u32 = match congestion {
+                    0 if low_fanout_room => 4,
+                    0 => 5,
+                    1 => 6,
+                    _ => 8,
+                };
+                // Delta-based, never modulo: the wall-clock frame counter
+                // advances in fixed jumps on throttled tabs, which makes
+                // `% stride` lock onto a non-zero residue forever.
+                if frame_count.saturating_sub(state_ref.last_enemy_sync_sent_frame)
+                    >= enemy_sync_stride
+                {
+                    state_ref.last_enemy_sync_sent_frame = frame_count;
+                    let owned = state_ref.network.owned_area_ids();
+                    if is_host || !owned.is_empty() {
+                        let assigned = state_ref.network.assigned_area_ids();
+                        let enemy_sync = state_ref
+                            .game
+                            .create_enemy_sync_in_areas(&owned, &assigned, is_host);
+                        if !enemy_sync.enemies.is_empty() {
+                            state_ref.network.send_enemy_sync(enemy_sync);
+                        }
                     }
-                } else {
-                    // Client: Always apply enemy sync from host (this IS the authoritative state)
-                    if let Some(sync) = state_ref.network.take_enemy_sync() {
-                        state_ref.game.apply_enemy_sync(&sync);
+                }
+                // Everyone applies incoming corrections (already filtered to
+                // areas their origin legitimately owns).
+                for (origin, from_host, sync) in state_ref.network.take_enemy_syncs() {
+                    state_ref.game.apply_enemy_sync(&sync, origin, from_host);
+                    if !is_host {
                         state_ref.game.clear_respawn_sync();
+                    }
+                    if from_host {
                         state_ref.network.mark_enemy_sync_received(frame_count);
                     }
                 }

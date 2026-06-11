@@ -1,3 +1,7 @@
 /target
 /dist
 /original-game
+matchbox-server/target
+matchbox-server/Cargo.lock
+.DS_Store
+node_modules

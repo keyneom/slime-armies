@@ -156,6 +156,10 @@ pub struct NetworkSession {
     /// Test/debug override for tree fanout (forces deep topologies with few
     /// nodes, e.g. fanout 1 turns a 3-player room into a chain).
     fanout_override: Option<usize>,
+    /// Frame at which we last acquired the root role (handoff hysteresis:
+    /// a fresh root holds the role for a settle period before it may hand
+    /// off again, so alt-tabbing players don't ping-pong the role).
+    root_acquired_frame: u32,
     /// Root only: when each member's current parent was assigned.
     member_parent_since: HashMap<u64, u32>,
     /// Root only: repeated join requests from an in-roster member signal the
@@ -199,8 +203,9 @@ pub struct NetworkSession {
     /// broadcast and `send_*` routing—not necessarily the player who clicked "create room".
     /// Game simulation authority (waves/enemy sync) currently follows this same flag.
     pub is_host: bool,
-    /// Received enemy sync from host (for clients)
-    pub pending_enemy_sync: Option<EnemySync>,
+    /// Received enemy-sync corrections: (origin hash, origin-is-host, sync).
+    /// Multiple per frame are normal once per-area authorities are active.
+    pub pending_enemy_syncs: Vec<(u64, bool, EnemySync)>,
     /// Received enemy damage events (for host)
     pub pending_enemy_damage: Vec<EnemyDamage>,
     /// Received wave start events (for deterministic spawning)
@@ -330,6 +335,10 @@ impl NetworkSession {
     fn interest_radius_sq() -> f32 {
         let radius = 1800.0;
         radius * radius
+    }
+
+    pub fn area_id_for_pos(pos: Vec2) -> u32 {
+        Self::area_id_from_pos(pos)
     }
 
     fn area_id_from_pos(pos: Vec2) -> u32 {
@@ -565,6 +574,7 @@ impl NetworkSession {
             map_anchor_counter: 0,
             needs_full_map: false,
             fanout_override: None,
+            root_acquired_frame: 0,
             member_parent_since: HashMap::new(),
             member_link_nags: HashMap::new(),
             reconnect_signaling: None,
@@ -600,7 +610,7 @@ impl NetworkSession {
             peer_identity_lookup: HashMap::new(),
             pending_messages: Vec::new(),
             is_host: false,
-            pending_enemy_sync: None,
+            pending_enemy_syncs: Vec::new(),
             pending_enemy_damage: Vec::new(),
             pending_wave_start: None,
             pending_enemy_kills_optimistic: Vec::new(),
@@ -894,6 +904,7 @@ impl NetworkSession {
         self.pending_paid_name_acks.clear();
         self.pending_paid_name_candidates.clear();
         self.pending_cannon_shots.clear();
+        self.pending_enemy_syncs.clear();
         self.pending_projectile_reflections.clear();
         self.latency_ms.clear();
         self.latency_samples.clear();
@@ -1545,23 +1556,31 @@ impl NetworkSession {
             }
         }
         for (peer_id, origin_hash, sync) in enemy_syncs {
-            if !self.is_host
-                && (self.is_authoritative_sender(&peer_id)
-                    || self.is_parent_sender(&peer_id)
-                    || self.bootstrap_accept_sender(&peer_id))
-            {
-                self.pending_enemy_sync = Some(sync.clone());
-                self.forward_enemy_sync_down(
-                    sync,
-                    self.resolve_peer_id(&peer_id),
-                    Some(origin_hash),
-                );
-            } else if !self.is_host {
-                self.relay_telemetry.dropped_messages =
-                    self.relay_telemetry.dropped_messages.saturating_add(1);
-                web_sys::console::log_1(
-                    &format!("Dropped enemy sync from non-authoritative {}", peer_id).into(),
-                );
+            if Some(origin_hash) == self.local_origin_hash() {
+                continue; // our own correction echoed back
+            }
+            let root_hash = self
+                .super_root_id
+                .map(Self::peer_hash_for_matchbox)
+                .unwrap_or(0);
+            let from_host = root_hash != 0 && origin_hash == root_hash;
+            // Flood along tree edges (minus the inbound one) so every node
+            // hears every authority's corrections exactly once.
+            self.relay_control_message(
+                &peer_id,
+                NetMessage::EnemySync(sync.clone()).to_bytes(),
+                Some(origin_hash),
+            );
+            // Per-area authority enforcement: an origin may only correct
+            // enemies inside areas it owns; unassigned areas belong to the
+            // host (which also covers bootstrap, before any area map exists).
+            let mut filtered = sync;
+            filtered.enemies.retain(|enemy| {
+                self.area_owned_by(Self::area_id_from_pos(enemy.pos()), origin_hash)
+            });
+            if from_host || !filtered.enemies.is_empty() {
+                self.pending_enemy_syncs
+                    .push((origin_hash, from_host, filtered));
             }
         }
         for (peer_id, origin_hash, wave_start) in wave_starts {
@@ -2217,6 +2236,7 @@ impl NetworkSession {
             .map(|entry| entry.parent_hash == 0)
             .unwrap_or(self.is_host);
         if self.is_host && !was_host {
+            self.root_acquired_frame = current_frame;
             // Gained the root role via a map (e.g. a throttled root handed
             // off to us). Seed liveness for inherited members so the TTL
             // prune doesn't wipe everyone we aren't directly linked to, and
@@ -2929,6 +2949,14 @@ impl NetworkSession {
         if !self.is_host || self.topology_roster.len() < 2 {
             return;
         }
+        // Settle period: hold the role for a while after acquiring it. With
+        // two players alt-tabbing, the role follows the foreground player at
+        // a damped rate instead of ping-ponging epochs on every focus change.
+        if self.root_acquired_frame != 0
+            && current_frame.saturating_sub(self.root_acquired_frame) < 600
+        {
+            return;
+        }
         let Some(local_hash) = self.local_peer_hash else {
             return;
         };
@@ -3015,6 +3043,7 @@ impl NetworkSession {
         self.last_broadcast_epoch = 0;
         self.map_anchor_counter = 0;
         self.is_host = true;
+        self.root_acquired_frame = current_frame;
         self.relay_parent = None;
         self.relay_backup_parent = None;
         self.relay_active_parent = None;
@@ -3024,66 +3053,78 @@ impl NetworkSession {
         self.root_departure_frame = None;
     }
 
+    /// Root: assign each active area to the *player nearest to it* — the
+    /// node whose local prediction of those enemies is most trustworthy and
+    /// most latency-relevant. Sticky: the incumbent keeps an area unless a
+    /// challenger is decisively closer, so ownership doesn't flap at borders.
     fn recompute_area_authorities(&mut self, current_frame: u32) {
-        if self.supernode_set.is_empty() {
+        if self.topology_roster.is_empty() {
             self.area_authorities.clear();
             return;
         }
 
-        let mut area_samples: HashMap<u32, (Vec2, u32)> = HashMap::new();
-        if let Some(pos) = self.local_last_pos {
-            let area_id = Self::area_id_from_pos(pos);
-            area_samples.insert(area_id, (pos, 1));
+        // Candidate members with known positions (self + visible remotes).
+        let mut member_positions: Vec<(u64, Vec2)> = Vec::new();
+        if let (Some(local_hash), Some(pos)) = (self.local_peer_hash, self.local_last_pos) {
+            member_positions.push((local_hash, pos));
         }
-        for remote in self.remote_players.values() {
-            let area_id = Self::area_id_from_pos(remote.pos);
-            if let Some((sum, count)) = area_samples.get_mut(&area_id) {
-                *sum += remote.pos;
-                *count = count.saturating_add(1);
-            } else {
-                area_samples.insert(area_id, (remote.pos, 1));
+        for (peer_id, remote) in &self.remote_players {
+            let hash = Self::peer_identity_hash(peer_id);
+            if self.roster_contains(hash) {
+                member_positions.push((hash, remote.pos));
             }
         }
-        if area_samples.is_empty() {
+        if member_positions.is_empty() {
             return;
         }
+        // Deterministic order so ties resolve identically everywhere.
+        member_positions.sort_by_key(|(hash, _)| *hash);
 
-        let mut supernode_positions: HashMap<u64, Vec2> = HashMap::new();
-        for supernode in &self.supernode_set {
-            let hash = Self::hash_peer_id(&format!("{:?}", supernode));
-            if Some(*supernode) == self.local_peer_id {
-                if let Some(pos) = self.local_last_pos {
-                    supernode_positions.insert(hash, pos);
-                }
-            } else if let Some(peer_id) = self.identity_peer_id_for_hash(hash) {
-                if let Some(remote) = self.remote_players.get(&peer_id) {
-                    supernode_positions.insert(hash, remote.pos);
-                }
+        let mut area_samples: HashMap<u32, (Vec2, u32)> = HashMap::new();
+        for (_, pos) in &member_positions {
+            let area_id = Self::area_id_from_pos(*pos);
+            if let Some((sum, count)) = area_samples.get_mut(&area_id) {
+                *sum += *pos;
+                *count = count.saturating_add(1);
+            } else {
+                area_samples.insert(area_id, (*pos, 1));
             }
         }
 
         let mut authorities = HashMap::new();
         for (area_id, (sum, count)) in area_samples {
-            let center = if count > 0 { sum / count as f32 } else { sum };
+            let center = sum / (count.max(1) as f32);
             let mut best: Option<(u64, f32)> = None;
-            for supernode in &self.supernode_set {
-                let hash = Self::hash_peer_id(&format!("{:?}", supernode));
-                let dist_score = if let Some(pos) = supernode_positions.get(&hash) {
-                    let d = *pos - center;
-                    d.x * d.x + d.y * d.y
-                } else {
-                    1_000_000_000.0
-                };
-                let latency = self.latency_ms.get(supernode).copied().unwrap_or(1000) as f32;
-                let score = dist_score + latency * 250.0 + (hash as u32 ^ area_id) as f32 * 0.0001;
+            for (hash, pos) in &member_positions {
+                let d = *pos - center;
+                let dist_sq = d.x * d.x + d.y * d.y;
                 match best {
-                    Some((_, best_score)) if score >= best_score => {}
-                    _ => best = Some((hash, score)),
+                    Some((_, best_score)) if dist_sq >= best_score => {}
+                    _ => best = Some((*hash, dist_sq)),
                 }
             }
-            if let Some((hash, _)) = best {
-                authorities.insert(area_id, hash);
-            }
+            let Some((winner, winner_dist)) = best else {
+                continue;
+            };
+            // Hysteresis: keep the incumbent unless the winner is decisively
+            // closer (or the incumbent is gone / has no known position).
+            let chosen =
+                match self.area_authorities.get(&area_id) {
+                    Some(prev) if *prev != winner => {
+                        let prev_dist = member_positions.iter().find(|(hash, _)| hash == prev).map(
+                            |(_, pos)| {
+                                let d = *pos - center;
+                                d.x * d.x + d.y * d.y
+                            },
+                        );
+                        match prev_dist {
+                            Some(prev_dist) if winner_dist * 2.25 >= prev_dist => *prev,
+                            _ => winner,
+                        }
+                    }
+                    _ => winner,
+                };
+            authorities.insert(area_id, chosen);
         }
 
         self.area_authorities = authorities;
@@ -3092,6 +3133,40 @@ impl NetworkSession {
         {
             self.last_area_update_broadcast_frame = current_frame;
             self.broadcast_area_authorities();
+        }
+    }
+
+    /// Areas whose enemy simulation this node currently owns.
+    pub fn owned_area_ids(&self) -> HashSet<u32> {
+        let Some(local_hash) = self.local_peer_hash else {
+            return HashSet::new();
+        };
+        self.area_authorities
+            .iter()
+            .filter(|(_, authority)| **authority == local_hash)
+            .map(|(area_id, _)| *area_id)
+            .collect()
+    }
+
+    /// All areas that have an assigned authority (everything else defaults
+    /// to the host).
+    pub fn assigned_area_ids(&self) -> HashSet<u32> {
+        self.area_authorities.keys().copied().collect()
+    }
+
+    /// May `origin` speak authoritatively about enemies in `area_id`?
+    /// Assigned areas belong to their authority; unassigned areas belong to
+    /// the host.
+    fn area_owned_by(&self, area_id: u32, origin_hash: u64) -> bool {
+        match self.area_authorities.get(&area_id) {
+            Some(authority) => *authority == origin_hash,
+            None => {
+                let root_hash = self
+                    .super_root_id
+                    .map(Self::peer_hash_for_matchbox)
+                    .unwrap_or(0);
+                origin_hash == root_hash
+            }
         }
     }
 
@@ -5394,25 +5469,18 @@ impl NetworkSession {
     }
 
     /// Send enemy sync to all peers (host only)
+    /// Send an enemy-sync correction for the areas this node owns (the host
+    /// additionally covers unassigned areas). Floods through the tree from
+    /// wherever the authority sits.
     pub fn send_enemy_sync(&mut self, sync: EnemySync) {
+        let msg = NetMessage::EnemySync(sync).to_bytes();
+        let origin = self.local_origin_hash();
         if !self.is_host {
-            return;
+            self.send_upstream_or_broadcast_routed(msg.clone(), None, origin);
         }
-        let msg = NetMessage::EnemySync(sync).to_bytes();
-        self.send_downstream_or_broadcast(msg, None);
-    }
-
-    fn forward_enemy_sync_down(
-        &mut self,
-        sync: EnemySync,
-        exclude: Option<matchbox_socket::PeerId>,
-        origin_hash: Option<u64>,
-    ) {
-        if self.relay_children.is_empty() {
-            return;
+        if self.is_host || !self.relay_children.is_empty() {
+            self.send_downstream_or_broadcast_routed(msg, None, origin);
         }
-        let msg = NetMessage::EnemySync(sync).to_bytes();
-        self.send_downstream_or_broadcast_routed(msg, exclude, origin_hash);
     }
 
     fn relay_enemy_kill(
@@ -5477,8 +5545,8 @@ impl NetworkSession {
     }
 
     /// Take pending enemy sync (for client to apply)
-    pub fn take_enemy_sync(&mut self) -> Option<EnemySync> {
-        self.pending_enemy_sync.take()
+    pub fn take_enemy_syncs(&mut self) -> Vec<(u64, bool, EnemySync)> {
+        std::mem::take(&mut self.pending_enemy_syncs)
     }
 
     /// Take pending enemy damage events (for host to process)
@@ -6809,6 +6877,122 @@ mod tests {
         assert_eq!(
             session.roster_entry(hash_for(leaf)).unwrap().parent_hash,
             parent_after
+        );
+    }
+
+    #[test]
+    fn area_authority_assigns_nearest_member_and_unassigned_defaults_to_host() {
+        let root = peer_from(0);
+        let remote = peer_from(1);
+
+        let mut session = NetworkSession::new();
+        session.is_host = true;
+        session.local_peer_id = Some(root);
+        session.local_peer_hash = Some(hash_for(root));
+        session.super_root_id = Some(root);
+        session.topology_roster = vec![entry_for(root, 0), entry_for(remote, hash_for(root))];
+
+        // Root at origin, remote far away in another area.
+        session.local_last_pos = Some(Vec2::new(0.0, 0.0));
+        let far = Vec2::new(100_000.0, 0.0);
+        let near_area = NetworkSession::area_id_for_pos(Vec2::new(0.0, 0.0));
+        let far_area = NetworkSession::area_id_for_pos(far);
+        assert_ne!(near_area, far_area, "test needs two distinct areas");
+
+        let remote_id = format!("{:?}", remote);
+        let state = PlayerState::new(
+            1,
+            far,
+            Vec2::RIGHT,
+            Vec2::RIGHT,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        session.peer_id_lookup.insert(remote_id.clone(), remote);
+        session
+            .peer_hash_lookup
+            .insert(hash_for(remote), remote_id.clone());
+        session.remote_players.insert(
+            remote_id.clone(),
+            RemotePlayer::new("FAR".to_string(), &state, 1),
+        );
+
+        session.recompute_area_authorities(10);
+
+        assert_eq!(
+            session.area_authorities.get(&near_area),
+            Some(&hash_for(root)),
+            "nearest member owns the root's area"
+        );
+        assert_eq!(
+            session.area_authorities.get(&far_area),
+            Some(&hash_for(remote)),
+            "nearest member owns the remote's area"
+        );
+        assert_eq!(session.owned_area_ids().len(), 1);
+
+        // Ownership checks: assigned area belongs to its authority...
+        assert!(session.area_owned_by(far_area, hash_for(remote)));
+        assert!(!session.area_owned_by(far_area, hash_for(root)));
+        // ...and unassigned areas default to the host.
+        let unassigned = NetworkSession::area_id_for_pos(Vec2::new(-100_000.0, -100_000.0));
+        assert!(session.area_owned_by(unassigned, hash_for(root)));
+        assert!(!session.area_owned_by(unassigned, hash_for(remote)));
+    }
+
+    #[test]
+    fn area_authority_is_sticky_against_marginal_challengers() {
+        let root = peer_from(0);
+        let remote = peer_from(1);
+
+        let mut session = NetworkSession::new();
+        session.is_host = true;
+        session.local_peer_id = Some(root);
+        session.local_peer_hash = Some(hash_for(root));
+        session.super_root_id = Some(root);
+        session.topology_roster = vec![entry_for(root, 0), entry_for(remote, hash_for(root))];
+
+        // Both in the same area, equidistant from its center: the incumbent
+        // must keep it regardless of hash ordering.
+        session.local_last_pos = Some(Vec2::new(0.0, 0.0));
+        let near = Vec2::new(64.0, 0.0);
+        let shared_area = NetworkSession::area_id_for_pos(Vec2::new(0.0, 0.0));
+        assert_eq!(shared_area, NetworkSession::area_id_for_pos(near));
+
+        let remote_id = format!("{:?}", remote);
+        let state = PlayerState::new(
+            1,
+            near,
+            Vec2::RIGHT,
+            Vec2::RIGHT,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        session.peer_id_lookup.insert(remote_id.clone(), remote);
+        session
+            .peer_hash_lookup
+            .insert(hash_for(remote), remote_id.clone());
+        session.remote_players.insert(
+            remote_id.clone(),
+            RemotePlayer::new("NEAR".to_string(), &state, 1),
+        );
+
+        // Seed the remote as incumbent; an (at best) marginally closer root
+        // must not steal the area.
+        session
+            .area_authorities
+            .insert(shared_area, hash_for(remote));
+        session.recompute_area_authorities(10);
+        assert_eq!(
+            session.area_authorities.get(&shared_area),
+            Some(&hash_for(remote)),
+            "incumbent keeps the area on marginal differences"
         );
     }
 

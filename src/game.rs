@@ -185,6 +185,7 @@ pub struct Game {
     /// This ensures host and client see enemies at the same visual update rate
     pub enemy_render_snapshot: Option<EnemyRenderSnapshot>,
     pub last_enemy_sync_tick: u32,
+    last_enemy_sync_ticks: std::collections::HashMap<u64, u32>,
     pub shockwave_cooldown: i32,
     pub shockwave_timer: i32,
     pub slow_spawn_timer: i32,
@@ -580,6 +581,7 @@ impl Game {
             pending_respawn: false,
             enemy_render_snapshot: None,
             last_enemy_sync_tick: 0,
+            last_enemy_sync_ticks: std::collections::HashMap::new(),
             shockwave_cooldown: 0,
             shockwave_timer: 0,
             slow_spawn_timer: 0,
@@ -2865,6 +2867,7 @@ impl Game {
         self.remote_simulations.clear();
         self.remote_predictions.clear();
         self.last_enemy_sync_tick = 0;
+        self.last_enemy_sync_ticks.clear();
         self.enemy_render_snapshot = None;
         self.wave_kill_counts = [0; 4];
         self.wave_kill_targets = [0; 4];
@@ -2985,12 +2988,30 @@ impl Game {
 
     /// Create enemy sync data for broadcasting (host only)
     pub fn create_enemy_sync(&self) -> crate::net::EnemySync {
+        self.create_enemy_sync_filtered(|_| true)
+    }
+
+    /// Enemy sync restricted to areas this node has authority over: `owned`
+    /// areas always; unassigned areas too when `cover_unassigned` (the host).
+    pub fn create_enemy_sync_in_areas(
+        &self,
+        owned: &std::collections::HashSet<u32>,
+        assigned: &std::collections::HashSet<u32>,
+        cover_unassigned: bool,
+    ) -> crate::net::EnemySync {
+        self.create_enemy_sync_filtered(|pos| {
+            let area = crate::net::NetworkSession::area_id_for_pos(pos);
+            owned.contains(&area) || (cover_unassigned && !assigned.contains(&area))
+        })
+    }
+
+    fn create_enemy_sync_filtered(&self, include: impl Fn(Vec2) -> bool) -> crate::net::EnemySync {
         use crate::net::EnemyState;
 
         let mut enemies = Vec::new();
 
         // Add spiders (alive or dead so clients can clear dead ones)
-        for spider in &self.spiders {
+        for spider in self.spiders.iter().filter(|e| include(e.pos)) {
             enemies.push(EnemyState::new_spider(
                 spider.id,
                 spider.alive,
@@ -3000,7 +3021,7 @@ impl Game {
         }
 
         // Add cannons (alive or dead so clients can clear dead ones)
-        for cannon in &self.cannons {
+        for cannon in self.cannons.iter().filter(|e| include(e.pos)) {
             enemies.push(EnemyState::new_cannon(
                 cannon.id,
                 cannon.alive,
@@ -3010,7 +3031,7 @@ impl Game {
         }
 
         // Add snakes (alive or dead so clients can clear dead ones)
-        for snake in &self.snakes {
+        for snake in self.snakes.iter().filter(|e| include(e.pos)) {
             enemies.push(EnemyState::new_snake(
                 snake.id,
                 snake.alive,
@@ -3021,13 +3042,13 @@ impl Game {
         }
 
         // Add wisps (alive or dead so clients can clear dead ones)
-        for wisp in &self.wisps {
+        for wisp in self.wisps.iter().filter(|e| include(e.pos)) {
             enemies.push(EnemyState::new_wisp(
                 wisp.id, wisp.alive, wisp.pos, wisp.dir,
             ));
         }
 
-        for guardian in &self.guardians {
+        for guardian in self.guardians.iter().filter(|e| include(e.pos)) {
             enemies.push(EnemyState::new_guardian(
                 guardian.id,
                 guardian.alive,
@@ -3478,18 +3499,32 @@ impl Game {
     }
 
     /// Apply enemy sync from host (client only)
-    pub fn apply_enemy_sync(&mut self, sync: &crate::net::EnemySync) {
+    pub fn apply_enemy_sync(
+        &mut self,
+        sync: &crate::net::EnemySync,
+        origin_hash: u64,
+        from_host: bool,
+    ) {
         use crate::net::EnemyType;
 
-        // Ignore stale/duplicate sync packets that can arrive out of order
-        // when relayed through different topology paths.
-        if sync.tick <= self.last_enemy_sync_tick {
+        // Per-origin staleness: with per-area authorities, corrections come
+        // from several independent senders whose tick counters are unrelated.
+        let last = self
+            .last_enemy_sync_ticks
+            .get(&origin_hash)
+            .copied()
+            .unwrap_or(0);
+        if sync.tick <= last {
             return;
         }
-        self.last_enemy_sync_tick = sync.tick;
+        if self.last_enemy_sync_ticks.len() > 64 {
+            self.last_enemy_sync_ticks.clear();
+        }
+        self.last_enemy_sync_ticks.insert(origin_hash, sync.tick);
+        self.last_enemy_sync_tick = self.last_enemy_sync_tick.max(sync.tick);
 
-        // Update wave if it changed
-        if sync.wave != self.wave {
+        // Wave changes are world events: host authority only.
+        if from_host && sync.wave != self.wave {
             self.wave = sync.wave;
             // Clear local enemies to rebuild from sync
             self.spiders.clear();

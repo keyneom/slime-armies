@@ -157,8 +157,19 @@ players could not see each other. Root causes found (see
       500ms samples; naturally occluded host hands off within seconds and
       the foreground player continues the world at full rate (31 unit tests
       green).
-- [ ] Next (recommended): per-area enemy authority assigned to the nearest
-      player, with root spot-checks — see NETWORK_SCALING_PLAN.md.
+- [x] Per-area enemy authority (steps 1-2 + 4 of the roadmap): the root
+      assigns each active area to the *nearest player* (sticky incumbent,
+      2.25x distance hysteresis); each authority broadcasts enemy corrections
+      only for its areas (tree flood); receivers enforce ownership per entry
+      (unassigned areas default to the host); per-origin sync tick staleness;
+      wave changes accepted from the host only. The host now also accepts
+      corrections for areas owned by others. Verified live: bidirectional
+      sync_tick growth in a 2-player room with matching enemy counts.
+      Remaining from the roadmap: root spot-checks of authority streams
+      (anti-cheat, step 3).
+- [x] Root handoff hysteresis: 10s settle period after acquiring the role +
+      ~5s sustained-throttle requirement, so alt-tabbing players converge to
+      "role follows the foreground player" instead of ping-ponging epochs.
 
 ### Also fixed along the way (pre-existing, exposed by the smoke run)
 - Handshakes stalled forever when STUN was unreachable: the vendored socket
