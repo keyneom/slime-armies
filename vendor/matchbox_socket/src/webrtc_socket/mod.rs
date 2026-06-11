@@ -22,7 +22,7 @@ pub use socket::{
 use std::{
     collections::{HashMap, HashSet},
     pin::Pin,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 cfg_if! {
@@ -121,6 +121,23 @@ trait PeerDataSender {
     fn close(&mut self) {}
 }
 
+/// Monotonic-enough wall clock in milliseconds. `std::time::Instant` panics
+/// with "time not implemented on this platform" on wasm32-unknown-unknown,
+/// and the panic poisons the async executor — every handshake retry after a
+/// timeout used to kill networking for the rest of the session.
+#[cfg(target_arch = "wasm32")]
+fn now_ms() -> f64 {
+    js_sys::Date::now()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn now_ms() -> f64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum SocketControl {
     FullMesh,
@@ -190,6 +207,7 @@ async fn message_loop<M: Messenger>(
     keep_alive_interval: Option<Duration>,
 ) -> Result<(), SignalingError> {
     const HANDSHAKE_RETRY_INTERVAL: Duration = Duration::from_millis(750);
+    const HANDSHAKE_RETRY_MS: f64 = 750.0;
 
     let MessageLoopChannels {
         requests_sender,
@@ -208,7 +226,7 @@ async fn message_loop<M: Messenger>(
     let mut data_channels: HashMap<PeerId, Vec<M::DataChannel>> = HashMap::new();
     let mut known_peers = HashSet::new();
     let mut desired_peers: Option<HashSet<PeerId>> = None;
-    let mut handshake_retry_after: HashMap<PeerId, Instant> = HashMap::new();
+    let mut handshake_retry_after: HashMap<PeerId, f64> = HashMap::new();
     let mut id_tx = Option::Some(id_tx);
     let mut signaling_attached = true;
 
@@ -228,7 +246,7 @@ async fn message_loop<M: Messenger>(
                 .map_or(true, |set| set.contains(&peer_uuid));
             let retry_ready = handshake_retry_after
                 .get(&peer_uuid)
-                .map(|deadline| Instant::now() >= *deadline)
+                .map(|deadline| now_ms() >= *deadline)
                 .unwrap_or(true);
             if signaling_attached
                 && should_connect
@@ -422,7 +440,7 @@ async fn message_loop<M: Messenger>(
                     HandshakeOutcome::TimedOut(peer_id) => {
                         warn!("handshake timed out for peer {peer_id:?}");
                         handshake_signals.remove(&peer_id);
-                        handshake_retry_after.insert(peer_id, Instant::now() + HANDSHAKE_RETRY_INTERVAL);
+                        handshake_retry_after.insert(peer_id, now_ms() + HANDSHAKE_RETRY_MS);
                         let _ = peer_state_tx.unbounded_send((peer_id, PeerState::Disconnected));
                     }
                     HandshakeOutcome::Result(handshake_result) => {
@@ -436,7 +454,7 @@ async fn message_loop<M: Messenger>(
                             for channel in channels.iter_mut() {
                                 channel.close();
                             }
-                            handshake_retry_after.insert(peer_id, Instant::now() + HANDSHAKE_RETRY_INTERVAL);
+                            handshake_retry_after.insert(peer_id, now_ms() + HANDSHAKE_RETRY_MS);
                             let _ = peer_state_tx.unbounded_send((peer_id, PeerState::Disconnected));
                             continue;
                         }
@@ -466,7 +484,7 @@ async fn message_loop<M: Messenger>(
                     && known_peers.contains(&peer_uuid)
                 {
                     handshake_retry_after
-                        .insert(peer_uuid, Instant::now() + HANDSHAKE_RETRY_INTERVAL);
+                        .insert(peer_uuid, now_ms() + HANDSHAKE_RETRY_MS);
                 } else {
                     handshake_retry_after.remove(&peer_uuid);
                 }
