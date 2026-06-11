@@ -463,6 +463,8 @@ pub fn main() -> Result<(), JsValue> {
         input_send_counter: 0,
         last_supernode_id: None,
         last_enemy_sync_sent_frame: 0,
+        last_enemy_intro_sent_frame: 0,
+        last_enemy_intro_wave: 0,
         last_tick_net_frame: 0,
         throttled_ticks: 0,
     }));
@@ -1166,6 +1168,10 @@ struct GameState {
     /// (e.g. exactly 30 or 60 per watchdog tick), so `frame % stride == 0`
     /// can lock onto a non-zero residue and never fire again.
     last_enemy_sync_sent_frame: u32,
+    /// Low-cadence full host snapshots used only to introduce newly spawned
+    /// enemies in delegated areas; receivers ignore known delegated enemies.
+    last_enemy_intro_sent_frame: u32,
+    last_enemy_intro_wave: u32,
     /// Wall-clock net frame of the previous tick (sim catch-up bookkeeping).
     last_tick_net_frame: u32,
     /// Consecutive heavily-throttled ticks (background tab detection).
@@ -3123,6 +3129,7 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     1 => 6,
                     _ => 8,
                 };
+                let host_enemy_intro_stride: u32 = 30;
                 // Delta-based, never modulo: the wall-clock frame counter
                 // advances in fixed jumps on throttled tabs, which makes
                 // `% stride` lock onto a non-zero residue forever.
@@ -3141,14 +3148,33 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                         }
                     }
                 }
+                if is_host {
+                    let intro_due = state_ref.last_enemy_intro_wave != state_ref.game.wave
+                        || state_ref.last_enemy_intro_sent_frame == 0
+                        || frame_count.saturating_sub(state_ref.last_enemy_intro_sent_frame)
+                            >= host_enemy_intro_stride;
+                    if intro_due {
+                        let enemy_intro_sync = state_ref.game.create_enemy_sync();
+                        if !enemy_intro_sync.enemies.is_empty() {
+                            state_ref.last_enemy_intro_sent_frame = frame_count;
+                            state_ref.last_enemy_intro_wave = state_ref.game.wave;
+                            state_ref.network.send_enemy_sync(enemy_intro_sync);
+                        }
+                    }
+                }
                 // Everyone applies incoming corrections (already filtered to
                 // areas their origin legitimately owns).
-                for (origin, from_host, sync) in state_ref.network.take_enemy_syncs() {
-                    state_ref.game.apply_enemy_sync(&sync, origin, from_host);
+                for pending_sync in state_ref.network.take_enemy_syncs() {
+                    state_ref.game.apply_enemy_sync(
+                        &pending_sync.sync,
+                        pending_sync.origin_hash,
+                        pending_sync.from_host,
+                        pending_sync.introductions_only,
+                    );
                     if !is_host {
                         state_ref.game.clear_respawn_sync();
                     }
-                    if from_host {
+                    if pending_sync.from_host {
                         state_ref.network.mark_enemy_sync_received(frame_count);
                     }
                 }

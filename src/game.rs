@@ -6,6 +6,7 @@ use crate::math::Vec2;
 use crate::net::PlayerState;
 use crate::payment;
 use crate::world::{Camera, ChunkManager};
+#[cfg(not(test))]
 use js_sys;
 use rand::{Rng, RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -730,6 +731,12 @@ impl Game {
         }
     }
 
+    #[cfg(test)]
+    fn generate_default_name() -> String {
+        "TESTSLIME000".to_string()
+    }
+
+    #[cfg(not(test))]
     fn generate_default_name() -> String {
         let adjectives = [
             "SWIFT", "BRAVE", "SLY", "BOLD", "KEEN", "WILD", "COOL", "RAD",
@@ -3504,8 +3511,13 @@ impl Game {
         sync: &crate::net::EnemySync,
         origin_hash: u64,
         from_host: bool,
+        introductions_only: bool,
     ) {
         use crate::net::EnemyType;
+
+        if !from_host && sync.wave != self.wave {
+            return;
+        }
 
         // Per-origin staleness: with per-area authorities, corrections come
         // from several independent senders whose tick counters are unrelated.
@@ -3514,14 +3526,16 @@ impl Game {
             .get(&origin_hash)
             .copied()
             .unwrap_or(0);
-        if sync.tick <= last {
+        if sync.tick < last || (sync.tick == last && !introductions_only) {
             return;
         }
-        if self.last_enemy_sync_ticks.len() > 64 {
-            self.last_enemy_sync_ticks.clear();
+        if !introductions_only {
+            if self.last_enemy_sync_ticks.len() > 64 {
+                self.last_enemy_sync_ticks.clear();
+            }
+            self.last_enemy_sync_ticks.insert(origin_hash, sync.tick);
+            self.last_enemy_sync_tick = self.last_enemy_sync_tick.max(sync.tick);
         }
-        self.last_enemy_sync_ticks.insert(origin_hash, sync.tick);
-        self.last_enemy_sync_tick = self.last_enemy_sync_tick.max(sync.tick);
 
         // Wave changes are world events: host authority only.
         if from_host && sync.wave != self.wave {
@@ -3547,15 +3561,20 @@ impl Game {
             match enemy_type {
                 EnemyType::Spider => {
                     let id = enemy_state.id as usize;
+                    if introductions_only && id < self.spiders.len() {
+                        continue;
+                    }
                     // Find existing spider or create placeholder
                     while self.spiders.len() <= id {
                         // Create placeholder spider that will be updated
-                        self.spiders.push(Spider::new_around(
+                        let mut spider = Spider::new_around(
                             self.spiders.len(),
                             enemy_state.pos(),
                             0.0,
                             &mut self.rng,
-                        ));
+                        );
+                        spider.alive = false;
+                        self.spiders.push(spider);
                     }
                     let spider = &mut self.spiders[id];
                     let was_alive = spider.alive;
@@ -3570,13 +3589,18 @@ impl Game {
                 }
                 EnemyType::Cannon => {
                     let id = enemy_state.id as usize;
+                    if introductions_only && id < self.cannons.len() {
+                        continue;
+                    }
                     while self.cannons.len() <= id {
-                        self.cannons.push(Cannon::new_around(
+                        let mut cannon = Cannon::new_around(
                             self.cannons.len(),
                             enemy_state.pos(),
                             0.0,
                             &mut self.rng,
-                        ));
+                        );
+                        cannon.alive = false;
+                        self.cannons.push(cannon);
                     }
                     let cannon = &mut self.cannons[id];
                     let was_alive = cannon.alive;
@@ -3591,19 +3615,24 @@ impl Game {
                 }
                 EnemyType::Snake => {
                     let id = enemy_state.id as usize;
+                    if introductions_only && id < self.snakes.len() {
+                        continue;
+                    }
                     while self.snakes.len() <= id {
                         let previous = if self.snakes.is_empty() {
                             None
                         } else {
                             self.snakes.last()
                         };
-                        self.snakes.push(Snake::new_around(
+                        let mut snake = Snake::new_around(
                             self.snakes.len(),
                             previous,
                             enemy_state.pos(),
                             0.0,
                             &mut self.rng,
-                        ));
+                        );
+                        snake.alive = false;
+                        self.snakes.push(snake);
                     }
                     let snake = &mut self.snakes[id];
                     let target_size = enemy_state.snake_size();
@@ -3620,12 +3649,17 @@ impl Game {
                 }
                 EnemyType::Wisp => {
                     let id = enemy_state.id as usize;
+                    if introductions_only && id < self.wisps.len() {
+                        continue;
+                    }
                     while self.wisps.len() <= id {
-                        self.wisps.push(Wisp::new_at_position(
+                        let mut wisp = Wisp::new_at_position(
                             self.wisps.len(),
                             enemy_state.pos(),
                             &mut self.rng,
-                        ));
+                        );
+                        wisp.alive = false;
+                        self.wisps.push(wisp);
                     }
                     let wisp = &mut self.wisps[id];
                     let was_alive = wisp.alive;
@@ -3639,11 +3673,14 @@ impl Game {
                 }
                 EnemyType::Guardian => {
                     let id = enemy_state.id as usize;
+                    if introductions_only && id < self.guardians.len() {
+                        continue;
+                    }
                     while self.guardians.len() <= id {
-                        self.guardians.push(Guardian::new_at_position(
-                            self.guardians.len(),
-                            enemy_state.pos(),
-                        ));
+                        let mut guardian =
+                            Guardian::new_at_position(self.guardians.len(), enemy_state.pos());
+                        guardian.alive = false;
+                        self.guardians.push(guardian);
                     }
                     let guardian = &mut self.guardians[id];
                     let was_alive = guardian.alive;
@@ -4062,4 +4099,59 @@ fn parse_proof_hash(hex: &str) -> Result<[u8; 32], String> {
         bytes[i] = ((hi << 4) | lo) as u8;
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::{EnemyState, EnemySync};
+
+    #[test]
+    fn drops_non_host_enemy_sync_from_wrong_wave() {
+        let mut game = Game::new(800, 600);
+        game.wave = 2;
+
+        let sync = EnemySync {
+            tick: 12,
+            wave: 1,
+            enemies: vec![EnemyState::new_spider(
+                7,
+                true,
+                Vec2::new(100.0, 50.0),
+                Vec2::new(1.0, 0.0),
+            )],
+        };
+
+        game.apply_enemy_sync(&sync, 0xCAFE, false, false);
+
+        assert!(game.spiders.is_empty());
+        assert!(!game.last_enemy_sync_ticks.contains_key(&0xCAFE));
+    }
+
+    #[test]
+    fn host_introduction_sync_only_creates_unknown_enemies() {
+        let mut game = Game::new(800, 600);
+        game.wave = 1;
+        game.spiders.push(Spider::new_at_position(
+            0,
+            Vec2::new(10.0, 10.0),
+            &mut game.rng,
+        ));
+
+        let sync = EnemySync {
+            tick: 20,
+            wave: 1,
+            enemies: vec![
+                EnemyState::new_spider(0, true, Vec2::new(500.0, 500.0), Vec2::new(1.0, 0.0)),
+                EnemyState::new_spider(1, true, Vec2::new(120.0, 80.0), Vec2::new(0.0, 1.0)),
+            ],
+        };
+
+        game.apply_enemy_sync(&sync, 0xBEEF, true, true);
+
+        assert_eq!(game.spiders[0].pos, Vec2::new(10.0, 10.0));
+        assert_eq!(game.spiders[1].pos, Vec2::new(120.0, 80.0));
+        assert!(game.spiders[1].alive);
+        assert!(!game.last_enemy_sync_ticks.contains_key(&0xBEEF));
+    }
 }

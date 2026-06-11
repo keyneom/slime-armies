@@ -89,6 +89,14 @@ pub struct RelayTelemetry {
     pub stale_parent_switches: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingEnemySync {
+    pub origin_hash: u64,
+    pub from_host: bool,
+    pub introductions_only: bool,
+    pub sync: EnemySync,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum LowPriorityTopic {
     Chat,
@@ -203,9 +211,9 @@ pub struct NetworkSession {
     /// broadcast and `send_*` routing—not necessarily the player who clicked "create room".
     /// Game simulation authority (waves/enemy sync) currently follows this same flag.
     pub is_host: bool,
-    /// Received enemy-sync corrections: (origin hash, origin-is-host, sync).
-    /// Multiple per frame are normal once per-area authorities are active.
-    pub pending_enemy_syncs: Vec<(u64, bool, EnemySync)>,
+    /// Received enemy-sync corrections. Multiple per frame are normal once
+    /// per-area authorities are active.
+    pub pending_enemy_syncs: Vec<PendingEnemySync>,
     /// Received enemy damage events (for host)
     pub pending_enemy_damage: Vec<EnemyDamage>,
     /// Received wave start events (for deterministic spawning)
@@ -1574,13 +1582,31 @@ impl NetworkSession {
             // Per-area authority enforcement: an origin may only correct
             // enemies inside areas it owns; unassigned areas belong to the
             // host (which also covers bootstrap, before any area map exists).
-            let mut filtered = sync;
-            filtered.enemies.retain(|enemy| {
+            let mut corrections = sync.clone();
+            corrections.enemies.retain(|enemy| {
                 self.area_owned_by(Self::area_id_from_pos(enemy.pos()), origin_hash)
             });
-            if from_host || !filtered.enemies.is_empty() {
-                self.pending_enemy_syncs
-                    .push((origin_hash, from_host, filtered));
+            if from_host || !corrections.enemies.is_empty() {
+                self.pending_enemy_syncs.push(PendingEnemySync {
+                    origin_hash,
+                    from_host,
+                    introductions_only: false,
+                    sync: corrections,
+                });
+            }
+            if from_host {
+                let mut introductions = sync;
+                introductions.enemies.retain(|enemy| {
+                    !self.area_owned_by(Self::area_id_from_pos(enemy.pos()), origin_hash)
+                });
+                if !introductions.enemies.is_empty() {
+                    self.pending_enemy_syncs.push(PendingEnemySync {
+                        origin_hash,
+                        from_host: true,
+                        introductions_only: true,
+                        sync: introductions,
+                    });
+                }
             }
         }
         for (peer_id, origin_hash, wave_start) in wave_starts {
@@ -5545,7 +5571,7 @@ impl NetworkSession {
     }
 
     /// Take pending enemy sync (for client to apply)
-    pub fn take_enemy_syncs(&mut self) -> Vec<(u64, bool, EnemySync)> {
+    pub fn take_enemy_syncs(&mut self) -> Vec<PendingEnemySync> {
         std::mem::take(&mut self.pending_enemy_syncs)
     }
 
