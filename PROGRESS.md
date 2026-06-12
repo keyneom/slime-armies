@@ -7,6 +7,43 @@ Transform "One Slime Army" from a single-player WASM-4 game into a P2P multiplay
 - Infinite procedurally generated world
 - Wave-based enemy spawning scaled by player count
 
+## 2026-06-11 - Enemy jumpiness root causes (refresh-rate pacing, dual authority, correction smoothing)
+
+Diagnosed "enemies teleport to a totally different location" reports. Four
+structural causes, all latency-independent (reproduced across windows on one
+device):
+
+- [x] **Sim speed was coupled to display refresh rate**: `sim_steps =
+      net_delta.clamp(1, 30)` forced >= 1 step per rAF tick, so 120Hz
+      displays (ProMotion etc.) ran the whole game at 2x speed and their
+      enemy predictions permanently overshot 60Hz authorities. Now
+      `net_delta.min(30)` (zero steps allowed); edge-triggered input is held
+      across 0-step ticks. Playtime + player/input send counters also advance
+      by sim steps, not browser callbacks (P2 review finding).
+- [x] **Dual authority near area borders**: two authorities whose sims placed
+      a border enemy on opposite sides both broadcast corrections for it, and
+      receivers interleaved the streams (staleness is per-origin by design)
+      -> ping-pong teleporting. Receivers now lock each enemy to one origin
+      and only switch after ~45 frames of silence (`enemy_sync_origins`).
+- [x] **Corrections applied as instant jumps**: the old 35%-of-error blend
+      (and 240px hard snap) moved on-screen enemies in single-frame steps.
+      Corrections now queue as residuals bled in over sim frames with a
+      bounded per-frame step (`enemy_corrections`); off-screen enemies and
+      hopeless errors (>600px) still snap outright.
+- [x] **Area-authority map propagated too slowly**: root broadcasts on change
+      (15-frame min interval) instead of only every 120 frames, and joiners
+      get the area map alongside their first topology map — both root-direct
+      (`update_topology_as_root`) and depth >= 2 (`forward_topology_delta`,
+      epoch-stamped to pass the receiver gate) — instead of treating every
+      area as host-owned until the heartbeat (P1 review finding).
+- [x] Tests: origin-lock takeover, visible-glide convergence, off-screen
+      snap (38 lib tests green; wasm32 check clean).
+- [ ] Follow-up: block knockback (bumps) is local-only — the area authority
+      never hears about another player's bumps, so its next correction shoves
+      the enemy back. Needs authority-side simulation of remote players'
+      blocking collisions (remote `blocking` flag + predicted positions are
+      already available).
+
 ## Current Session - Topology Control-Plane Rewrite (sticky root + map)
 
 ### Why

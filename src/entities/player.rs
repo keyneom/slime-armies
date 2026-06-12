@@ -246,7 +246,14 @@ impl Player {
         if !self.alive || !self.blocking {
             return false;
         }
-        let look = self.look_dir.normalize();
+        Self::block_collides(self.pos, self.look_dir, target, radius)
+    }
+
+    /// Block shield geometry test for an arbitrary blocker position/facing.
+    /// Used for remote players too, so every simulation applies block bumps
+    /// regardless of which peer owns the enemy.
+    pub fn block_collides(pos: Vec2, look_dir: Vec2, target: Vec2, radius: f32) -> bool {
+        let look = look_dir.normalize();
         if look.length_squared() == 0.0 {
             return false;
         }
@@ -254,10 +261,10 @@ impl Player {
         let perp = Vec2::new(look.y, -look.x);
         let scale = CREATURE_SCALE;
 
-        let s1 = self.pos + (look * (5.0 * scale) - perp * (7.0 * scale));
-        let e1 = self.pos + (look * (5.0 * scale) + perp * (7.0 * scale));
-        let s2 = self.pos + (look * (6.0 * scale) - perp * (4.0 * scale));
-        let e2 = self.pos + (look * (6.0 * scale) + perp * (4.0 * scale));
+        let s1 = pos + (look * (5.0 * scale) - perp * (7.0 * scale));
+        let e1 = pos + (look * (5.0 * scale) + perp * (7.0 * scale));
+        let s2 = pos + (look * (6.0 * scale) - perp * (4.0 * scale));
+        let e2 = pos + (look * (6.0 * scale) + perp * (4.0 * scale));
 
         let thickness = 1.2 * scale + radius;
         let d1 = distance_point_to_segment(target, s1, e1);

@@ -977,7 +977,7 @@ impl Game {
 
     fn update_game(&mut self, input: &Input) {
         // Single-player update - all enemies target local player
-        self.update_game_with_targets(input, &[self.player.pos], true, 1);
+        self.update_game_with_targets(input, &[self.player.pos], &[], true, 1);
     }
 
     /// Update game with multiplayer support
@@ -993,17 +993,23 @@ impl Game {
     ) {
         // Build list of all player positions for enemy targeting (host uses this for AI)
         let mut target_positions = vec![self.player.pos];
+        // Blocking remote players bump enemies in every simulation (not just
+        // their own), so the per-area enemy authority doesn't sync a bumped
+        // enemy right back into the blocker's face.
+        let mut remote_blockers: Vec<(Vec2, Vec2)> = Vec::new();
         let mut remote_ids: Vec<_> = remote_players.keys().collect();
         remote_ids.sort();
         for peer_id in remote_ids {
             let remote = &remote_players[peer_id];
             if remote.alive {
-                let pos = self
-                    .remote_predictions
-                    .get(peer_id)
-                    .map(|state| state.pos())
-                    .unwrap_or(remote.pos);
+                let (pos, look_dir, blocking) = match self.remote_predictions.get(peer_id) {
+                    Some(state) => (state.pos(), state.look_dir(), state.is_blocking()),
+                    None => (remote.pos, remote.look_dir, remote.blocking),
+                };
                 target_positions.push(pos);
+                if blocking {
+                    remote_blockers.push((pos, look_dir));
+                }
             }
         }
 
@@ -1015,13 +1021,20 @@ impl Game {
         // ticks; the host's simulation remains authoritative — its periodic
         // syncs correct our prediction, and only the host produces side
         // effects (wave spawns, shrine bosses, cannon shot events).
-        self.update_game_with_targets(input, &target_positions, is_host, player_count);
+        self.update_game_with_targets(
+            input,
+            &target_positions,
+            &remote_blockers,
+            is_host,
+            player_count,
+        );
     }
 
     fn update_game_with_targets(
         &mut self,
         input: &Input,
         target_positions: &[Vec2],
+        remote_blockers: &[(Vec2, Vec2)],
         authoritative: bool,
         player_count: usize,
     ) {
@@ -1154,6 +1167,9 @@ impl Game {
         let mut snake_bumps: Vec<(usize, Vec2, f32)> = Vec::new();
         let mut wisp_bumps: Vec<(usize, Vec2, f32)> = Vec::new();
         let mut guardian_bumps: Vec<(usize, Vec2, f32)> = Vec::new();
+        // Only local-player blocks play the Block sound; remote-blocker bumps
+        // also land in the vecs above but happen on someone else's screen.
+        let mut local_block = false;
         let mut guardian_damaged = vec![false; self.guardians.len()];
         let mut attack_hits_this_frame: u32 = 0;
         let trail_segments = &self.trail_segments;
@@ -1197,6 +1213,7 @@ impl Game {
                     let distance = player_pos.distance(spider.pos);
                     let bump = (11.0 * CREATURE_SCALE - distance).max(1.5 * CREATURE_SCALE);
                     spider_bumps.push((i, player_look_dir, bump));
+                    local_block = true;
                 } else if self
                     .player
                     .collide_body(spider.pos, (spider.radius() - 3.5) * CREATURE_SCALE)
@@ -1205,6 +1222,15 @@ impl Game {
                     if player_killed_by.is_none() {
                         player_killed_by = Some((0, spider.id as u16));
                     }
+                }
+
+                if let Some((dir, distance)) = Self::remote_block_hit(
+                    remote_blockers,
+                    spider.pos,
+                    (spider.radius() - 3.5) * CREATURE_SCALE,
+                ) {
+                    let bump = (11.0 * CREATURE_SCALE - distance).max(1.5 * CREATURE_SCALE);
+                    spider_bumps.push((i, dir, bump));
                 }
             }
         }
@@ -1246,6 +1272,7 @@ impl Game {
                     let distance = player_pos.distance(wisp.pos);
                     let bump = (9.0 * CREATURE_SCALE - distance).max(1.0 * CREATURE_SCALE);
                     wisp_bumps.push((i, player_look_dir, bump));
+                    local_block = true;
                 } else if self
                     .player
                     .collide_body(wisp.pos, (wisp.radius() - 2.0) * CREATURE_SCALE)
@@ -1254,6 +1281,15 @@ impl Game {
                     if player_killed_by.is_none() {
                         player_killed_by = Some((4, wisp.id as u16));
                     }
+                }
+
+                if let Some((dir, distance)) = Self::remote_block_hit(
+                    remote_blockers,
+                    wisp.pos,
+                    (wisp.radius() - 2.0) * CREATURE_SCALE,
+                ) {
+                    let bump = (9.0 * CREATURE_SCALE - distance).max(1.0 * CREATURE_SCALE);
+                    wisp_bumps.push((i, dir, bump));
                 }
             }
         }
@@ -1394,6 +1430,15 @@ impl Game {
                         }
                     }
                 }
+
+                if let Some((dir, distance)) = Self::remote_block_hit(
+                    remote_blockers,
+                    guardian.pos,
+                    guardian.radius() * CREATURE_SCALE,
+                ) {
+                    let bump = (14.0 * CREATURE_SCALE - distance).max(2.0 * CREATURE_SCALE);
+                    guardian_bumps.push((i, dir, bump));
+                }
             }
         }
 
@@ -1450,11 +1495,19 @@ impl Game {
                     let distance = player_pos.distance(cannon.pos);
                     let bump = (11.5 - distance).max(1.5);
                     cannon_bumps.push((i, player_look_dir, bump));
+                    local_block = true;
                 } else if self.player.collide_body(cannon.pos, cannon.radius() - 4.0) {
                     player_killed = true;
                     if player_killed_by.is_none() {
                         player_killed_by = Some((1, cannon.id as u16));
                     }
+                }
+
+                if let Some((dir, distance)) =
+                    Self::remote_block_hit(remote_blockers, cannon.pos, cannon.radius() - 4.0)
+                {
+                    let bump = (11.5 - distance).max(1.5);
+                    cannon_bumps.push((i, dir, bump));
                 }
             }
         }
@@ -1517,6 +1570,7 @@ impl Game {
                         / 2.0;
                     snake_bumps.push((i, player_look_dir, bump));
                     self.player.pos -= player_look_dir * bump;
+                    local_block = true;
                 } else if self
                     .player
                     .collide_body(snake.pos, snake.radius() * CREATURE_SCALE)
@@ -1525,6 +1579,19 @@ impl Game {
                     if player_killed_by.is_none() {
                         player_killed_by = Some((2, snake.id as u16));
                     }
+                }
+
+                // Remote blockers bump the snake but not the local player;
+                // the blocker's own sim applies their pushback.
+                if let Some((dir, distance)) = Self::remote_block_hit(
+                    remote_blockers,
+                    snake.pos,
+                    snake.radius() * CREATURE_SCALE,
+                ) {
+                    let bump = (8.5 * CREATURE_SCALE + snake.radius() * CREATURE_SCALE - distance)
+                        .max(1.5 * CREATURE_SCALE)
+                        / 2.0;
+                    snake_bumps.push((i, dir, bump));
                 }
             }
         }
@@ -1656,11 +1723,7 @@ impl Game {
         }
 
         // Apply all collected actions (blocking bumps enemies)
-        if !spider_bumps.is_empty()
-            || !cannon_bumps.is_empty()
-            || !snake_bumps.is_empty()
-            || !wisp_bumps.is_empty()
-        {
+        if local_block {
             self.sound_events.push(SoundEvent::Block);
         }
         for (i, dir, amount) in spider_bumps {
@@ -4100,6 +4163,22 @@ impl Game {
         std::mem::take(&mut self.pending_player_deaths)
     }
 
+    /// Test an enemy against all blocking remote players' shields.
+    /// Returns the first hit's look direction and blocker distance so callers
+    /// can compute the bump with the same constants as the local-player path.
+    fn remote_block_hit(
+        remote_blockers: &[(Vec2, Vec2)],
+        enemy_pos: Vec2,
+        radius: f32,
+    ) -> Option<(Vec2, f32)> {
+        for (pos, look_dir) in remote_blockers {
+            if crate::entities::Player::block_collides(*pos, *look_dir, enemy_pos, radius) {
+                return Some((*look_dir, pos.distance(enemy_pos)));
+            }
+        }
+        None
+    }
+
     /// Static helper to find closest target from a list of positions
     fn find_closest_target(pos: Vec2, targets: &[Vec2]) -> Vec2 {
         if targets.is_empty() {
@@ -4323,5 +4402,90 @@ mod tests {
         assert_eq!(game.spiders[1].pos, Vec2::new(120.0, 80.0));
         assert!(game.spiders[1].alive);
         assert!(!game.last_enemy_sync_ticks.contains_key(&0xBEEF));
+    }
+
+    fn spider_sync(tick: u32, target: Vec2) -> EnemySync {
+        EnemySync {
+            tick,
+            wave: 1,
+            enemies: vec![EnemyState::new_spider(0, true, target, Vec2::new(1.0, 0.0))],
+        }
+    }
+
+    #[test]
+    fn enemy_corrections_follow_one_origin_until_it_goes_silent() {
+        let mut game = Game::new(800, 600);
+        game.wave = 1;
+        game.spiders
+            .push(Spider::new_at_position(0, Vec2::ZERO, &mut game.rng));
+        game.spiders[0].alive = true;
+
+        // First correction stream locks the enemy to origin A.
+        game.apply_enemy_sync(&spider_sync(10, Vec2::new(50.0, 0.0)), 0xAAAA, false, false);
+        let residual_a = game.enemy_corrections[&(0u8, 0u16)];
+        assert!(residual_a.x > 0.0);
+
+        // A rival origin correcting the same enemy is ignored while A's
+        // stream is fresh — this is what stops border ping-pong.
+        game.apply_enemy_sync(
+            &spider_sync(99, Vec2::new(-400.0, 0.0)),
+            0xBBBB,
+            false,
+            false,
+        );
+        assert!(game.enemy_corrections[&(0u8, 0u16)].x > 0.0);
+
+        // Once A has been silent past the lock window, B may take over.
+        game.frame_count += 46;
+        game.apply_enemy_sync(
+            &spider_sync(120, Vec2::new(-400.0, 0.0)),
+            0xBBBB,
+            false,
+            false,
+        );
+        assert!(game.enemy_corrections[&(0u8, 0u16)].x < 0.0);
+    }
+
+    #[test]
+    fn visible_enemy_corrections_glide_instead_of_jumping() {
+        let mut game = Game::new(800, 600);
+        game.wave = 1;
+        game.spiders
+            .push(Spider::new_at_position(0, Vec2::ZERO, &mut game.rng));
+        game.spiders[0].alive = true;
+
+        // On-screen target: position must not move at sync time...
+        game.apply_enemy_sync(&spider_sync(10, Vec2::new(60.0, 0.0)), 0xAAAA, false, false);
+        assert_eq!(game.spiders[0].pos, Vec2::ZERO);
+
+        // ...one correction step moves it a bounded distance...
+        game.apply_enemy_corrections();
+        let after_one = game.spiders[0].pos.x;
+        assert!(after_one > 0.0 && after_one < 60.0);
+
+        // ...and repeated steps converge on the authoritative position.
+        for _ in 0..60 {
+            game.apply_enemy_corrections();
+        }
+        assert!((game.spiders[0].pos.x - 60.0).abs() < 0.1);
+        assert!(!game.enemy_corrections.contains_key(&(0u8, 0u16)));
+    }
+
+    #[test]
+    fn off_screen_enemy_corrections_snap_immediately() {
+        let mut game = Game::new(800, 600);
+        game.wave = 1;
+        game.spiders.push(Spider::new_at_position(
+            0,
+            Vec2::new(5000.0, 5000.0),
+            &mut game.rng,
+        ));
+        game.spiders[0].alive = true;
+
+        let target = Vec2::new(5100.0, 5000.0);
+        game.apply_enemy_sync(&spider_sync(10, target), 0xAAAA, false, false);
+
+        assert_eq!(game.spiders[0].pos, target);
+        assert!(!game.enemy_corrections.contains_key(&(0u8, 0u16)));
     }
 }

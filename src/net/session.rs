@@ -2179,9 +2179,19 @@ impl NetworkSession {
             || heartbeat_due
             || !self.pending_map_peers.is_empty()
         {
+            // Joiners must get the area-authority map with their first
+            // topology map: broadcast_topology drains pending_map_peers, and
+            // an empty area map means "the host owns everything" to them, so
+            // they'd drop legitimate per-area corrections until the next
+            // heartbeat (enemies coast on prediction, then snap).
+            let joiner_waiting = !self.pending_map_peers.is_empty();
             self.last_topology_broadcast_frame = current_frame;
             self.roster_dirty = false;
             self.broadcast_topology();
+            if joiner_waiting && self.last_area_update_broadcast_frame != current_frame {
+                self.last_area_update_broadcast_frame = current_frame;
+                self.broadcast_area_authorities();
+            }
         }
     }
 
@@ -2508,9 +2518,22 @@ impl NetworkSession {
         if !pending.is_empty() {
             if let Some(full) = self.topology_map_message() {
                 let full_msg = NetMessage::TopologyUpdateEvent(full).to_bytes();
+                // Our cached area-authority map rides along (stamped with the
+                // same epoch as the map above, so the joiner's epoch gate
+                // accepts it): depth >= 2 joiners get their first map from us,
+                // not the root, and would otherwise treat every area as
+                // host-owned until the root's next area heartbeat.
+                let area_msg = if self.area_authorities.is_empty() {
+                    None
+                } else {
+                    Some(self.area_authority_update_message())
+                };
                 if let Some(socket) = &mut self.socket {
                     for peer_id in &pending {
                         socket.send(full_msg.clone().into_boxed_slice(), *peer_id);
+                        if let Some(area_msg) = &area_msg {
+                            socket.send(area_msg.clone().into_boxed_slice(), *peer_id);
+                        }
                     }
                 }
             }
@@ -3160,12 +3183,13 @@ impl NetworkSession {
         // copy, so a slow-propagating handoff silently drops legitimate
         // corrections (enemies coast on prediction, then snap). Broadcast
         // changes promptly — a small min-interval guards against border
-        // flapping — refresh waiting joiners (an empty map means "the host
-        // owns everything" to them), and keep the periodic heartbeat.
+        // flapping — and keep the periodic heartbeat. Joiners are refreshed
+        // alongside their first topology map (see update_topology_as_root and
+        // forward_topology_delta), not here: pending_map_peers can drain
+        // between recomputes, so gating on it here would race the throttle.
         if self.is_host {
             let since = current_frame.saturating_sub(self.last_area_update_broadcast_frame);
-            let due = since >= 120
-                || ((changed || !self.pending_map_peers.is_empty()) && since >= 15);
+            let due = since >= 120 || (changed && since >= 15);
             if due {
                 self.last_area_update_broadcast_frame = current_frame;
                 self.broadcast_area_authorities();
@@ -3536,14 +3560,10 @@ impl NetworkSession {
             .collect();
     }
 
-    fn broadcast_area_authorities(&mut self) {
-        if !self.is_host {
-            return;
-        }
-        let socket = match &mut self.socket {
-            Some(s) => s,
-            None => return,
-        };
+    /// Current area-authority map as a wire message, stamped with our current
+    /// relay epoch (matches any topology map sent in the same flush, so the
+    /// receiver's epoch gate accepts it).
+    fn area_authority_update_message(&self) -> Vec<u8> {
         let entries: Vec<AreaAuthorityEntry> = self
             .area_authorities
             .iter()
@@ -3556,7 +3576,18 @@ impl NetworkSession {
             epoch: self.relay_epoch,
             entries,
         };
-        let msg = NetMessage::AreaAuthorityUpdateEvent(update).to_bytes();
+        NetMessage::AreaAuthorityUpdateEvent(update).to_bytes()
+    }
+
+    fn broadcast_area_authorities(&mut self) {
+        if !self.is_host {
+            return;
+        }
+        let msg = self.area_authority_update_message();
+        let socket = match &mut self.socket {
+            Some(s) => s,
+            None => return,
+        };
         for peer_id in socket.connected_peers().collect::<Vec<_>>() {
             socket.send(msg.clone().into_boxed_slice(), peer_id);
         }
@@ -4831,12 +4862,16 @@ impl NetworkSession {
         self.remote_stats.clear();
     }
 
-    pub fn tick_playtime(&mut self, in_game: bool) {
+    /// Advance playtime by sim steps, not browser callbacks: rAF fires at the
+    /// display refresh rate, so counting invocations would credit a 120Hz
+    /// screen double time (and a watchdog-driven background tab almost none).
+    pub fn tick_playtime(&mut self, in_game: bool, steps: u32) {
         if !in_game {
             return;
         }
 
-        self.local_stats.time_played_frames = self.local_stats.time_played_frames.saturating_add(1);
+        self.local_stats.time_played_frames =
+            self.local_stats.time_played_frames.saturating_add(steps);
     }
 
     pub fn record_local_kill(&mut self, enemy_type: crate::net::EnemyType) {

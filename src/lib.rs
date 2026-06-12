@@ -2635,7 +2635,7 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
             }
 
             if in_multiplayer_room && state_ref.game.scene == Scene::Game {
-                state_ref.network.tick_playtime(true);
+                state_ref.network.tick_playtime(true, sim_steps);
             }
 
             if in_multiplayer_room && state_ref.game.scene == Scene::Game && became_host {
@@ -3227,7 +3227,10 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 1 => 4,
                 _ => 6,
             };
-            state_ref.send_counter += 1;
+            // Strides are denominated in 60/s sim frames; advancing by sim
+            // steps (not browser callbacks) keeps the wall-clock send rate
+            // independent of the display refresh rate.
+            state_ref.send_counter += sim_steps;
             if state_ref.send_counter >= player_send_stride {
                 state_ref.send_counter = 0;
                 let player = &state_ref.game.player;
@@ -3252,7 +3255,7 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     1 => 3,
                     _ => 4,
                 };
-                state_ref.input_send_counter += 1;
+                state_ref.input_send_counter += sim_steps;
                 if state_ref.input_send_counter >= input_send_stride {
                     state_ref.input_send_counter = 0;
                     let frame = state_ref.game.frame_count;
