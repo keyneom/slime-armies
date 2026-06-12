@@ -3153,12 +3153,23 @@ impl NetworkSession {
             authorities.insert(area_id, chosen);
         }
 
+        let changed = authorities != self.area_authorities;
         self.area_authorities = authorities;
-        if self.is_host
-            && current_frame.saturating_sub(self.last_area_update_broadcast_frame) >= 120
-        {
-            self.last_area_update_broadcast_frame = current_frame;
-            self.broadcast_area_authorities();
+        // Stale copies of this map are what open split-brain windows: senders
+        // claim areas and receivers filter corrections against their own
+        // copy, so a slow-propagating handoff silently drops legitimate
+        // corrections (enemies coast on prediction, then snap). Broadcast
+        // changes promptly — a small min-interval guards against border
+        // flapping — refresh waiting joiners (an empty map means "the host
+        // owns everything" to them), and keep the periodic heartbeat.
+        if self.is_host {
+            let since = current_frame.saturating_sub(self.last_area_update_broadcast_frame);
+            let due = since >= 120
+                || ((changed || !self.pending_map_peers.is_empty()) && since >= 15);
+            if due {
+                self.last_area_update_broadcast_frame = current_frame;
+                self.broadcast_area_authorities();
+            }
         }
     }
 

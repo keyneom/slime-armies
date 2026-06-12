@@ -2591,8 +2591,15 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 state_ref.network.handoff_root(frame_count);
                 state_ref.throttled_ticks = 0;
             }
+            // Zero steps is a valid outcome: rAF fires at the display refresh
+            // rate (120+Hz on ProMotion/gaming screens) while the sim is
+            // paced at 60/s by the wall clock. Forcing a minimum of one step
+            // per tick ran the whole game at 2x speed on those displays — and
+            // in multiplayer made each client's enemy prediction overshoot
+            // the authority's wall-clock sim, so every correction yanked
+            // enemies backward.
             let sim_steps = if state_ref.game.scene == Scene::Game {
-                net_delta.clamp(1, 30)
+                net_delta.min(30)
             } else {
                 1
             };
@@ -2614,7 +2621,11 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     step_input.end_frame();
                 }
             }
-            state_ref.input.end_frame();
+            if sim_steps > 0 {
+                // Keep edge-triggered presses pending across 0-step ticks so
+                // a tap landing between wall-clock frames isn't dropped.
+                state_ref.input.end_frame();
+            }
 
             if prev_scene != Scene::Game
                 && state_ref.game.scene == Scene::Game

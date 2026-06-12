@@ -187,6 +187,15 @@ pub struct Game {
     pub enemy_render_snapshot: Option<EnemyRenderSnapshot>,
     pub last_enemy_sync_tick: u32,
     last_enemy_sync_ticks: std::collections::HashMap<u64, u32>,
+    /// Per-enemy correction-stream lock: (origin, frame it last corrected).
+    /// With per-area authorities, two senders whose sims disagree about which
+    /// side of an area border an enemy is on can both claim it; following one
+    /// origin until it goes silent keeps the enemy on a single coherent
+    /// stream instead of teleporting between two divergent simulations.
+    enemy_sync_origins: std::collections::HashMap<(u8, u16), (u64, u32)>,
+    /// Residual correction error per enemy, bled in over sim frames so a
+    /// sync never moves a visible enemy in one jump.
+    enemy_corrections: std::collections::HashMap<(u8, u16), Vec2>,
     pub shockwave_cooldown: i32,
     pub shockwave_timer: i32,
     pub slow_spawn_timer: i32,
@@ -583,6 +592,8 @@ impl Game {
             enemy_render_snapshot: None,
             last_enemy_sync_tick: 0,
             last_enemy_sync_ticks: std::collections::HashMap::new(),
+            enemy_sync_origins: std::collections::HashMap::new(),
+            enemy_corrections: std::collections::HashMap::new(),
             shockwave_cooldown: 0,
             shockwave_timer: 0,
             slow_spawn_timer: 0,
@@ -710,17 +721,77 @@ impl Game {
     }
 
     /// Reconcile a locally predicted enemy position with the authoritative
-    /// one from a host sync: small errors blend smoothly (prediction keeps
-    /// motion fluid between syncs), large errors or revivals snap.
-    fn correct_prediction(pos: &mut Vec2, authoritative: Vec2, smooth: bool) {
-        const SNAP_DIST: f32 = 240.0;
-        const BLEND: f32 = 0.35;
+    /// one from a sync. Enemies the local player can't see (and revivals or
+    /// hopeless errors) snap outright; visible enemies queue the error as a
+    /// residual that apply_enemy_corrections bleeds in over the next frames,
+    /// so a sync never teleports an enemy on screen.
+    fn queue_enemy_correction(
+        corrections: &mut std::collections::HashMap<(u8, u16), Vec2>,
+        key: (u8, u16),
+        pos: &mut Vec2,
+        authoritative: Vec2,
+        smooth: bool,
+        visible: bool,
+    ) {
+        const SNAP_DIST: f32 = 600.0;
         let err = authoritative - *pos;
-        if !smooth || err.length() > SNAP_DIST {
+        if !smooth || !visible || err.length() > SNAP_DIST {
             *pos = authoritative;
+            corrections.remove(&key);
         } else {
-            *pos += err * BLEND;
+            corrections.insert(key, err);
         }
+    }
+
+    /// Bleed queued sync corrections into enemy positions a bounded step per
+    /// sim frame: fast enough to converge in a fraction of a second, slow
+    /// enough to read as motion rather than teleporting.
+    fn apply_enemy_corrections(&mut self) {
+        use crate::net::EnemyType;
+        if self.enemy_corrections.is_empty() {
+            return;
+        }
+        const RATE: f32 = 0.25;
+        const MIN_STEP: f32 = 0.75;
+        const MAX_STEP: f32 = 20.0;
+        let mut corrections = std::mem::take(&mut self.enemy_corrections);
+        corrections.retain(|&(type_u8, id), residual| {
+            let id = id as usize;
+            let pos = match EnemyType::from_u8(type_u8) {
+                Some(EnemyType::Spider) => match self.spiders.get_mut(id) {
+                    Some(e) if e.alive => &mut e.pos,
+                    _ => return false,
+                },
+                Some(EnemyType::Cannon) => match self.cannons.get_mut(id) {
+                    Some(e) if e.alive => &mut e.pos,
+                    _ => return false,
+                },
+                Some(EnemyType::Snake) => match self.snakes.get_mut(id) {
+                    Some(e) if e.alive => &mut e.pos,
+                    _ => return false,
+                },
+                Some(EnemyType::Wisp) => match self.wisps.get_mut(id) {
+                    Some(e) if e.alive => &mut e.pos,
+                    _ => return false,
+                },
+                Some(EnemyType::Guardian) => match self.guardians.get_mut(id) {
+                    Some(e) if e.alive => &mut e.pos,
+                    _ => return false,
+                },
+                None => return false,
+            };
+            let dist = residual.length();
+            if dist <= MIN_STEP {
+                *pos += *residual;
+                return false;
+            }
+            let step_len = (dist * RATE).clamp(MIN_STEP, MAX_STEP);
+            let step = *residual * (step_len / dist);
+            *pos += step;
+            *residual -= step;
+            true
+        });
+        self.enemy_corrections = corrections;
     }
 
     fn normalized_or(v: Vec2, fallback: Vec2) -> Vec2 {
@@ -986,6 +1057,7 @@ impl Game {
             self.trail_timer -= 1;
         }
         self.update_slime_trail();
+        self.apply_enemy_corrections();
 
         let player_stationary = input.axis.length() < 0.05;
         if authoritative && !self.guardians.is_empty() {
@@ -2047,6 +2119,8 @@ impl Game {
         self.snakes.clear();
         self.wisps.clear();
         self.guardians.clear();
+        self.enemy_sync_origins.clear();
+        self.enemy_corrections.clear();
 
         // Spawn enemies around the player position (in infinite world)
         // Use validated spawning to avoid placing enemies in obstacles
@@ -2875,6 +2949,8 @@ impl Game {
         self.remote_predictions.clear();
         self.last_enemy_sync_tick = 0;
         self.last_enemy_sync_ticks.clear();
+        self.enemy_sync_origins.clear();
+        self.enemy_corrections.clear();
         self.enemy_render_snapshot = None;
         self.wave_kill_counts = [0; 4];
         self.wave_kill_targets = [0; 4];
@@ -2953,6 +3029,8 @@ impl Game {
         self.remote_simulations.clear();
         self.remote_predictions.clear();
         self.last_enemy_sync_tick = 0;
+        self.enemy_sync_origins.clear();
+        self.enemy_corrections.clear();
         self.enemy_render_snapshot = None;
         self.wave_kill_counts = [0; 4];
         self.wave_kill_targets = [0; 4];
@@ -3546,7 +3624,26 @@ impl Game {
             self.snakes.clear();
             self.wisps.clear();
             self.guardians.clear();
+            self.enemy_sync_origins.clear();
+            self.enemy_corrections.clear();
         }
+        // Safety valve; wave-change clears keep these bounded in practice.
+        if self.enemy_sync_origins.len() > 4096 {
+            self.enemy_sync_origins.clear();
+        }
+
+        // How long a locked correction stream may go silent before another
+        // origin can take an enemy over (~0.75s at 60fps).
+        const ORIGIN_LOCK_SILENCE_FRAMES: u32 = 45;
+        let frame_count = self.frame_count;
+        let (vis_min_x, vis_min_y, vis_max_x, vis_max_y) = self.camera.visible_bounds();
+        let on_screen = |p: Vec2| {
+            const MARGIN: f32 = 64.0;
+            p.x >= vis_min_x - MARGIN
+                && p.x <= vis_max_x + MARGIN
+                && p.y >= vis_min_y - MARGIN
+                && p.y <= vis_max_y + MARGIN
+        };
 
         // Process each enemy in the sync
         for enemy_state in &sync.enemies {
@@ -3557,6 +3654,27 @@ impl Game {
             let alive = enemy_state.is_alive();
             let target_pos = enemy_state.pos();
             let target_dir = enemy_state.dir();
+
+            // Per-enemy stream lock: follow one origin per enemy so two
+            // authorities that disagree about an area border can't alternate
+            // corrections and teleport the enemy back and forth.
+            if !introductions_only {
+                let key = (enemy_state.enemy_type, enemy_state.id);
+                match self.enemy_sync_origins.get_mut(&key) {
+                    Some((locked_origin, last_frame)) if *locked_origin != origin_hash => {
+                        if frame_count.saturating_sub(*last_frame) <= ORIGIN_LOCK_SILENCE_FRAMES {
+                            continue;
+                        }
+                        *locked_origin = origin_hash;
+                        *last_frame = frame_count;
+                    }
+                    Some((_, last_frame)) => *last_frame = frame_count,
+                    None => {
+                        self.enemy_sync_origins
+                            .insert(key, (origin_hash, frame_count));
+                    }
+                }
+            }
 
             match enemy_type {
                 EnemyType::Spider => {
@@ -3580,11 +3698,21 @@ impl Game {
                     let was_alive = spider.alive;
                     spider.alive = alive;
                     if alive {
-                        Self::correct_prediction(&mut spider.pos, target_pos, was_alive);
+                        let visible = on_screen(spider.pos) || on_screen(target_pos);
+                        Self::queue_enemy_correction(
+                            &mut self.enemy_corrections,
+                            (enemy_state.enemy_type, enemy_state.id),
+                            &mut spider.pos,
+                            target_pos,
+                            was_alive,
+                            visible,
+                        );
                         spider.dir = Self::normalized_or(target_dir, spider.dir);
                     } else {
                         spider.pos = target_pos;
                         spider.speed = Vec2::ZERO;
+                        self.enemy_corrections
+                            .remove(&(enemy_state.enemy_type, enemy_state.id));
                     }
                 }
                 EnemyType::Cannon => {
@@ -3606,11 +3734,21 @@ impl Game {
                     let was_alive = cannon.alive;
                     cannon.alive = alive;
                     if alive {
-                        Self::correct_prediction(&mut cannon.pos, target_pos, was_alive);
+                        let visible = on_screen(cannon.pos) || on_screen(target_pos);
+                        Self::queue_enemy_correction(
+                            &mut self.enemy_corrections,
+                            (enemy_state.enemy_type, enemy_state.id),
+                            &mut cannon.pos,
+                            target_pos,
+                            was_alive,
+                            visible,
+                        );
                         cannon.look_dir = Self::normalized_or(target_dir, cannon.look_dir);
                     } else {
                         cannon.pos = target_pos;
                         cannon.speed = Vec2::ZERO;
+                        self.enemy_corrections
+                            .remove(&(enemy_state.enemy_type, enemy_state.id));
                     }
                 }
                 EnemyType::Snake => {
@@ -3640,11 +3778,21 @@ impl Game {
                     snake.alive = alive;
                     snake.size = target_size;
                     if alive {
-                        Self::correct_prediction(&mut snake.pos, target_pos, was_alive);
+                        let visible = on_screen(snake.pos) || on_screen(target_pos);
+                        Self::queue_enemy_correction(
+                            &mut self.enemy_corrections,
+                            (enemy_state.enemy_type, enemy_state.id),
+                            &mut snake.pos,
+                            target_pos,
+                            was_alive,
+                            visible,
+                        );
                         snake.dir = Self::normalized_or(target_dir, snake.dir);
                     } else {
                         snake.pos = target_pos;
                         snake.speed = Vec2::ZERO;
+                        self.enemy_corrections
+                            .remove(&(enemy_state.enemy_type, enemy_state.id));
                     }
                 }
                 EnemyType::Wisp => {
@@ -3665,10 +3813,20 @@ impl Game {
                     let was_alive = wisp.alive;
                     wisp.alive = alive;
                     if alive {
-                        Self::correct_prediction(&mut wisp.pos, target_pos, was_alive);
+                        let visible = on_screen(wisp.pos) || on_screen(target_pos);
+                        Self::queue_enemy_correction(
+                            &mut self.enemy_corrections,
+                            (enemy_state.enemy_type, enemy_state.id),
+                            &mut wisp.pos,
+                            target_pos,
+                            was_alive,
+                            visible,
+                        );
                         wisp.dir = Self::normalized_or(target_dir, wisp.dir);
                     } else {
                         wisp.pos = target_pos;
+                        self.enemy_corrections
+                            .remove(&(enemy_state.enemy_type, enemy_state.id));
                     }
                 }
                 EnemyType::Guardian => {
@@ -3686,11 +3844,21 @@ impl Game {
                     let was_alive = guardian.alive;
                     guardian.alive = alive;
                     if alive {
-                        Self::correct_prediction(&mut guardian.pos, target_pos, was_alive);
+                        let visible = on_screen(guardian.pos) || on_screen(target_pos);
+                        Self::queue_enemy_correction(
+                            &mut self.enemy_corrections,
+                            (enemy_state.enemy_type, enemy_state.id),
+                            &mut guardian.pos,
+                            target_pos,
+                            was_alive,
+                            visible,
+                        );
                         guardian.dir = Self::normalized_or(target_dir, guardian.dir);
                     } else {
                         guardian.pos = target_pos;
                         guardian.speed = Vec2::ZERO;
+                        self.enemy_corrections
+                            .remove(&(enemy_state.enemy_type, enemy_state.id));
                     }
                 }
             }
@@ -3858,6 +4026,8 @@ impl Game {
                 self.snakes.clear();
                 self.wisps.clear();
                 self.guardians.clear();
+                self.enemy_sync_origins.clear();
+                self.enemy_corrections.clear();
                 self.projectiles.clear();
                 Ok("cleared enemies and projectiles".to_string())
             }

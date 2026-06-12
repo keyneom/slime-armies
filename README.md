@@ -179,6 +179,15 @@ For features requiring persistence without dedicated servers, consider:
 
 This would maintain the P2P philosophy while enabling persistent features. Implementation deferred until core gameplay is solid.
 
+### Networking Consistency Enhancements
+
+CRDTs and simple consensus are worth considering only for low-rate, durable shared state, not per-frame enemy positions. Enemy motion should stay prediction + authority correction because consensus on every local movement update would add latency and bandwidth exactly where the game needs immediacy.
+
+Potential future uses:
+- **CRDTs**: eventually consistent room metadata, chat/moderation state, or other non-combat state where concurrent edits should merge instead of picking a single winner.
+- **Small quorum/consensus checks**: tournament results, paid unlock validation, authority handoff/fencing tokens, or suspicious kill/death outcomes where correctness matters more than frame-level latency.
+- **Authority-map hardening**: root-issued leases or monotonically increasing fencing epochs per area so receivers can reject stale enemy authorities without needing heavyweight consensus among every nearby node.
+
 ### Future Upgrades + Competitive Prizes
 - Paid upgrades could include a forward laser attack, stronger shields (e.g., 3/4 coverage), or other ability enhancements.
 - Competitive modes could award crypto prizes (e.g., last-slime-standing vs. environment, or PvP tournaments/gladiator fights).
