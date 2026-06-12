@@ -196,6 +196,10 @@ pub struct Game {
     /// Residual correction error per enemy, bled in over sim frames so a
     /// sync never moves a visible enemy in one jump.
     enemy_corrections: std::collections::HashMap<(u8, u16), Vec2>,
+    /// Frame each enemy was last killed locally. An authority that hasn't
+    /// processed the kill yet keeps syncing alive=true for a beat; without a
+    /// tombstone the enemy flickers back to life with a position snap.
+    enemy_recent_kills: std::collections::HashMap<(u8, u16), u32>,
     pub shockwave_cooldown: i32,
     pub shockwave_timer: i32,
     pub slow_spawn_timer: i32,
@@ -594,6 +598,7 @@ impl Game {
             last_enemy_sync_ticks: std::collections::HashMap::new(),
             enemy_sync_origins: std::collections::HashMap::new(),
             enemy_corrections: std::collections::HashMap::new(),
+            enemy_recent_kills: std::collections::HashMap::new(),
             shockwave_cooldown: 0,
             shockwave_timer: 0,
             slow_spawn_timer: 0,
@@ -618,7 +623,13 @@ impl Game {
             let sim = self
                 .remote_simulations
                 .entry(peer_id.clone())
-                .or_insert_with(|| RemoteSimulation::new_placeholder(self.frame_count));
+                .or_insert_with(|| {
+                    // Anchor placeholders in the SENDER's frame domain (input
+                    // stamps), never the local counter — the epochs are
+                    // unrelated, and a local-frame anchor can sit so far
+                    // "ahead" that authoritative states are ignored for ages.
+                    RemoteSimulation::new_placeholder(input_frame.frame.saturating_sub(1))
+                });
             sim.queue_input(input_frame.frame, input_frame.input);
         }
     }
@@ -632,48 +643,39 @@ impl Game {
         self.viewport_height = height;
     }
 
+    /// Re-anchor each remote player's input-replay prediction on their latest
+    /// authoritative state and extrapolate a bounded number of frames.
+    ///
+    /// Everything here lives in the SENDER's sim-frame domain: the anchor is
+    /// the state's own stamp and the replayed inputs carry the same counter,
+    /// so they actually match (local frame counters have unrelated epochs —
+    /// anchoring on them froze predictions and stranded every queued input).
+    /// `net_now` (the local wall clock) is only ever DIFFERENCED against the
+    /// local receive time to size the extrapolation budget.
     pub fn update_remote_predictions(
         &mut self,
         remote_players: &HashMap<String, crate::net::RemotePlayer>,
+        net_now: u32,
     ) {
         self.remote_predictions.clear();
 
         for (peer_id, remote) in remote_players {
+            let state = remote.last_authoritative_state();
+            let anchor = state.sim_frame();
             let sim = self
                 .remote_simulations
                 .entry(peer_id.clone())
-                .or_insert_with(|| {
-                    let state = PlayerState::new(
-                        remote.last_update_frame(),
-                        remote.pos,
-                        remote.look_dir,
-                        remote.move_dir,
-                        remote.alive,
-                        remote.attacking,
-                        remote.blocking,
-                        remote.phasing,
-                        remote.shielded,
-                    );
-                    RemoteSimulation::new_from_state(&state, remote.last_update_frame())
-                });
+                .or_insert_with(|| RemoteSimulation::new_from_state(&state, anchor));
 
-            let authoritative_frame = remote.last_update_frame();
-            if authoritative_frame > sim.last_authoritative_frame {
-                let state = PlayerState::new(
-                    authoritative_frame,
-                    remote.pos,
-                    remote.look_dir,
-                    remote.move_dir,
-                    remote.alive,
-                    remote.attacking,
-                    remote.blocking,
-                    remote.phasing,
-                    remote.shielded,
-                );
-                sim.apply_authoritative_state(&state, authoritative_frame);
+            if anchor > sim.last_authoritative_frame {
+                sim.apply_authoritative_state(&state, anchor);
             }
 
-            sim.simulate_to(self.frame_count, &self.chunks);
+            // Frames of wall time since this state arrived, plus a small
+            // transit allowance; capped so a stalled stream cannot run away.
+            let since_receive = net_now.saturating_sub(remote.last_update_frame());
+            let ahead = since_receive.min(12).saturating_add(2);
+            sim.simulate_to(anchor.saturating_add(ahead), &self.chunks);
             self.remote_predictions
                 .insert(peer_id.clone(), sim.predicted_state());
         }
@@ -741,6 +743,16 @@ impl Game {
         } else {
             corrections.insert(key, err);
         }
+    }
+
+    /// Record a kill so periodic syncs can't flicker the enemy back to life
+    /// (with a position snap) before the authority processes the kill event.
+    fn tombstone_enemy(&mut self, enemy_type: crate::net::EnemyType, enemy_id: u16) {
+        if self.enemy_recent_kills.len() > 4096 {
+            self.enemy_recent_kills.clear();
+        }
+        self.enemy_recent_kills
+            .insert((enemy_type as u8, enemy_id), self.frame_count);
     }
 
     /// Bleed queued sync corrections into enemy positions a bounded step per
@@ -1752,6 +1764,7 @@ impl Game {
             self.sound_events.push(SoundEvent::EnemyKill);
             self.pending_enemy_kills
                 .push((crate::net::EnemyType::Spider, enemy_id));
+            self.tombstone_enemy(crate::net::EnemyType::Spider, enemy_id);
         }
         for i in killed_cannons {
             let pos = self.cannons[i].pos;
@@ -1764,6 +1777,7 @@ impl Game {
             self.sound_events.push(SoundEvent::EnemyKill);
             self.pending_enemy_kills
                 .push((crate::net::EnemyType::Cannon, enemy_id));
+            self.tombstone_enemy(crate::net::EnemyType::Cannon, enemy_id);
         }
         for i in killed_snakes {
             let pos = self.snakes[i].pos;
@@ -1776,6 +1790,7 @@ impl Game {
             self.sound_events.push(SoundEvent::EnemyKill);
             self.pending_enemy_kills
                 .push((crate::net::EnemyType::Snake, enemy_id));
+            self.tombstone_enemy(crate::net::EnemyType::Snake, enemy_id);
         }
         for i in killed_wisps {
             let pos = self.wisps[i].pos;
@@ -1788,6 +1803,7 @@ impl Game {
             self.sound_events.push(SoundEvent::EnemyKill);
             self.pending_enemy_kills
                 .push((crate::net::EnemyType::Wisp, enemy_id));
+            self.tombstone_enemy(crate::net::EnemyType::Wisp, enemy_id);
         }
         for i in killed_guardians {
             let pos = self.guardians[i].pos;
@@ -1799,6 +1815,7 @@ impl Game {
             self.sound_events.push(SoundEvent::EnemyKill);
             self.pending_enemy_kills
                 .push((crate::net::EnemyType::Guardian, enemy_id));
+            self.tombstone_enemy(crate::net::EnemyType::Guardian, enemy_id);
         }
 
         // Spawn cannon projectiles
@@ -1963,6 +1980,7 @@ impl Game {
             self.sound_events.push(SoundEvent::EnemyKill);
             self.pending_enemy_kills
                 .push((crate::net::EnemyType::Spider, enemy_id));
+            self.tombstone_enemy(crate::net::EnemyType::Spider, enemy_id);
         }
         for i in killed_cannons {
             let pos = self.cannons[i].pos;
@@ -1974,6 +1992,7 @@ impl Game {
             self.sound_events.push(SoundEvent::EnemyKill);
             self.pending_enemy_kills
                 .push((crate::net::EnemyType::Cannon, enemy_id));
+            self.tombstone_enemy(crate::net::EnemyType::Cannon, enemy_id);
         }
         for i in killed_snakes {
             let pos = self.snakes[i].pos;
@@ -1985,6 +2004,7 @@ impl Game {
             self.sound_events.push(SoundEvent::EnemyKill);
             self.pending_enemy_kills
                 .push((crate::net::EnemyType::Snake, enemy_id));
+            self.tombstone_enemy(crate::net::EnemyType::Snake, enemy_id);
         }
         for i in killed_wisps {
             let pos = self.wisps[i].pos;
@@ -1996,6 +2016,7 @@ impl Game {
             self.sound_events.push(SoundEvent::EnemyKill);
             self.pending_enemy_kills
                 .push((crate::net::EnemyType::Wisp, enemy_id));
+            self.tombstone_enemy(crate::net::EnemyType::Wisp, enemy_id);
         }
     }
 
@@ -2184,6 +2205,7 @@ impl Game {
         self.guardians.clear();
         self.enemy_sync_origins.clear();
         self.enemy_corrections.clear();
+        self.enemy_recent_kills.clear();
 
         // Spawn enemies around the player position (in infinite world)
         // Use validated spawning to avoid placing enemies in obstacles
@@ -3014,6 +3036,7 @@ impl Game {
         self.last_enemy_sync_ticks.clear();
         self.enemy_sync_origins.clear();
         self.enemy_corrections.clear();
+        self.enemy_recent_kills.clear();
         self.enemy_render_snapshot = None;
         self.wave_kill_counts = [0; 4];
         self.wave_kill_targets = [0; 4];
@@ -3094,6 +3117,7 @@ impl Game {
         self.last_enemy_sync_tick = 0;
         self.enemy_sync_origins.clear();
         self.enemy_corrections.clear();
+        self.enemy_recent_kills.clear();
         self.enemy_render_snapshot = None;
         self.wave_kill_counts = [0; 4];
         self.wave_kill_targets = [0; 4];
@@ -3689,6 +3713,7 @@ impl Game {
             self.guardians.clear();
             self.enemy_sync_origins.clear();
             self.enemy_corrections.clear();
+            self.enemy_recent_kills.clear();
         }
         // Safety valve; wave-change clears keep these bounded in practice.
         if self.enemy_sync_origins.len() > 4096 {
@@ -3717,6 +3742,20 @@ impl Game {
             let alive = enemy_state.is_alive();
             let target_pos = enemy_state.pos();
             let target_dir = enemy_state.dir();
+
+            // A locally observed kill outranks in-flight alive=true syncs
+            // from an authority that hasn't processed the kill event yet —
+            // without this the enemy flickers back alive with a position
+            // snap, then dies again.
+            if alive {
+                let key = (enemy_state.enemy_type, enemy_state.id);
+                if let Some(killed_at) = self.enemy_recent_kills.get(&key) {
+                    if frame_count.saturating_sub(*killed_at) < 90 {
+                        continue;
+                    }
+                    self.enemy_recent_kills.remove(&key);
+                }
+            }
 
             // Per-enemy stream lock: follow one origin per enemy so two
             // authorities that disagree about an area border can't alternate
@@ -3933,6 +3972,7 @@ impl Game {
     pub fn kill_enemy(&mut self, enemy_type: crate::net::EnemyType, enemy_id: u16) {
         use crate::net::EnemyType;
 
+        self.tombstone_enemy(enemy_type, enemy_id);
         let id = enemy_id as usize;
         match enemy_type {
             EnemyType::Spider => {
@@ -4091,6 +4131,7 @@ impl Game {
                 self.guardians.clear();
                 self.enemy_sync_origins.clear();
                 self.enemy_corrections.clear();
+                self.enemy_recent_kills.clear();
                 self.projectiles.clear();
                 Ok("cleared enemies and projectiles".to_string())
             }
@@ -4487,5 +4528,82 @@ mod tests {
 
         assert_eq!(game.spiders[0].pos, target);
         assert!(!game.enemy_corrections.contains_key(&(0u8, 0u16)));
+    }
+
+    #[test]
+    fn remote_predictions_anchor_and_replay_in_sender_frame_domain() {
+        use std::collections::HashMap;
+
+        let mut game = Game::new(800, 600);
+        game.wave = 1;
+        // Local sim epoch wildly different from the sender's: predictions
+        // must never compare sender stamps against this counter.
+        game.frame_count = 50_000;
+
+        // Sender stamped this state at frame 1000 of THEIR sim clock;
+        // received locally at net frame 7.
+        let state = PlayerState::new(
+            1000,
+            Vec2::ZERO,
+            Vec2::RIGHT,
+            Vec2::ZERO,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        let remote = crate::net::RemotePlayer::new("p".to_string(), &state, 7);
+        let mut remotes = HashMap::new();
+        remotes.insert("peer".to_string(), remote);
+
+        // First pass anchors the sim on the received state.
+        game.update_remote_predictions(&remotes, 7);
+
+        // Sender-domain input frames after the anchor: held right.
+        let inputs: Vec<(String, crate::net::InputFrame)> = (1001..=1006)
+            .map(|frame| {
+                (
+                    "peer".to_string(),
+                    crate::net::InputFrame {
+                        frame,
+                        input: crate::input::BUTTON_RIGHT,
+                    },
+                )
+            })
+            .collect();
+        game.queue_remote_inputs(&inputs);
+
+        // Five net frames later the prediction should have replayed those
+        // inputs and extrapolated rightward from the anchor.
+        game.update_remote_predictions(&remotes, 12);
+        let predicted = game.remote_predictions().get("peer").unwrap();
+        assert!(
+            predicted.pos().x > 0.0,
+            "expected rightward extrapolation, got {:?}",
+            predicted.pos()
+        );
+    }
+
+    #[test]
+    fn recently_killed_enemies_ignore_alive_syncs() {
+        let mut game = Game::new(800, 600);
+        game.wave = 1;
+        game.spiders
+            .push(Spider::new_at_position(0, Vec2::ZERO, &mut game.rng));
+        game.spiders[0].alive = true;
+
+        game.kill_enemy(crate::net::EnemyType::Spider, 0);
+        assert!(!game.spiders[0].alive);
+
+        // An authority that hasn't processed the kill yet keeps syncing
+        // alive=true; the tombstone must win.
+        game.apply_enemy_sync(&spider_sync(10, Vec2::new(40.0, 0.0)), 0xAAAA, false, false);
+        assert!(!game.spiders[0].alive);
+
+        // Once the tombstone expires, syncs may legitimately revive.
+        game.frame_count += 120;
+        game.apply_enemy_sync(&spider_sync(20, Vec2::new(40.0, 0.0)), 0xAAAA, false, false);
+        assert!(game.spiders[0].alive);
     }
 }

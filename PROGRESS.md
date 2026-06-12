@@ -44,6 +44,39 @@ device):
       blocking collisions (remote `blocking` flag + predicted positions are
       already available).
 
+### Follow-up pass (same day): remote-player frame-domain bugs
+
+Symptoms: enemies still made big jumps; remote players crawled to their stop
+position after the controlling player stopped moving. Root cause: the
+remote-player prediction pipeline mixed THREE unrelated frame counters —
+PlayerState was stamped with the wall-clock net frame, InputFrame with the
+sender's `game.frame_count`, and RemoteSimulation anchored at the receiver's
+net frame while simulating to the receiver's `game.frame_count`. Counters
+have unrelated epochs across machines, so input replay never matched (inputs
+piled up unconsumed), placeholder sims could park anchors so far "ahead" that
+authoritative states were ignored for ages, and `apply_predicted_states`
+stomped the displayed position with this broken prediction every tick (wiping
+the interpolator — hence the post-stop crawl). Enemy AI targets remote
+players through these predictions, so every machine's enemy sim chased
+different player positions — diverged sims = constant big corrections.
+
+- [x] PlayerState is now stamped with the sender's sim frame (same domain as
+      InputFrame). RemoteSimulation anchors at the state's own stamp, replays
+      sender-domain inputs (they match now), and extrapolates a bounded
+      `frames-since-receive + transit` budget (capped) instead of "to the
+      local frame counter".
+- [x] Placeholder sims (input arrives before first state) anchor at the
+      input's sender-domain stamp.
+- [x] `apply_predicted_state` no longer hard-sets the displayed position; it
+      only retargets the interpolator, which glides (and snaps only above
+      300px, for genuine teleports like respawns).
+- [x] Enemy kill tombstones (~1.5s): a locally observed kill outranks
+      in-flight alive=true syncs from an authority that hasn't processed the
+      kill yet — removes the revive-flicker position snap during combat.
+- [x] Tests: sender-domain anchor/replay regression test (with deliberately
+      mismatched local epoch), kill-tombstone test (40 lib tests green;
+      wasm32 check clean).
+
 ## Current Session - Topology Control-Plane Rewrite (sticky root + map)
 
 ### Why

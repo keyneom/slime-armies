@@ -20,6 +20,9 @@ pub struct RemotePlayer {
     avg_update_delta_frames: f32,
     last_state_frame: u32,
     last_update_frame: u32,
+    /// Last authoritative state exactly as received (sender frame domain).
+    /// Predictions anchor on this — never on the smoothed display fields.
+    last_state: PlayerState,
 }
 
 impl RemotePlayer {
@@ -40,6 +43,7 @@ impl RemotePlayer {
             avg_update_delta_frames: 6.0,
             last_state_frame: state.sim_frame(),
             last_update_frame: frame,
+            last_state: *state,
         }
     }
 
@@ -71,13 +75,21 @@ impl RemotePlayer {
         self.shielded = state.is_shielded();
         self.last_state_frame = state.sim_frame();
         self.last_update_frame = frame;
+        self.last_state = *state;
     }
 
+    /// The raw last received state, for anchoring input-replay predictions.
+    pub fn last_authoritative_state(&self) -> PlayerState {
+        self.last_state
+    }
+
+    /// Adopt an input-replay prediction as the smoothing target. The display
+    /// position is NOT set here: update() glides toward the target, so a
+    /// prediction correction never teleports the player on screen (the old
+    /// hard `pos = predicted` reset wiped the interpolator every tick).
     pub fn apply_predicted_state(&mut self, state: &PlayerState) {
-        let pos = state.pos();
-        self.target_pos = pos;
+        self.target_pos = state.pos();
         self.target_velocity = Vec2::ZERO;
-        self.pos = pos;
         self.look_dir = state.look_dir();
         self.move_dir = state.move_dir();
         self.alive = state.is_alive();
@@ -89,10 +101,16 @@ impl RemotePlayer {
 
     /// Interpolate position each frame
     pub fn update(&mut self) {
+        const SNAP_DIST: f32 = 300.0;
         let predict_frames = (self.avg_update_delta_frames * 0.5).clamp(0.0, 4.0);
         let predicted_target = self.target_pos + self.target_velocity * predict_frames;
-        let blend = (2.4 / self.avg_update_delta_frames.max(2.0)).clamp(0.18, 0.60);
-        self.pos = self.pos.lerp(predicted_target, blend);
+        // Genuine relocations (respawns, phases) snap; everything else glides.
+        if (predicted_target - self.pos).length() > SNAP_DIST {
+            self.pos = predicted_target;
+        } else {
+            let blend = (2.4 / self.avg_update_delta_frames.max(2.0)).clamp(0.18, 0.60);
+            self.pos = self.pos.lerp(predicted_target, blend);
+        }
 
         if self.move_dir.length_squared() == 0.0 && self.target_velocity.length_squared() > 0.0001 {
             self.move_dir = self.target_velocity.normalize();

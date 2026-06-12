@@ -2562,7 +2562,9 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     state_ref.game.queue_remote_inputs(&formatted_inputs);
                 }
                 let remote_players = state_ref.network.remote_players.clone();
-                state_ref.game.update_remote_predictions(&remote_players);
+                state_ref
+                    .game
+                    .update_remote_predictions(&remote_players, frame_count);
                 let predictions = state_ref.game.remote_predictions().clone();
                 state_ref.network.apply_predicted_states(&predictions);
             }
@@ -3233,9 +3235,16 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
             state_ref.send_counter += sim_steps;
             if state_ref.send_counter >= player_send_stride {
                 state_ref.send_counter = 0;
+                // Stamp with the sim frame counter — the SAME domain as
+                // InputFrame stamps — so receivers can anchor input-replay
+                // predictions at this state and match our input frames
+                // against it. (The wall-clock net frame is a different
+                // counter with a different epoch; mixing the two made input
+                // replay never match and froze prediction anchors.)
+                let sim_frame = state_ref.game.frame_count;
                 let player = &state_ref.game.player;
                 let player_state = PlayerState::new(
-                    frame_count,
+                    sim_frame,
                     player.pos,
                     player.look_dir,
                     player.move_dir,
