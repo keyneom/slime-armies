@@ -494,7 +494,12 @@ pub fn create_room() -> String {
             }
             let server = signaling_server_url();
             let ice = ice_config();
-            state_ref.network.create_room(&server, &ice)
+            let code = state_ref.network.create_room(&server, &ice);
+            // The room code seeds world generation (seed_from_room_code), so
+            // the creator must hold it too or they generate a different world
+            // than every joiner. The in-game menu path already does this.
+            state_ref.game.room_code_input = code.clone();
+            code
         } else {
             String::new()
         }
@@ -927,6 +932,52 @@ pub fn test_runtime_state() -> String {
             )
         } else {
             "scene=uninitialized;network=uninitialized;room=;players=0;map_open=false;player_list_open=false;chat_open=false".to_string()
+        }
+    })
+}
+
+/// Test/debug: full dump of alive enemies + area-authority diagnostics as
+/// JSON, for cross-window jitter measurement in browser-driven tests.
+/// Entries are [type, id, x, y]; types: 0 spider, 1 cannon, 2 snake,
+/// 3 wisp, 4 guardian.
+#[wasm_bindgen]
+pub fn test_enemy_positions() -> String {
+    GAME_STATE.with(|gs| {
+        let Ok(game_state) = gs.try_borrow() else {
+            return "{\"busy\":true}".to_string();
+        };
+        if let Some(state) = game_state.as_ref() {
+            let Ok(state_ref) = state.try_borrow() else {
+                return "{\"busy\":true}".to_string();
+            };
+            let game = &state_ref.game;
+            let mut parts: Vec<String> = Vec::new();
+            for e in game.spiders.iter().filter(|e| e.alive) {
+                parts.push(format!("[0,{},{:.1},{:.1}]", e.id, e.pos.x, e.pos.y));
+            }
+            for e in game.cannons.iter().filter(|e| e.alive) {
+                parts.push(format!("[1,{},{:.1},{:.1}]", e.id, e.pos.x, e.pos.y));
+            }
+            for e in game.snakes.iter().filter(|e| e.alive) {
+                parts.push(format!("[2,{},{:.1},{:.1}]", e.id, e.pos.x, e.pos.y));
+            }
+            for e in game.wisps.iter().filter(|e| e.alive) {
+                parts.push(format!("[3,{},{:.1},{:.1}]", e.id, e.pos.x, e.pos.y));
+            }
+            for e in game.guardians.iter().filter(|e| e.alive) {
+                parts.push(format!("[4,{},{:.1},{:.1}]", e.id, e.pos.x, e.pos.y));
+            }
+            format!(
+                "{{\"tick\":{},\"wave\":{},\"px\":{:.1},\"py\":{:.1},\"areas\":{},\"enemies\":[{}]}}",
+                game.frame_count,
+                game.wave,
+                game.player.pos.x,
+                game.player.pos.y,
+                state_ref.network.area_authority_debug(),
+                parts.join(",")
+            )
+        } else {
+            "{\"uninitialized\":true}".to_string()
         }
     })
 }
@@ -3146,12 +3197,18 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 // Delta-based, never modulo: the wall-clock frame counter
                 // advances in fixed jumps on throttled tabs, which makes
                 // `% stride` lock onto a non-zero residue forever.
+                // A watchdog-driven (hidden/occluded) tab simulates in coarse
+                // catch-up bursts; broadcasting corrections from that sim
+                // teleports enemies on every healthy screen. Stay silent while
+                // throttled — the root reassigns our areas within frames, and
+                // receivers' prediction covers the gap.
+                let sim_throttled = state_ref.throttled_ticks > 0;
                 if frame_count.saturating_sub(state_ref.last_enemy_sync_sent_frame)
                     >= enemy_sync_stride
                 {
                     state_ref.last_enemy_sync_sent_frame = frame_count;
                     let owned = state_ref.network.owned_area_ids();
-                    if is_host || !owned.is_empty() {
+                    if !sim_throttled && (is_host || !owned.is_empty()) {
                         let assigned = state_ref.network.assigned_area_ids();
                         let enemy_sync = state_ref
                             .game
@@ -3161,7 +3218,7 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                         }
                     }
                 }
-                if is_host {
+                if is_host && !sim_throttled {
                     let intro_due = state_ref.last_enemy_intro_wave != state_ref.game.wave
                         || state_ref.last_enemy_intro_sent_frame == 0
                         || frame_count.saturating_sub(state_ref.last_enemy_intro_sent_frame)

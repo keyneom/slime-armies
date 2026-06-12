@@ -36,13 +36,28 @@ device):
       (`update_topology_as_root`) and depth >= 2 (`forward_topology_delta`,
       epoch-stamped to pass the receiver gate) — instead of treating every
       area as host-owned until the heartbeat (P1 review finding).
+- [x] **Hidden enemy motion state diverged across peers**: spiders/cannons
+      had random `target_offset`, and wisps had random initial direction /
+      wobble phase. Sync-created enemies or different placeholder RNG order
+      meant non-authority clients followed a different curve forever, so they
+      needed repeated visible corrections. These values now derive
+      deterministically from enemy id.
+- [x] **Visible correction cap was still too sharp**: the smoother could
+      consume residual error at 20px/sim frame, which read as a lurch during
+      area-authority correction. The visible correction cap is now 8px/frame
+      with a lower blend rate.
 - [x] Tests: origin-lock takeover, visible-glide convergence, off-screen
-      snap (38 lib tests green; wasm32 check clean).
-- [ ] Follow-up: block knockback (bumps) is local-only — the area authority
-      never hears about another player's bumps, so its next correction shoves
-      the enemy back. Needs authority-side simulation of remote players'
-      blocking collisions (remote `blocking` flag + predicted positions are
-      already available).
+      snap (40 lib tests green; wasm32 check clean).
+- [x] Remote blocking bump follow-up: enemy simulation now includes blocking
+      remote players from predicted remote states, so an area authority sees
+      the same shield bump instead of syncing the enemy back into the blocker.
+- [x] Empirical probe: `scripts/jitter_probe.mjs` now creates separate Chrome
+      windows via CDP (background tabs produced false jumps) and reports
+      visible-vs-offscreen enemy jumps. Final local 3-window runs:
+      - `cluster`: 0 visible jumps, 0 reversals, visible enemy divergence
+        p99=37px / max=42px, remote-player error p99=11px / max=15px.
+      - `border`: 0 visible jumps, 0 reversals, visible enemy divergence
+        p99=37px / max=130px, remote-player error p99=11px / max=14px.
 
 ### Follow-up pass (same day): remote-player frame-domain bugs
 

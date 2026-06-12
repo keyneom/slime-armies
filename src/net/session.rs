@@ -187,6 +187,10 @@ pub struct NetworkSession {
     peer_connected_frames: HashMap<matchbox_socket::PeerId, u32>,
     pub relay_telemetry: RelayTelemetry,
     last_update_frame: u32,
+    /// While current_frame is below this, the local node refuses enemy area
+    /// authority (set when the loop is detected running on the hidden-tab
+    /// watchdog instead of rAF).
+    local_throttle_hold_until: u32,
     last_lowpri_chat_frame: u32,
     last_lowpri_vote_frame: u32,
     last_lowpri_ack_frame: u32,
@@ -598,6 +602,7 @@ impl NetworkSession {
             peer_connected_frames: HashMap::new(),
             relay_telemetry: RelayTelemetry::default(),
             last_update_frame: 0,
+            local_throttle_hold_until: 0,
             last_lowpri_chat_frame: u32::MAX,
             last_lowpri_vote_frame: u32::MAX,
             last_lowpri_ack_frame: u32::MAX,
@@ -935,6 +940,15 @@ impl NetworkSession {
     /// Poll for network events and update state
     /// Returns true if update succeeded, false if connection failed
     pub fn update(&mut self, current_frame: u32) -> bool {
+        // Self-throttle detection: a hidden/occluded tab's loop is driven by
+        // the 1-2Hz watchdog, so update() sees large net-frame gaps. While
+        // throttled (plus a 2s recovery hold), this node must not act as an
+        // enemy area authority — its catch-up-burst sim teleports enemies on
+        // every healthy screen.
+        let tick_gap = current_frame.saturating_sub(self.last_update_frame);
+        if self.last_update_frame != 0 && tick_gap >= 20 {
+            self.local_throttle_hold_until = current_frame.saturating_add(120);
+        }
         self.last_update_frame = current_frame;
         // Check if socket loop has ended (connection failed)
         if self.socket_closed.get() {
@@ -3113,19 +3127,30 @@ impl NetworkSession {
         }
 
         // Candidate members with known positions (self + visible remotes).
+        // Throttled/background members are excluded: a tab whose loop runs on
+        // the 1-2Hz hidden-tab watchdog simulates enemies in coarse catch-up
+        // bursts, and making it an authority teleports those enemies on every
+        // healthy player's screen (measured: ~80 jumps/25s per viewer).
+        // Healthy members' states arrive every few frames; watchdog-driven
+        // ones every ~60, so state recency separates them cleanly.
+        const AUTHORITY_STATE_FRESHNESS_FRAMES: u32 = 30;
         let mut member_positions: Vec<(u64, Vec2)> = Vec::new();
         if let (Some(local_hash), Some(pos)) = (self.local_peer_hash, self.local_last_pos) {
-            member_positions.push((local_hash, pos));
+            if current_frame >= self.local_throttle_hold_until {
+                member_positions.push((local_hash, pos));
+            }
         }
         for (peer_id, remote) in &self.remote_players {
             let hash = Self::peer_identity_hash(peer_id);
-            if self.roster_contains(hash) {
+            let fresh = current_frame.saturating_sub(remote.last_update_frame())
+                <= AUTHORITY_STATE_FRESHNESS_FRAMES;
+            if fresh && self.roster_contains(hash) {
                 member_positions.push((hash, remote.pos));
             }
         }
-        if member_positions.is_empty() {
-            return;
-        }
+        // No early return when empty: with every member throttled/stale, the
+        // map must CLEAR (all areas fall back to the host) rather than keep
+        // pinning areas to nodes that can no longer simulate them.
         // Deterministic order so ties resolve identically everywhere.
         member_positions.sort_by_key(|(hash, _)| *hash);
 
@@ -3591,6 +3616,33 @@ impl NetworkSession {
         for peer_id in socket.connected_peers().collect::<Vec<_>>() {
             socket.send(msg.clone().into_boxed_slice(), peer_id);
         }
+    }
+
+    /// Test/debug: the area-authority map as JSON for browser-driven probes.
+    pub fn area_authority_debug(&self) -> String {
+        let local = self.local_peer_hash.unwrap_or(0);
+        let mut entries: Vec<(u32, u64)> = self
+            .area_authorities
+            .iter()
+            .map(|(area, hash)| (*area, *hash))
+            .collect();
+        entries.sort_unstable();
+        let body: Vec<String> = entries
+            .iter()
+            .map(|(area, hash)| {
+                format!(
+                    "[{},\"{:04x}\",{}]",
+                    area,
+                    hash & 0xFFFF,
+                    u8::from(*hash == local)
+                )
+            })
+            .collect();
+        format!(
+            "{{\"local\":\"{:04x}\",\"entries\":[{}]}}",
+            local & 0xFFFF,
+            body.join(",")
+        )
     }
 
     pub fn mark_enemy_sync_received(&mut self, current_frame: u32) {
@@ -7013,6 +7065,70 @@ mod tests {
         let unassigned = NetworkSession::area_id_for_pos(Vec2::new(-100_000.0, -100_000.0));
         assert!(session.area_owned_by(unassigned, hash_for(root)));
         assert!(!session.area_owned_by(unassigned, hash_for(remote)));
+    }
+
+    #[test]
+    fn area_authority_skips_throttled_and_stale_members() {
+        let root = peer_from(0);
+        let remote = peer_from(1);
+
+        let mut session = NetworkSession::new();
+        session.is_host = true;
+        session.local_peer_id = Some(root);
+        session.local_peer_hash = Some(hash_for(root));
+        session.super_root_id = Some(root);
+        session.topology_roster = vec![entry_for(root, 0), entry_for(remote, hash_for(root))];
+        session.local_last_pos = Some(Vec2::new(0.0, 0.0));
+
+        let far = Vec2::new(100_000.0, 0.0);
+        let far_area = NetworkSession::area_id_for_pos(far);
+        let near_area = NetworkSession::area_id_for_pos(Vec2::new(0.0, 0.0));
+
+        let remote_id = format!("{:?}", remote);
+        let state = PlayerState::new(
+            1,
+            far,
+            Vec2::RIGHT,
+            Vec2::RIGHT,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        session.peer_id_lookup.insert(remote_id.clone(), remote);
+        session
+            .peer_hash_lookup
+            .insert(hash_for(remote), remote_id.clone());
+        // Remote's last state arrived at frame 1; recomputing at frame 200
+        // means it's a background tab (watchdog cadence), so it must not own
+        // its area — enemies there fall back to the host.
+        session.remote_players.insert(
+            remote_id.clone(),
+            RemotePlayer::new("FAR".to_string(), &state, 1),
+        );
+        session.recompute_area_authorities(200);
+        assert_eq!(
+            session.area_authorities.get(&far_area),
+            None,
+            "stale member must not be an area authority"
+        );
+        assert!(session.area_owned_by(far_area, hash_for(root)));
+
+        // A locally throttled node refuses authority for its own area too.
+        session.local_throttle_hold_until = 500;
+        session.recompute_area_authorities(300);
+        assert_eq!(
+            session.area_authorities.get(&near_area),
+            None,
+            "throttled local node must not claim its area"
+        );
+        // After the hold expires it resumes ownership.
+        session.recompute_area_authorities(600);
+        assert_eq!(
+            session.area_authorities.get(&near_area),
+            Some(&hash_for(root)),
+        );
     }
 
     #[test]

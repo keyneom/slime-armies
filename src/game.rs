@@ -763,9 +763,9 @@ impl Game {
         if self.enemy_corrections.is_empty() {
             return;
         }
-        const RATE: f32 = 0.25;
+        const RATE: f32 = 0.18;
         const MIN_STEP: f32 = 0.75;
-        const MAX_STEP: f32 = 20.0;
+        const MAX_STEP: f32 = 8.0;
         let mut corrections = std::mem::take(&mut self.enemy_corrections);
         corrections.retain(|&(type_u8, id), residual| {
             let id = id as usize;
@@ -4499,10 +4499,10 @@ mod tests {
         game.apply_enemy_sync(&spider_sync(10, Vec2::new(60.0, 0.0)), 0xAAAA, false, false);
         assert_eq!(game.spiders[0].pos, Vec2::ZERO);
 
-        // ...one correction step moves it a bounded distance...
+        // ...one correction step moves it a bounded, visually small distance...
         game.apply_enemy_corrections();
         let after_one = game.spiders[0].pos.x;
-        assert!(after_one > 0.0 && after_one < 60.0);
+        assert!(after_one > 0.0 && after_one <= 8.0);
 
         // ...and repeated steps converge on the authoritative position.
         for _ in 0..60 {

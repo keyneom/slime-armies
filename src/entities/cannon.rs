@@ -5,6 +5,20 @@ use rand::Rng;
 const ACCEL: f32 = 0.02;
 const SPEED_MAX: f32 = 0.7;
 
+fn unit_from_id(id: usize, salt: u32) -> f32 {
+    let mut x = (id as u32).wrapping_mul(747_796_405).wrapping_add(salt);
+    x = ((x >> ((x >> 28) + 4)) ^ x).wrapping_mul(277_803_737);
+    x = (x >> 22) ^ x;
+    x as f32 / u32::MAX as f32
+}
+
+fn target_offset_for(id: usize) -> Vec2 {
+    Vec2::new(
+        unit_from_id(id, 0xc04a_11a5) * 1.2 - 0.6,
+        unit_from_id(id, 0x27b3_d19f) * 1.2 - 0.6,
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct Cannon {
     pub id: usize,
@@ -44,7 +58,7 @@ impl Cannon {
             speed: Vec2::ZERO,
             dir: Vec2::ZERO,
             look_dir: Vec2::ZERO,
-            target_offset: Vec2::new(rng.gen::<f32>() * 1.2 - 0.6, rng.gen::<f32>() * 1.2 - 0.6),
+            target_offset: target_offset_for(id),
             shoot_timer: (id * 10) as u32,
         }
     }
@@ -72,7 +86,7 @@ impl Cannon {
             speed: Vec2::ZERO,
             dir: Vec2::ZERO,
             look_dir: Vec2::ZERO,
-            target_offset: Vec2::new(rng.gen::<f32>() * 1.2 - 0.6, rng.gen::<f32>() * 1.2 - 0.6),
+            target_offset: target_offset_for(id),
             shoot_timer: (id * 10) as u32,
         }
     }
@@ -109,12 +123,12 @@ impl Cannon {
             speed: Vec2::ZERO,
             dir: Vec2::ZERO,
             look_dir: Vec2::ZERO,
-            target_offset: Vec2::new(rng.gen::<f32>() * 1.2 - 0.6, rng.gen::<f32>() * 1.2 - 0.6),
+            target_offset: target_offset_for(id),
             shoot_timer: (id * 10) as u32,
         }
     }
 
-    pub fn new_at_position<R: Rng>(id: usize, pos: Vec2, rng: &mut R) -> Self {
+    pub fn new_at_position<R: Rng>(id: usize, pos: Vec2, _rng: &mut R) -> Self {
         Self {
             id,
             alive: true,
@@ -122,7 +136,7 @@ impl Cannon {
             speed: Vec2::ZERO,
             dir: Vec2::ZERO,
             look_dir: Vec2::ZERO,
-            target_offset: Vec2::new(rng.gen::<f32>() * 1.2 - 0.6, rng.gen::<f32>() * 1.2 - 0.6),
+            target_offset: target_offset_for(id),
             shoot_timer: (id * 10) as u32,
         }
     }

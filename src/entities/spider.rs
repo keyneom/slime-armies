@@ -5,6 +5,20 @@ use rand::Rng;
 const ACCEL: f32 = 0.08;
 const SPEED_MAX: f32 = 2.5;
 
+fn unit_from_id(id: usize, salt: u32) -> f32 {
+    let mut x = (id as u32).wrapping_mul(747_796_405).wrapping_add(salt);
+    x = ((x >> ((x >> 28) + 4)) ^ x).wrapping_mul(277_803_737);
+    x = (x >> 22) ^ x;
+    x as f32 / u32::MAX as f32
+}
+
+fn target_offset_for(id: usize) -> Vec2 {
+    Vec2::new(
+        unit_from_id(id, 0x51f1_5eED) * 1.2 - 0.6,
+        unit_from_id(id, 0xa17c_9E11) * 1.2 - 0.6,
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct Spider {
     pub id: usize,
@@ -43,7 +57,7 @@ impl Spider {
             pos,
             speed: Vec2::ZERO,
             dir,
-            target_offset: Vec2::new(rng.gen::<f32>() * 1.2 - 0.6, rng.gen::<f32>() * 1.2 - 0.6),
+            target_offset: target_offset_for(id),
         }
     }
 
@@ -66,7 +80,7 @@ impl Spider {
             pos,
             speed: Vec2::ZERO,
             dir,
-            target_offset: Vec2::new(rng.gen::<f32>() * 1.2 - 0.6, rng.gen::<f32>() * 1.2 - 0.6),
+            target_offset: target_offset_for(id),
         }
     }
 
@@ -134,18 +148,18 @@ impl Spider {
             pos,
             speed: Vec2::ZERO,
             dir,
-            target_offset: Vec2::new(rng.gen::<f32>() * 1.2 - 0.6, rng.gen::<f32>() * 1.2 - 0.6),
+            target_offset: target_offset_for(id),
         }
     }
 
-    pub fn new_at_position<R: Rng>(id: usize, pos: Vec2, rng: &mut R) -> Self {
+    pub fn new_at_position<R: Rng>(id: usize, pos: Vec2, _rng: &mut R) -> Self {
         Self {
             id,
             alive: true,
             pos,
             speed: Vec2::ZERO,
             dir: Vec2::new(0.0, -1.0),
-            target_offset: Vec2::new(rng.gen::<f32>() * 1.2 - 0.6, rng.gen::<f32>() * 1.2 - 0.6),
+            target_offset: target_offset_for(id),
         }
     }
 

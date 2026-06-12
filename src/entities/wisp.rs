@@ -6,6 +6,22 @@ const WISP_SPEED: f32 = 2.6;
 const WISP_WOBBLE: f32 = 0.6;
 const WISP_WOBBLE_SPEED: f32 = 0.22;
 
+fn unit_from_id(id: usize, salt: u32) -> f32 {
+    let mut x = (id as u32).wrapping_mul(747_796_405).wrapping_add(salt);
+    x = ((x >> ((x >> 28) + 4)) ^ x).wrapping_mul(277_803_737);
+    x = (x >> 22) ^ x;
+    x as f32 / u32::MAX as f32
+}
+
+fn initial_dir_for(id: usize) -> Vec2 {
+    let angle = unit_from_id(id, 0x915f_2d3b) * std::f32::consts::TAU;
+    Vec2::new(angle.cos(), angle.sin())
+}
+
+fn wobble_phase_for(id: usize) -> f32 {
+    unit_from_id(id, 0x4b1d_7a6c) * std::f32::consts::TAU
+}
+
 #[derive(Debug, Clone)]
 pub struct Wisp {
     pub id: usize,
@@ -16,14 +32,14 @@ pub struct Wisp {
 }
 
 impl Wisp {
-    pub fn new_at_position<R: Rng>(id: usize, pos: Vec2, rng: &mut R) -> Self {
-        let dir = Vec2::new(rng.gen::<f32>() - 0.5, rng.gen::<f32>() - 0.5).normalize();
+    pub fn new_at_position<R: Rng>(id: usize, pos: Vec2, _rng: &mut R) -> Self {
+        let dir = initial_dir_for(id);
         Self {
             id,
             alive: true,
             pos,
             dir,
-            wobble_phase: rng.gen::<f32>() * std::f32::consts::TAU,
+            wobble_phase: wobble_phase_for(id),
         }
     }
 
