@@ -13,7 +13,7 @@ use js_sys;
 use matchbox_socket::{PeerState, WebRtcSocket};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 pub type PeerId = String;
@@ -131,6 +131,9 @@ pub struct NetworkSession {
     /// Cached `{:?}` strings of roster uuids so per-frame lookup pruning keeps
     /// hash->id mappings alive for roster members we have not connected to yet.
     roster_peer_strs: HashSet<String>,
+    /// Link derivation is pure in the roster. Cache its structural checksum so
+    /// the root does not rebuild every identity/string index every frame.
+    last_derived_roster_checksum: Option<u64>,
     /// Root only: last frame each member (by origin hash) showed signs of life.
     member_last_seen: HashMap<u64, u32>,
     /// Root only: membership/assignments changed since last broadcast.
@@ -210,6 +213,14 @@ pub struct NetworkSession {
     peer_hash_lookup: HashMap<u64, PeerId>,
     peer_identity_lookup: HashMap<u64, PeerId>,
     pending_messages: Vec<(PeerId, Option<u64>, NetMessage)>,
+    /// Recently received relay events, keyed by (origin, sequence).
+    /// This bounds duplicate floods independently of message-specific event ids.
+    recent_relay_events: HashMap<(u64, u64), u32>,
+    /// Relay event id and remaining hop budget for messages processed this frame,
+    /// keyed by (origin, payload fingerprint) so existing forwarding paths can
+    /// preserve envelope metadata.
+    incoming_relay_routes: HashMap<(u64, u64), (u64, u8)>,
+    next_relay_sequence: Cell<u64>,
     /// Whether this client is the host (room creator) - host controls enemy spawning
     /// Relay-tree root (lowest sorted [`PeerId`] among known/connected nodes). Drives topology
     /// broadcast and `send_*` routing—not necessarily the player who clicked "create room".
@@ -261,7 +272,7 @@ pub struct NetworkSession {
     /// Received input frames (future rollback netcode)
     pub pending_input_frames: Vec<(PeerId, InputFrame)>,
     relay_player_states: HashMap<u64, PlayerState>,
-    relay_input_frames: Vec<InputFrameEntry>,
+    relay_input_frames: VecDeque<InputFrameEntry>,
     downlink_player_batches: Vec<PlayerStateBatch>,
     downlink_input_batches: Vec<InputFrameBatch>,
     /// Latency samples to peers (ms)
@@ -271,12 +282,11 @@ pub struct NetworkSession {
     /// Supernode score reports (score, sample_count, frame_received)
     pub supernode_scores: HashMap<matchbox_socket::PeerId, (u32, u8, u32)>,
     last_enemy_sync_frame: u32,
-    paid_obstacle_confirmations: HashMap<[u8; 32], HashSet<matchbox_socket::PeerId>>,
-    paid_ability_confirmations: HashMap<[u8; 32], HashSet<matchbox_socket::PeerId>>,
-    paid_name_confirmations: HashMap<[u8; 32], HashSet<matchbox_socket::PeerId>>,
+    paid_obstacle_confirmations: HashMap<[u8; 32], (HashSet<matchbox_socket::PeerId>, u32)>,
+    paid_ability_confirmations: HashMap<[u8; 32], (HashSet<matchbox_socket::PeerId>, u32)>,
+    paid_name_confirmations: HashMap<[u8; 32], (HashSet<matchbox_socket::PeerId>, u32)>,
     name_reservations: HashMap<String, PaidNameReservation>,
     last_ping_frame: u32,
-    last_score_frame: u32,
     /// Newly connected peers that need current game state (for late joiners)
     pub new_peers_needing_state: Vec<matchbox_socket::PeerId>,
 }
@@ -301,7 +311,16 @@ impl NetworkSession {
     const MAX_RELAY_INPUT_QUEUE: usize = 1024;
     const MAX_DOWNLINK_QUEUE: usize = 64;
     const MAX_BATCH_ENTRIES: usize = 512;
-    const RELAY_ENVELOPE_MAGIC: [u8; 4] = *b"SLRY";
+    const RELAY_ENVELOPE_MAGIC: [u8; 4] = *b"SLR2";
+    const LEGACY_RELAY_ENVELOPE_MAGIC: [u8; 4] = *b"SLRY";
+    const RELAY_MAX_HOPS: u8 = 24;
+    const RELAY_DEDUP_FRAMES: u32 = 120;
+    const MAX_RECENT_RELAY_EVENTS: usize = 4096;
+    const PAID_CONFIRMATION_TTL_FRAMES: u32 = 1800;
+    const MAX_PENDING_CONFIRMATIONS: usize = 2048;
+    const MAX_NAME_RESERVATIONS: usize = 4096;
+    const APPLIED_EVENT_TTL_FRAMES: u32 = 3600;
+    const MAX_APPLIED_EVENT_IDS: usize = 8192;
     /// Root drops a member that has shown no signs of life for this long (~10s).
     const MEMBER_TTL_FRAMES: u32 = 600;
     /// Root re-broadcasts the (possibly unchanged) map at this cadence; the
@@ -503,8 +522,14 @@ impl NetworkSession {
     /// join never reshuffles existing routes.
     fn pick_parent_for_new_member(&self) -> u64 {
         let fanout = self.relay_fanout.clamp(1, Self::MAX_FANOUT);
+        let mut child_counts: HashMap<u64, usize> = HashMap::new();
         for entry in &self.topology_roster {
-            if self.roster_child_count(entry.peer_hash) < fanout {
+            if entry.parent_hash != 0 {
+                *child_counts.entry(entry.parent_hash).or_default() += 1;
+            }
+        }
+        for entry in &self.topology_roster {
+            if child_counts.get(&entry.peer_hash).copied().unwrap_or(0) < fanout {
                 return entry.peer_hash;
             }
         }
@@ -569,6 +594,7 @@ impl NetworkSession {
             discovery_attached: false,
             topology_roster: Vec::new(),
             roster_peer_strs: HashSet::new(),
+            last_derived_roster_checksum: None,
             member_last_seen: HashMap::new(),
             roster_dirty: false,
             last_map_rx_frame: 0,
@@ -622,6 +648,9 @@ impl NetworkSession {
             peer_hash_lookup: HashMap::new(),
             peer_identity_lookup: HashMap::new(),
             pending_messages: Vec::new(),
+            recent_relay_events: HashMap::new(),
+            incoming_relay_routes: HashMap::new(),
+            next_relay_sequence: Cell::new(1),
             is_host: false,
             pending_enemy_syncs: Vec::new(),
             pending_enemy_damage: Vec::new(),
@@ -650,7 +679,7 @@ impl NetworkSession {
             vote_mutes: HashMap::new(),
             pending_input_frames: Vec::new(),
             relay_player_states: HashMap::new(),
-            relay_input_frames: Vec::new(),
+            relay_input_frames: VecDeque::new(),
             downlink_player_batches: Vec::new(),
             downlink_input_batches: Vec::new(),
             latency_ms: HashMap::new(),
@@ -662,7 +691,6 @@ impl NetworkSession {
             paid_name_confirmations: HashMap::new(),
             name_reservations: HashMap::new(),
             last_ping_frame: 0,
-            last_score_frame: 0,
             new_peers_needing_state: Vec::new(),
         }
     }
@@ -791,6 +819,7 @@ impl NetworkSession {
         self.discovery_attached = true;
         self.topology_roster.clear();
         self.roster_peer_strs.clear();
+        self.last_derived_roster_checksum = None;
         self.member_last_seen.clear();
         self.roster_dirty = false;
         self.last_map_rx_frame = 0;
@@ -814,6 +843,8 @@ impl NetworkSession {
         self.relay_fanout = Self::MIN_FANOUT;
         self.relay_epoch = 0;
         self.area_authorities.clear();
+        self.recent_relay_events.clear();
+        self.incoming_relay_routes.clear();
         self.peer_link_backoff_until.clear();
         self.last_peer_message_frames.clear();
         self.peer_connected_frames.clear();
@@ -860,6 +891,7 @@ impl NetworkSession {
         self.discovery_attached = false;
         self.topology_roster.clear();
         self.roster_peer_strs.clear();
+        self.last_derived_roster_checksum = None;
         self.member_last_seen.clear();
         self.roster_dirty = false;
         self.last_map_rx_frame = 0;
@@ -905,6 +937,9 @@ impl NetworkSession {
         self.peer_id_lookup.clear();
         self.peer_hash_lookup.clear();
         self.peer_identity_lookup.clear();
+        self.pending_messages.clear();
+        self.recent_relay_events.clear();
+        self.incoming_relay_routes.clear();
         self.last_enemy_sync_frame = 0;
         self.paid_obstacle_confirmations.clear();
         self.paid_ability_confirmations.clear();
@@ -950,6 +985,9 @@ impl NetworkSession {
             self.local_throttle_hold_until = current_frame.saturating_add(120);
         }
         self.last_update_frame = current_frame;
+        self.incoming_relay_routes.clear();
+        self.recent_relay_events
+            .retain(|_, frame| current_frame.saturating_sub(*frame) < Self::RELAY_DEDUP_FRAMES);
         // Check if socket loop has ended (connection failed)
         if self.socket_closed.get() {
             self.socket = None;
@@ -1115,10 +1153,32 @@ impl NetworkSession {
                 if self.is_host {
                     self.member_last_seen.insert(hash, current_frame);
                 }
-                if let Some((origin_hash, payload)) = Self::decode_relay_envelope(&data) {
+                if let Some((origin_hash, event_id, hops_remaining, payload)) =
+                    Self::decode_relay_envelope(&data)
+                {
                     if self.is_host {
                         self.member_last_seen.insert(origin_hash, current_frame);
                     }
+                    let event_key = (origin_hash, event_id);
+                    let duplicate = self
+                        .recent_relay_events
+                        .get(&event_key)
+                        .map(|frame| {
+                            current_frame.saturating_sub(*frame) < Self::RELAY_DEDUP_FRAMES
+                        })
+                        .unwrap_or(false);
+                    if hops_remaining == 0
+                        || duplicate
+                        || self.recent_relay_events.len() >= Self::MAX_RECENT_RELAY_EVENTS
+                    {
+                        self.relay_telemetry.dropped_messages =
+                            self.relay_telemetry.dropped_messages.saturating_add(1);
+                        continue;
+                    }
+                    self.recent_relay_events.insert(event_key, current_frame);
+                    let payload_key = (origin_hash, Self::hash_bytes(&payload));
+                    self.incoming_relay_routes
+                        .insert(payload_key, (event_id, hops_remaining.saturating_sub(1)));
                     if let Some(msg) = NetMessage::from_bytes(&payload) {
                         self.pending_messages
                             .push((peer_id_str, Some(origin_hash), msg));
@@ -1235,6 +1295,7 @@ impl NetworkSession {
         let mut enemy_damages: Vec<(PeerId, u64, EnemyDamage)> = Vec::new();
         let mut wave_starts: Vec<(PeerId, u64, WaveStart)> = Vec::new();
         let mut enemy_kills: Vec<(PeerId, u64, EnemyKill)> = Vec::new();
+        let mut enemy_kill_batches: Vec<(PeerId, u64, EnemyKillBatch)> = Vec::new();
         let mut player_deaths: Vec<(PeerId, u64, PlayerDeath)> = Vec::new();
         let mut paid_obstacles: Vec<(PeerId, u64, PaidObstacle)> = Vec::new();
         let mut paid_abilities: Vec<(PeerId, u64, PaidAbility)> = Vec::new();
@@ -1283,9 +1344,7 @@ impl NetworkSession {
                     enemy_kills.push((peer_id, origin_hash, kill));
                 }
                 NetMessage::EnemyKillBatchEvent(batch) => {
-                    for kill in batch.kills {
-                        enemy_kills.push((peer_id.clone(), origin_hash, kill));
-                    }
+                    enemy_kill_batches.push((peer_id, origin_hash, batch));
                 }
                 NetMessage::PlayerDeathEvent(death) => {
                     player_deaths.push((peer_id, origin_hash, death));
@@ -1588,11 +1647,7 @@ impl NetworkSession {
             let from_host = root_hash != 0 && origin_hash == root_hash;
             // Flood along tree edges (minus the inbound one) so every node
             // hears every authority's corrections exactly once.
-            self.relay_control_message(
-                &peer_id,
-                NetMessage::EnemySync(sync.clone()).to_bytes(),
-                Some(origin_hash),
-            );
+            self.relay_enemy_sync_message(&peer_id, &sync, origin_hash);
             // Per-area authority enforcement: an origin may only correct
             // enemies inside areas it owns; unassigned areas belong to the
             // host (which also covers bootstrap, before any area map exists).
@@ -1643,8 +1698,26 @@ impl NetworkSession {
                 );
             }
         }
+        for (peer_id, origin_hash, batch) in enemy_kill_batches {
+            let from_parent = self.is_parent_sender(&peer_id);
+            let from_child = self.is_child_sender(&peer_id);
+            let exclude = self.resolve_peer_id(&peer_id);
+            let bytes = NetMessage::EnemyKillBatchEvent(batch.clone()).to_bytes();
+            if self.is_host {
+                self.send_downstream_or_broadcast_routed(bytes, exclude, Some(origin_hash));
+            } else if from_parent {
+                if !self.relay_children.is_empty() {
+                    self.send_downstream_or_broadcast_routed(bytes, exclude, Some(origin_hash));
+                }
+            } else if from_child {
+                self.send_upstream_or_broadcast_routed(bytes, exclude, Some(origin_hash));
+            }
+            for kill in batch.kills {
+                self.handle_enemy_kill(peer_id.clone(), origin_hash, kill, current_frame, false);
+            }
+        }
         for (peer_id, origin_hash, kill) in enemy_kills {
-            self.handle_enemy_kill(peer_id, origin_hash, kill, current_frame);
+            self.handle_enemy_kill(peer_id, origin_hash, kill, current_frame, true);
         }
         for (peer_id, origin_hash, death) in player_deaths {
             self.handle_player_death(peer_id, origin_hash, death, current_frame);
@@ -1991,7 +2064,7 @@ impl NetworkSession {
         current_frame: u32,
         connected_peers: &[matchbox_socket::PeerId],
     ) {
-        const NAME_ANNOUNCE_PERIOD_FRAMES: u32 = 600;
+        const NAME_ANNOUNCE_PERIOD_FRAMES: u32 = 3600;
         if connected_peers.is_empty() {
             return;
         }
@@ -2212,10 +2285,15 @@ impl NetworkSession {
     /// Everyone: derive parent/backup/children/supernode-set from the roster.
     /// Pure function of the map, so all nodes agree on every link.
     fn derive_links_from_roster(&mut self, current_frame: u32) {
-        self.rebuild_roster_peer_strs();
         let Some(local_hash) = self.local_peer_hash else {
             return;
         };
+        let roster_checksum = Self::roster_checksum(&self.topology_roster);
+        if self.last_derived_roster_checksum == Some(roster_checksum) {
+            return;
+        }
+        self.last_derived_roster_checksum = Some(roster_checksum);
+        self.rebuild_roster_peer_strs();
         let entries = self.topology_roster.clone();
         for entry in &entries {
             self.register_peer_uuid(entry.uuid);
@@ -2260,11 +2338,30 @@ impl NetworkSession {
             .find(|entry| entry.peer_hash == parent_hash)
             .map(|entry| entry.parent_hash)
             .unwrap_or(0);
-        let mut new_backup = if grandparent_hash != 0 {
-            self.hash_to_matchbox(grandparent_hash)
+        // Spread backup load sideways: use the primary parent's next sibling
+        // ("uncle") instead of the grandparent. Grandparent backups make every
+        // grandchild proactively connect upward and concentrate O(fanout²)
+        // inbound links on interior nodes.
+        let mut parent_siblings: Vec<&TopologyEntry> = if grandparent_hash == 0 {
+            Vec::new()
         } else {
-            root_id
+            entries
+                .iter()
+                .filter(|entry| entry.parent_hash == grandparent_hash)
+                .collect()
         };
+        parent_siblings.sort_by_key(|entry| entry.uuid);
+        let mut new_backup = parent_siblings
+            .iter()
+            .position(|entry| entry.peer_hash == parent_hash)
+            .and_then(|index| {
+                if parent_siblings.len() < 2 {
+                    None
+                } else {
+                    Some(parent_siblings[(index + 1) % parent_siblings.len()].peer_hash)
+                }
+            })
+            .and_then(|hash| self.hash_to_matchbox(hash));
         if new_backup == new_parent || new_backup == self.local_peer_id {
             new_backup = None;
         }
@@ -2607,6 +2704,66 @@ impl NetworkSession {
         new_epoch > cur_epoch || (new_epoch == cur_epoch && new_root < cur_root)
     }
 
+    fn topology_map_is_well_formed(update: &TopologyUpdate) -> bool {
+        if update.entries.is_empty() || update.entries.len() > 100_000 {
+            return false;
+        }
+        let mut parents = HashMap::with_capacity(update.entries.len());
+        let mut uuids = HashSet::with_capacity(update.entries.len());
+        let mut child_counts: HashMap<u64, usize> = HashMap::new();
+        let mut root_count = 0;
+        for entry in &update.entries {
+            let expected_hash = Self::peer_hash_for_matchbox(Self::peer_id_from_uuid(entry.uuid));
+            if entry.peer_hash == 0
+                || entry.peer_hash != expected_hash
+                || !uuids.insert(entry.uuid)
+                || parents.insert(entry.peer_hash, entry.parent_hash).is_some()
+                || entry.parent_hash == entry.peer_hash
+            {
+                return false;
+            }
+            if entry.parent_hash == 0 {
+                root_count += 1;
+                if entry.peer_hash != update.root_hash {
+                    return false;
+                }
+            } else {
+                *child_counts.entry(entry.parent_hash).or_default() += 1;
+            }
+        }
+        if root_count != 1
+            || child_counts.values().any(|count| *count > Self::MAX_FANOUT)
+            || child_counts
+                .keys()
+                .any(|parent_hash| !parents.contains_key(parent_hash))
+        {
+            return false;
+        }
+
+        // Every parent chain must terminate at the declared root. This rejects
+        // disconnected components and cycles before they reach link derivation.
+        for entry in &update.entries {
+            let mut current = entry.peer_hash;
+            let mut seen = HashSet::new();
+            loop {
+                if !seen.insert(current) {
+                    return false;
+                }
+                let Some(parent) = parents.get(&current).copied() else {
+                    return false;
+                };
+                if parent == 0 {
+                    if current != update.root_hash {
+                        return false;
+                    }
+                    break;
+                }
+                current = parent;
+            }
+        }
+        true
+    }
+
     /// Returns true when the map was adopted (and should be forwarded).
     fn apply_topology_map(
         &mut self,
@@ -2614,7 +2771,9 @@ impl NetworkSession {
         update: &TopologyUpdate,
         current_frame: u32,
     ) -> bool {
-        if update.entries.is_empty() {
+        if !Self::topology_map_is_well_formed(update) {
+            self.relay_telemetry.dropped_messages =
+                self.relay_telemetry.dropped_messages.saturating_add(1);
             return false;
         }
         let local_hash = self.local_peer_hash;
@@ -3428,15 +3587,38 @@ impl NetworkSession {
             if let Some(parent) = self.relay_parent {
                 desired.insert(parent);
             }
-            if let Some(backup) = self.relay_backup_parent {
-                desired.insert(backup);
+            // Backups are cold until the primary has had time to connect and
+            // then goes stale. Eager backup links violate the bounded-degree
+            // topology because the backup endpoint does not own that edge.
+            let primary_stale = self
+                .relay_parent
+                .map(|parent| {
+                    !self.peer_seen_recently(parent, self.last_update_frame)
+                        && self
+                            .last_update_frame
+                            .saturating_sub(self.last_parent_switch_frame)
+                            > Self::PEER_HANDSHAKE_GRACE_FRAMES
+                })
+                .unwrap_or(false);
+            if self.relay_active_parent == self.relay_backup_parent || primary_stale {
+                if let Some(backup) = self.relay_backup_parent {
+                    desired.insert(backup);
+                }
             }
             desired.extend(self.relay_children.iter().copied());
             // No parent assigned, or our active route is dead: desire the root
             // directly. Recovery pairs with the root's rescue links below: for
             // any pair, the side that joined signaling first knows the other
             // and can initiate, so one of the two always forms the link.
-            if self.relay_parent.is_none() || self.relay_active_parent.is_none() {
+            let backup_recovery_exhausted = primary_stale
+                && self
+                    .last_update_frame
+                    .saturating_sub(self.last_parent_switch_frame)
+                    > Self::PEER_HANDSHAKE_GRACE_FRAMES * 2;
+            if self.relay_parent.is_none()
+                || (self.relay_active_parent.is_none()
+                    && (self.relay_backup_parent.is_none() || backup_recovery_exhausted))
+            {
                 if let Some(root) = self.super_root_id {
                     desired.insert(root);
                 }
@@ -3466,7 +3648,13 @@ impl NetworkSession {
                 .filter(|id| !desired.contains(id))
                 .filter(|id| !self.roster_contains(Self::peer_hash_for_matchbox(*id)))
                 .collect();
-            Self::sort_peer_ids(&mut candidates);
+            let local_hash = local_id.map(Self::peer_hash_for_matchbox).unwrap_or(0);
+            candidates.sort_by_key(|peer| {
+                (
+                    Self::peer_hash_for_matchbox(*peer) ^ local_hash,
+                    Self::uuid_for_peer(*peer),
+                )
+            });
             let admission_target = if self.is_host { 4 } else { 2 };
             for peer in candidates.into_iter().take(admission_target) {
                 optional.push(peer);
@@ -3783,6 +3971,11 @@ impl NetworkSession {
     }
 
     fn allow_low_priority_topic(&mut self, topic: LowPriorityTopic) -> bool {
+        // Chat is human-paced and must not be silently lost because a stats
+        // packet consumed this hop's low-priority budget.
+        if matches!(topic, LowPriorityTopic::Chat) {
+            return true;
+        }
         let frame = self.last_update_frame;
         let stride = self.low_priority_stride();
         let slot = match topic {
@@ -3834,7 +4027,7 @@ impl NetworkSession {
     ) {
         let targets = self.upstream_targets();
         let payload = origin_hash
-            .map(|hash| Self::encode_relay_envelope(hash, &msg))
+            .map(|hash| self.encode_relay_envelope(hash, &msg))
             .unwrap_or(msg);
         let socket = match &mut self.socket {
             Some(s) => s,
@@ -3897,7 +4090,7 @@ impl NetworkSession {
         origin_hash: Option<u64>,
     ) {
         let payload = origin_hash
-            .map(|hash| Self::encode_relay_envelope(hash, &msg))
+            .map(|hash| self.encode_relay_envelope(hash, &msg))
             .unwrap_or(msg);
         let socket = match &mut self.socket {
             Some(s) => s,
@@ -3993,6 +4186,85 @@ impl NetworkSession {
         }
     }
 
+    /// Enemy corrections still travel intact across interior edges so a
+    /// subtree cannot be starved by its parent's location. At leaf edges we
+    /// can safely remove enemies outside that player's interest radius.
+    fn send_enemy_sync_downstream(
+        &mut self,
+        sync: &EnemySync,
+        exclude: Option<matchbox_socket::PeerId>,
+        origin_hash: u64,
+    ) {
+        let children = self.relay_children.clone();
+        if children.is_empty() {
+            return;
+        }
+        let interior_hashes: HashSet<u64> = self
+            .topology_roster
+            .iter()
+            .filter(|entry| entry.parent_hash != 0)
+            .map(|entry| entry.parent_hash)
+            .collect();
+        let radius_sq = Self::interest_radius_sq();
+        let mut sends = Vec::new();
+        for child in children {
+            if Some(child) == exclude {
+                continue;
+            }
+            let child_hash = Self::peer_hash_for_matchbox(child);
+            let mut filtered = sync.clone();
+            if !interior_hashes.contains(&child_hash) {
+                if let Some(target) = self.peer_pos(child) {
+                    filtered.enemies.retain(|enemy| {
+                        let pos = enemy.pos();
+                        let dx = pos.x - target.x;
+                        let dy = pos.y - target.y;
+                        dx * dx + dy * dy <= radius_sq
+                    });
+                }
+            }
+            if !filtered.enemies.is_empty() {
+                let msg = NetMessage::EnemySync(filtered).to_bytes();
+                let payload = self.encode_relay_envelope(origin_hash, &msg);
+                sends.push((child, payload));
+            }
+        }
+        let Some(socket) = &mut self.socket else {
+            return;
+        };
+        for (child, payload) in sends {
+            socket.send(payload.into_boxed_slice(), child);
+            self.relay_telemetry.sent_downstream =
+                self.relay_telemetry.sent_downstream.saturating_add(1);
+        }
+    }
+
+    fn relay_enemy_sync_message(&mut self, sender: &str, sync: &EnemySync, origin_hash: u64) {
+        let sender_matchbox = self.resolve_peer_id(sender);
+        let from_parent = self.is_parent_sender(sender);
+        let from_child = self.is_child_sender(sender);
+        if from_parent {
+            self.send_enemy_sync_downstream(sync, sender_matchbox, origin_hash);
+        } else if from_child {
+            if !self.is_host && self.relay_parent_or_root().is_some() {
+                self.send_upstream_or_broadcast_routed(
+                    NetMessage::EnemySync(sync.clone()).to_bytes(),
+                    sender_matchbox,
+                    Some(origin_hash),
+                );
+            }
+            self.send_enemy_sync_downstream(sync, sender_matchbox, origin_hash);
+        } else if self.is_host {
+            self.send_enemy_sync_downstream(sync, sender_matchbox, origin_hash);
+        } else {
+            self.send_upstream_or_broadcast_routed(
+                NetMessage::EnemySync(sync.clone()).to_bytes(),
+                sender_matchbox,
+                Some(origin_hash),
+            );
+        }
+    }
+
     fn relay_low_priority_control_message(
         &mut self,
         sender: &str,
@@ -4013,18 +4285,24 @@ impl NetworkSession {
         proof_hash: [u8; 32],
         peer_id: matchbox_socket::PeerId,
     ) -> usize {
+        if !self.paid_obstacle_confirmations.contains_key(&proof_hash)
+            && self.paid_obstacle_confirmations.len() >= Self::MAX_PENDING_CONFIRMATIONS
+        {
+            return 0;
+        }
         let entry = self
             .paid_obstacle_confirmations
             .entry(proof_hash)
-            .or_default();
-        entry.insert(peer_id);
-        entry.len()
+            .or_insert_with(|| (HashSet::new(), self.last_update_frame));
+        entry.1 = self.last_update_frame;
+        entry.0.insert(peer_id);
+        entry.0.len()
     }
 
     pub fn paid_obstacle_confirmation_count(&self, proof_hash: [u8; 32]) -> usize {
         self.paid_obstacle_confirmations
             .get(&proof_hash)
-            .map(|set| set.len())
+            .map(|(set, _)| set.len())
             .unwrap_or(0)
     }
 
@@ -4035,7 +4313,7 @@ impl NetworkSession {
         };
         self.paid_obstacle_confirmations
             .get(&proof_hash)
-            .map(|set| set.contains(&supernode))
+            .map(|(set, _)| set.contains(&supernode))
             .unwrap_or(false)
     }
 
@@ -4044,18 +4322,24 @@ impl NetworkSession {
         proof_hash: [u8; 32],
         peer_id: matchbox_socket::PeerId,
     ) -> usize {
+        if !self.paid_ability_confirmations.contains_key(&proof_hash)
+            && self.paid_ability_confirmations.len() >= Self::MAX_PENDING_CONFIRMATIONS
+        {
+            return 0;
+        }
         let entry = self
             .paid_ability_confirmations
             .entry(proof_hash)
-            .or_default();
-        entry.insert(peer_id);
-        entry.len()
+            .or_insert_with(|| (HashSet::new(), self.last_update_frame));
+        entry.1 = self.last_update_frame;
+        entry.0.insert(peer_id);
+        entry.0.len()
     }
 
     pub fn paid_ability_confirmation_count(&self, proof_hash: [u8; 32]) -> usize {
         self.paid_ability_confirmations
             .get(&proof_hash)
-            .map(|set| set.len())
+            .map(|(set, _)| set.len())
             .unwrap_or(0)
     }
 
@@ -4066,7 +4350,7 @@ impl NetworkSession {
         };
         self.paid_ability_confirmations
             .get(&proof_hash)
-            .map(|set| set.contains(&supernode))
+            .map(|(set, _)| set.contains(&supernode))
             .unwrap_or(false)
     }
 
@@ -4075,15 +4359,24 @@ impl NetworkSession {
         proof_hash: [u8; 32],
         peer_id: matchbox_socket::PeerId,
     ) -> usize {
-        let entry = self.paid_name_confirmations.entry(proof_hash).or_default();
-        entry.insert(peer_id);
-        entry.len()
+        if !self.paid_name_confirmations.contains_key(&proof_hash)
+            && self.paid_name_confirmations.len() >= Self::MAX_PENDING_CONFIRMATIONS
+        {
+            return 0;
+        }
+        let entry = self
+            .paid_name_confirmations
+            .entry(proof_hash)
+            .or_insert_with(|| (HashSet::new(), self.last_update_frame));
+        entry.1 = self.last_update_frame;
+        entry.0.insert(peer_id);
+        entry.0.len()
     }
 
     pub fn paid_name_confirmation_count(&self, proof_hash: [u8; 32]) -> usize {
         self.paid_name_confirmations
             .get(&proof_hash)
-            .map(|set| set.len())
+            .map(|(set, _)| set.len())
             .unwrap_or(0)
     }
 
@@ -4094,7 +4387,7 @@ impl NetworkSession {
         };
         self.paid_name_confirmations
             .get(&proof_hash)
-            .map(|set| set.contains(&supernode))
+            .map(|(set, _)| set.contains(&supernode))
             .unwrap_or(false)
     }
 
@@ -4154,15 +4447,11 @@ impl NetworkSession {
         canonical
     }
 
-    fn peer_id_key(peer_id: matchbox_socket::PeerId) -> String {
-        format!("{:?}", peer_id)
-    }
-
     fn peer_id_ordering(
         a: matchbox_socket::PeerId,
         b: matchbox_socket::PeerId,
     ) -> std::cmp::Ordering {
-        Self::peer_id_key(a).cmp(&Self::peer_id_key(b))
+        a.cmp(&b)
     }
 
     fn sort_peer_ids(ids: &mut Vec<matchbox_socket::PeerId>) {
@@ -4207,17 +4496,36 @@ impl NetworkSession {
         Self::hash_peer_id(&format!("{:?}", peer_id))
     }
 
-    fn encode_relay_envelope(origin_hash: u64, payload: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(Self::RELAY_ENVELOPE_MAGIC.len() + 8 + payload.len());
+    fn encode_relay_envelope(&mut self, origin_hash: u64, payload: &[u8]) -> Vec<u8> {
+        let payload_key = (origin_hash, Self::hash_bytes(payload));
+        let (event_id, hops_remaining) =
+            if let Some(route) = self.incoming_relay_routes.get(&payload_key).copied() {
+                route
+            } else {
+                let sequence = self.next_relay_sequence.get();
+                self.next_relay_sequence
+                    .set(sequence.wrapping_add(1).max(1));
+                let route = (sequence, Self::RELAY_MAX_HOPS);
+                self.incoming_relay_routes.insert(payload_key, route);
+                route
+            };
+        let mut out = Vec::with_capacity(Self::RELAY_ENVELOPE_MAGIC.len() + 17 + payload.len());
         out.extend_from_slice(&Self::RELAY_ENVELOPE_MAGIC);
         out.extend_from_slice(&origin_hash.to_le_bytes());
+        out.extend_from_slice(&event_id.to_le_bytes());
+        out.push(hops_remaining);
         out.extend_from_slice(payload);
         out
     }
 
-    fn decode_relay_envelope(bytes: &[u8]) -> Option<(u64, Vec<u8>)> {
+    fn decode_relay_envelope(bytes: &[u8]) -> Option<(u64, u64, u8, Vec<u8>)> {
         let header_len = Self::RELAY_ENVELOPE_MAGIC.len();
-        if bytes.len() < header_len + 8 || bytes[..header_len] != Self::RELAY_ENVELOPE_MAGIC {
+        if bytes.len() < header_len + 8 {
+            return None;
+        }
+        let is_current = bytes[..header_len] == Self::RELAY_ENVELOPE_MAGIC;
+        let is_legacy = bytes[..header_len] == Self::LEGACY_RELAY_ENVELOPE_MAGIC;
+        if !is_current && !is_legacy {
             return None;
         }
         let origin_hash = u64::from_le_bytes([
@@ -4230,16 +4538,49 @@ impl NetworkSession {
             bytes[header_len + 6],
             bytes[header_len + 7],
         ]);
-        Some((origin_hash, bytes[(header_len + 8)..].to_vec()))
+        if is_current {
+            if bytes.len() < header_len + 17 {
+                return None;
+            }
+            let event_start = header_len + 8;
+            let event_id = u64::from_le_bytes([
+                bytes[event_start],
+                bytes[event_start + 1],
+                bytes[event_start + 2],
+                bytes[event_start + 3],
+                bytes[event_start + 4],
+                bytes[event_start + 5],
+                bytes[event_start + 6],
+                bytes[event_start + 7],
+            ]);
+            Some((
+                origin_hash,
+                event_id,
+                bytes[header_len + 16],
+                bytes[(header_len + 17)..].to_vec(),
+            ))
+        } else {
+            let payload = bytes[(header_len + 8)..].to_vec();
+            Some((
+                origin_hash,
+                Self::hash_bytes(&payload),
+                Self::RELAY_MAX_HOPS,
+                payload,
+            ))
+        }
     }
 
-    fn hash_peer_id(peer_id: &str) -> u64 {
+    fn hash_bytes(bytes: &[u8]) -> u64 {
         let mut hash: u64 = 0xcbf29ce484222325;
-        for b in peer_id.as_bytes() {
-            hash ^= *b as u64;
+        for byte in bytes {
+            hash ^= *byte as u64;
             hash = hash.wrapping_mul(0x100000001b3);
         }
         hash
+    }
+
+    fn hash_peer_id(peer_id: &str) -> u64 {
+        Self::hash_bytes(peer_id.as_bytes())
     }
 
     pub fn normalize_player_name(name: &str) -> String {
@@ -4371,28 +4712,9 @@ impl NetworkSession {
             }
         }
 
-        if current_frame.saturating_sub(self.last_score_frame) >= 180 {
-            self.last_score_frame = current_frame;
-            let sample_count = connected_peers
-                .iter()
-                .map(|peer_id| *self.latency_samples.get(peer_id).unwrap_or(&0))
-                .min()
-                .unwrap_or(0);
-            if sample_count > 0 {
-                let score_ms: u32 = connected_peers
-                    .iter()
-                    .map(|peer_id| *self.latency_ms.get(peer_id).unwrap_or(&1000))
-                    .sum();
-                let score = SupernodeScore {
-                    score_ms,
-                    sample_count,
-                };
-                let msg = NetMessage::SupernodeScoreEvent(score).to_bytes();
-                for peer_id in connected_peers {
-                    socket.send(msg.clone().into_boxed_slice(), *peer_id);
-                }
-            }
-        }
+        // The sticky roster determines interior nodes; latency scores no
+        // longer participate in topology selection. Keep accepting the legacy
+        // message for rolling compatibility, but do not broadcast dead data.
     }
 
     fn network_state_label(&self) -> &'static str {
@@ -4668,6 +4990,17 @@ impl NetworkSession {
         if vote.target_hash == 0 || vote.voter_hash == 0 || vote.target_hash == vote.voter_hash {
             return false;
         }
+        let active_member = |hash: u64| {
+            Some(hash) == self.local_peer_hash
+                || self.roster_contains(hash)
+                || self
+                    .remote_players
+                    .keys()
+                    .any(|peer_id| Self::peer_identity_hash(peer_id) == hash)
+        };
+        if !active_member(vote.target_hash) || !active_member(vote.voter_hash) {
+            return false;
+        }
 
         let entry = self.vote_mutes.entry(vote.target_hash).or_default();
         entry.insert(vote.voter_hash);
@@ -4794,6 +5127,11 @@ impl NetworkSession {
     pub fn apply_paid_name_reservation(&mut self, reservation: PaidNameReservation) -> bool {
         let normalized_name = Self::normalize_player_name(&reservation.name_string());
         let key = normalized_name.to_ascii_lowercase();
+        if !self.name_reservations.contains_key(&key)
+            && self.name_reservations.len() >= Self::MAX_NAME_RESERVATIONS
+        {
+            return false;
+        }
         if let Some(existing) = self.name_reservations.get(&key) {
             if existing.owner_hash != reservation.owner_hash {
                 return false;
@@ -4813,6 +5151,13 @@ impl NetworkSession {
     }
 
     pub fn store_paid_name_candidate(&mut self, reservation: PaidNameReservation) {
+        if !self
+            .pending_paid_name_candidates
+            .contains_key(&reservation.proof_hash)
+            && self.pending_paid_name_candidates.len() >= Self::MAX_PENDING_CONFIRMATIONS
+        {
+            return;
+        }
         self.pending_paid_name_candidates
             .insert(reservation.proof_hash, reservation);
     }
@@ -5090,11 +5435,11 @@ impl NetworkSession {
     fn queue_relay_input_frame(&mut self, peer_hash: u64, frame: InputFrame) {
         let area_id = self.area_id_for_hash(peer_hash);
         if self.relay_input_frames.len() >= Self::MAX_RELAY_INPUT_QUEUE {
-            self.relay_input_frames.remove(0);
+            self.relay_input_frames.pop_front();
             self.relay_telemetry.dropped_queue_entries =
                 self.relay_telemetry.dropped_queue_entries.saturating_add(1);
         }
-        self.relay_input_frames.push(InputFrameEntry {
+        self.relay_input_frames.push_back(InputFrameEntry {
             peer_hash,
             area_id,
             frame,
@@ -5140,36 +5485,23 @@ impl NetworkSession {
     pub fn flush_relay_batches(&mut self) {
         let parent = self.relay_active_parent.or(self.relay_parent);
         let children = self.relay_children.clone();
-        // Periodically bypass interest filtering for player-state batches so
-        // far-away players still reach everyone at a low rate (roster, player
-        // list, minimap). Cadence widens with room size to bound the cost.
+        // Round-robin a bounded slice of far-away players through every flush.
+        // This preserves low-rate minimap/roster freshness without the old
+        // periodic full-roster burst on every tree edge.
         self.flush_counter = self.flush_counter.wrapping_add(1);
-        let bypass_stride: u32 = if self.topology_roster.len() <= 128 {
+        let far_slice_stride: u64 = if self.topology_roster.len() <= 128 {
             8
         } else {
             32
         };
-        let bypass_interest = self.flush_counter % bypass_stride == 0;
-        let identity_lookup = self.peer_identity_lookup.clone();
-        let mut remote_positions: HashMap<PeerId, Vec2> = self
+        let far_slice = self.flush_counter as u64 % far_slice_stride;
+        let mut positions_by_hash: HashMap<u64, Vec2> = self
             .remote_players
             .iter()
-            .map(|(id, remote)| (id.clone(), remote.pos))
+            .map(|(id, remote)| (Self::peer_identity_hash(id), remote.pos))
             .collect();
         if let (Some(local_hash), Some(local_pos)) = (self.local_peer_hash, self.local_last_pos) {
-            let local_id = self
-                .local_peer_id
-                .map(|id| format!("{:?}", id))
-                .unwrap_or_default();
-            if !local_id.is_empty() {
-                remote_positions.insert(local_id.clone(), local_pos);
-                let _ = identity_lookup.get(&local_hash);
-            }
-        }
-
-        let mut id_lookup: HashMap<matchbox_socket::PeerId, PeerId> = HashMap::new();
-        for (peer_id, matchbox_id) in &self.peer_id_lookup {
-            id_lookup.insert(*matchbox_id, peer_id.clone());
+            positions_by_hash.insert(local_hash, local_pos);
         }
 
         let queue_depth = self.relay_player_states.len()
@@ -5226,21 +5558,15 @@ impl NetworkSession {
                 socket.send(msg.into_boxed_slice(), parent_peer);
             } else if !children.is_empty() {
                 for child in &children {
-                    let child_id = match id_lookup.get(child) {
-                        Some(id) => id.clone(),
-                        None => continue,
-                    };
-                    let target_hash = Self::hash_peer_id(&child_id);
-                    let target_key = identity_lookup
-                        .get(&target_hash)
-                        .cloned()
-                        .unwrap_or_else(|| child_id.clone());
-                    let target_pos = remote_positions.get(&target_key).copied();
+                    let target_hash = Self::peer_hash_for_matchbox(*child);
+                    let target_pos = positions_by_hash.get(&target_hash).copied();
                     let target_area = target_pos.map(Self::area_id_from_pos);
                     let mut filtered: Vec<PlayerStateEntry> = entries
                         .iter()
                         .filter(|entry| {
-                            if bypass_interest || entry.peer_hash == target_hash {
+                            if entry.peer_hash == target_hash
+                                || entry.peer_hash % far_slice_stride == far_slice
+                            {
                                 return true;
                             }
                             if let Some(area) = target_area {
@@ -5281,22 +5607,16 @@ impl NetworkSession {
             let batches = std::mem::take(&mut self.downlink_player_batches);
             for batch in batches {
                 for child in &children {
-                    let child_id = match id_lookup.get(child) {
-                        Some(id) => id.clone(),
-                        None => continue,
-                    };
-                    let target_hash = Self::hash_peer_id(&child_id);
-                    let target_key = identity_lookup
-                        .get(&target_hash)
-                        .cloned()
-                        .unwrap_or_else(|| child_id.clone());
-                    let target_pos = remote_positions.get(&target_key).copied();
+                    let target_hash = Self::peer_hash_for_matchbox(*child);
+                    let target_pos = positions_by_hash.get(&target_hash).copied();
                     let target_area = target_pos.map(Self::area_id_from_pos);
                     let mut filtered: Vec<PlayerStateEntry> = batch
                         .entries
                         .iter()
                         .filter(|entry| {
-                            if bypass_interest || entry.peer_hash == target_hash {
+                            if entry.peer_hash == target_hash
+                                || entry.peer_hash % far_slice_stride == far_slice
+                            {
                                 return true;
                             }
                             if let Some(area) = target_area {
@@ -5335,7 +5655,7 @@ impl NetworkSession {
         }
 
         if !self.relay_input_frames.is_empty() {
-            let mut entries = std::mem::take(&mut self.relay_input_frames);
+            let mut entries: Vec<InputFrameEntry> = self.relay_input_frames.drain(..).collect();
             if entries.len() > batch_cap {
                 let drop = entries.len() - batch_cap;
                 entries = entries.split_off(drop);
@@ -5350,16 +5670,8 @@ impl NetworkSession {
                 socket.send(msg.into_boxed_slice(), parent_peer);
             } else if !children.is_empty() {
                 for child in &children {
-                    let child_id = match id_lookup.get(child) {
-                        Some(id) => id.clone(),
-                        None => continue,
-                    };
-                    let target_hash = Self::hash_peer_id(&child_id);
-                    let target_key = identity_lookup
-                        .get(&target_hash)
-                        .cloned()
-                        .unwrap_or_else(|| child_id.clone());
-                    let target_pos = remote_positions.get(&target_key).copied();
+                    let target_hash = Self::peer_hash_for_matchbox(*child);
+                    let target_pos = positions_by_hash.get(&target_hash).copied();
                     let target_area = target_pos.map(Self::area_id_from_pos);
                     let mut filtered: Vec<InputFrameEntry> = entries
                         .iter()
@@ -5372,11 +5684,7 @@ impl NetworkSession {
                                     return true;
                                 }
                             }
-                            let entry_peer_id = match identity_lookup.get(&entry.peer_hash) {
-                                Some(id) => id,
-                                None => return true,
-                            };
-                            match remote_positions.get(entry_peer_id) {
+                            match positions_by_hash.get(&entry.peer_hash) {
                                 Some(pos) => {
                                     if let Some(target) = target_pos {
                                         let dx = pos.x - target.x;
@@ -5415,16 +5723,8 @@ impl NetworkSession {
             let batches = std::mem::take(&mut self.downlink_input_batches);
             for batch in batches {
                 for child in &children {
-                    let child_id = match id_lookup.get(child) {
-                        Some(id) => id.clone(),
-                        None => continue,
-                    };
-                    let target_hash = Self::hash_peer_id(&child_id);
-                    let target_key = identity_lookup
-                        .get(&target_hash)
-                        .cloned()
-                        .unwrap_or_else(|| child_id.clone());
-                    let target_pos = remote_positions.get(&target_key).copied();
+                    let target_hash = Self::peer_hash_for_matchbox(*child);
+                    let target_pos = positions_by_hash.get(&target_hash).copied();
                     let target_area = target_pos.map(Self::area_id_from_pos);
                     let mut filtered: Vec<InputFrameEntry> = batch
                         .entries
@@ -5438,11 +5738,7 @@ impl NetworkSession {
                                     return true;
                                 }
                             }
-                            let entry_peer_id = match identity_lookup.get(&entry.peer_hash) {
-                                Some(id) => id,
-                                None => return true,
-                            };
-                            match remote_positions.get(entry_peer_id) {
+                            match positions_by_hash.get(&entry.peer_hash) {
                                 Some(pos) => {
                                     if let Some(target) = target_pos {
                                         let dx = pos.x - target.x;
@@ -5597,13 +5893,17 @@ impl NetworkSession {
     /// additionally covers unassigned areas). Floods through the tree from
     /// wherever the authority sits.
     pub fn send_enemy_sync(&mut self, sync: EnemySync) {
-        let msg = NetMessage::EnemySync(sync).to_bytes();
+        let msg = NetMessage::EnemySync(sync.clone()).to_bytes();
         let origin = self.local_origin_hash();
         if !self.is_host {
             self.send_upstream_or_broadcast_routed(msg.clone(), None, origin);
         }
-        if self.is_host || !self.relay_children.is_empty() {
-            self.send_downstream_or_broadcast_routed(msg, None, origin);
+        if let Some(origin_hash) = origin {
+            if !self.relay_children.is_empty() {
+                self.send_enemy_sync_downstream(&sync, None, origin_hash);
+            } else if self.is_host {
+                self.send_downstream_or_broadcast_routed(msg, None, Some(origin_hash));
+            }
         }
     }
 
@@ -5881,8 +6181,11 @@ impl NetworkSession {
         origin_hash: u64,
         kill: EnemyKill,
         current_frame: u32,
+        relay_event: bool,
     ) {
-        if self.applied_event_ids.contains_key(&kill.event_id) {
+        if self.applied_event_ids.contains_key(&kill.event_id)
+            || self.applied_event_ids.len() >= Self::MAX_APPLIED_EVENT_IDS
+        {
             return;
         }
         let from_parent = self.is_parent_sender(&peer_id);
@@ -5892,12 +6195,12 @@ impl NetworkSession {
         if !self.is_host && (from_authority || from_parent) {
             self.pending_enemy_kills_confirmed.push(kill);
             self.applied_event_ids.insert(kill.event_id, current_frame);
-            if from_parent && !self.relay_children.is_empty() {
+            if relay_event && from_parent && !self.relay_children.is_empty() {
                 self.relay_enemy_kill(kill, self.resolve_peer_id(&peer_id), Some(origin_hash));
             }
             return;
         }
-        if !self.is_host && from_child {
+        if relay_event && !self.is_host && from_child {
             self.send_upstream_or_broadcast_routed(
                 NetMessage::EnemyKillEvent(kill).to_bytes(),
                 self.resolve_peer_id(&peer_id),
@@ -5911,7 +6214,7 @@ impl NetworkSession {
         entry.1.insert(peer_id.clone());
 
         if self.is_host {
-            if entry.1.len() == 1 {
+            if relay_event && entry.1.len() == 1 {
                 self.relay_enemy_kill(kill, self.resolve_peer_id(&peer_id), Some(origin_hash));
             }
             self.pending_enemy_kills_confirmed.push(kill);
@@ -5942,7 +6245,9 @@ impl NetworkSession {
         death: PlayerDeath,
         current_frame: u32,
     ) {
-        if self.applied_event_ids.contains_key(&death.event_id) {
+        if self.applied_event_ids.contains_key(&death.event_id)
+            || self.applied_event_ids.len() >= Self::MAX_APPLIED_EVENT_IDS
+        {
             return;
         }
         let from_parent = self.is_parent_sender(&peer_id);
@@ -5999,17 +6304,54 @@ impl NetworkSession {
     }
 
     fn prune_event_confirmations(&mut self, current_frame: u32) {
-        let ttl = 600;
+        let confirmation_ttl = 600;
         self.enemy_kill_confirmations
-            .retain(|_, (_, _, frame)| current_frame.saturating_sub(*frame) < ttl);
+            .retain(|_, (_, _, frame)| current_frame.saturating_sub(*frame) < confirmation_ttl);
         self.player_death_confirmations
-            .retain(|_, (_, _, frame)| current_frame.saturating_sub(*frame) < ttl);
-        self.applied_event_ids
-            .retain(|_, frame| current_frame.saturating_sub(*frame) < ttl);
+            .retain(|_, (_, _, frame)| current_frame.saturating_sub(*frame) < confirmation_ttl);
+        self.applied_event_ids.retain(|_, frame| {
+            current_frame.saturating_sub(*frame) < Self::APPLIED_EVENT_TTL_FRAMES
+        });
         self.optimistic_enemy_event_ids
-            .retain(|_, frame| current_frame.saturating_sub(*frame) < ttl);
+            .retain(|_, frame| current_frame.saturating_sub(*frame) < confirmation_ttl);
         self.optimistic_death_event_ids
-            .retain(|_, frame| current_frame.saturating_sub(*frame) < ttl);
+            .retain(|_, frame| current_frame.saturating_sub(*frame) < confirmation_ttl);
+
+        self.paid_obstacle_confirmations.retain(|_, (_, frame)| {
+            current_frame.saturating_sub(*frame) < Self::PAID_CONFIRMATION_TTL_FRAMES
+        });
+        self.paid_ability_confirmations.retain(|_, (_, frame)| {
+            current_frame.saturating_sub(*frame) < Self::PAID_CONFIRMATION_TTL_FRAMES
+        });
+        self.paid_name_confirmations.retain(|_, (_, frame)| {
+            current_frame.saturating_sub(*frame) < Self::PAID_CONFIRMATION_TTL_FRAMES
+        });
+
+        // Votes only count while both voter and target remain room members.
+        // This prevents departed majorities and arbitrary spoofed hashes from
+        // accumulating indefinitely.
+        let mut active_hashes: HashSet<u64> = self
+            .topology_roster
+            .iter()
+            .map(|entry| entry.peer_hash)
+            .collect();
+        if let Some(local_hash) = self.local_peer_hash {
+            active_hashes.insert(local_hash);
+        }
+        active_hashes.extend(
+            self.remote_players
+                .keys()
+                .map(|peer_id| Self::peer_identity_hash(peer_id)),
+        );
+        self.vote_mutes.retain(|target, voters| {
+            if !active_hashes.contains(target) {
+                return false;
+            }
+            voters.retain(|voter| active_hashes.contains(voter));
+            !voters.is_empty()
+        });
+        self.muted_hashes
+            .retain(|target| active_hashes.contains(target));
     }
 
     /// Take pending paid obstacles from other players
@@ -6308,9 +6650,13 @@ mod tests {
         leaf.relay_parent = Some(parent);
         leaf.relay_backup_parent = Some(backup);
         leaf.relay_children = Vec::new();
+        leaf.topology_roster = peers
+            .iter()
+            .map(|peer| entry_for(*peer, hash_for(local)))
+            .collect();
         let leaf_links = leaf.desired_peer_links(&peers, &peers);
         assert!(leaf_links.contains(&parent));
-        assert!(leaf_links.contains(&backup));
+        assert!(!leaf_links.contains(&backup), "healthy backups stay lazy");
         assert!(leaf_links.len() <= NetworkSession::LEAF_LINK_CAP);
 
         let mut supernode = NetworkSession::new();
@@ -6320,9 +6666,13 @@ mod tests {
         supernode.relay_parent = Some(parent);
         supernode.relay_backup_parent = Some(backup);
         supernode.relay_children = peers[8..16].to_vec();
+        supernode.topology_roster = peers
+            .iter()
+            .map(|peer| entry_for(*peer, hash_for(local)))
+            .collect();
         let super_links = supernode.desired_peer_links(&peers, &peers);
         assert!(super_links.contains(&parent));
-        assert!(super_links.contains(&backup));
+        assert!(!super_links.contains(&backup), "healthy backups stay lazy");
         for child in &supernode.relay_children {
             assert!(super_links.contains(child));
         }
@@ -7352,6 +7702,88 @@ mod tests {
         session.relay_epoch = 8;
         let second = session.desired_peer_links(&peers, &peers);
         assert_eq!(first, second, "epoch bumps must not rotate links");
+    }
+
+    #[test]
+    fn backup_link_is_desired_only_after_primary_stalls() {
+        let peers = known_peers(3);
+        let mut session = NetworkSession::new();
+        session.local_peer_id = Some(peers[0]);
+        session.relay_parent = Some(peers[1]);
+        session.relay_active_parent = Some(peers[1]);
+        session.relay_backup_parent = Some(peers[2]);
+        session.last_parent_switch_frame = 10;
+        session.last_update_frame = 100;
+
+        let healthy = session.desired_peer_links(&peers, &[peers[1]]);
+        assert!(!healthy.contains(&peers[2]));
+
+        session.last_update_frame = 400;
+        let stalled = session.desired_peer_links(&peers, &[]);
+        assert!(stalled.contains(&peers[2]));
+    }
+
+    #[test]
+    fn backup_parent_is_primary_parents_next_sibling() {
+        let peers = known_peers(4);
+        let root = peers[0];
+        let primary = peers[1];
+        let uncle = peers[2];
+        let local = peers[3];
+        let mut session = NetworkSession::new();
+        session.local_peer_id = Some(local);
+        session.local_peer_hash = Some(hash_for(local));
+        session.topology_roster = vec![
+            entry_for(root, 0),
+            entry_for(primary, hash_for(root)),
+            entry_for(uncle, hash_for(root)),
+            entry_for(local, hash_for(primary)),
+        ];
+
+        session.derive_links_from_roster(10);
+
+        assert_eq!(session.relay_parent, Some(primary));
+        assert_eq!(session.relay_backup_parent, Some(uncle));
+    }
+
+    #[test]
+    fn relay_envelope_carries_and_decrements_hop_budget() {
+        let mut session = NetworkSession::new();
+        let payload = NetMessage::PlayerLeft.to_bytes();
+        let origin = 0x1234;
+        let first = session.encode_relay_envelope(origin, &payload);
+        let (decoded_origin, event_id, hops, decoded_payload) =
+            NetworkSession::decode_relay_envelope(&first).expect("current envelope");
+        assert_eq!(decoded_origin, origin);
+        assert_eq!(event_id, 1);
+        assert_eq!(hops, NetworkSession::RELAY_MAX_HOPS);
+        assert_eq!(decoded_payload, payload);
+
+        let key = (origin, NetworkSession::hash_bytes(&payload));
+        session
+            .incoming_relay_routes
+            .insert(key, (event_id, hops - 1));
+        let forwarded = session.encode_relay_envelope(origin, &payload);
+        let (_, forwarded_event_id, forwarded_hops, _) =
+            NetworkSession::decode_relay_envelope(&forwarded).expect("forwarded envelope");
+        assert_eq!(forwarded_event_id, event_id);
+        assert_eq!(forwarded_hops, hops - 1);
+    }
+
+    #[test]
+    fn malformed_topology_cycles_are_rejected() {
+        let peers = known_peers(3);
+        let map = TopologyUpdate {
+            epoch: 1,
+            root_hash: hash_for(peers[0]),
+            fanout: 2,
+            entries: vec![
+                entry_for(peers[0], 0),
+                entry_for(peers[1], hash_for(peers[2])),
+                entry_for(peers[2], hash_for(peers[1])),
+            ],
+        };
+        assert!(!NetworkSession::topology_map_is_well_formed(&map));
     }
 
     #[test]

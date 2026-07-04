@@ -2603,7 +2603,15 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 && (state_ref.network.state == NetworkState::Connected
                     || state_ref.network.state == NetworkState::WaitingForPeers);
 
+            let multiplayer_remote_players = if in_multiplayer_room {
+                Some(state_ref.network.remote_players.clone())
+            } else {
+                None
+            };
             if in_multiplayer_room && state_ref.game.scene == Scene::Game {
+                let remote_players = multiplayer_remote_players
+                    .as_ref()
+                    .expect("multiplayer snapshot must exist during gameplay");
                 let incoming_inputs = state_ref.network.take_input_frames();
                 if !incoming_inputs.is_empty() {
                     let mut formatted_inputs = Vec::with_capacity(incoming_inputs.len());
@@ -2612,10 +2620,9 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     }
                     state_ref.game.queue_remote_inputs(&formatted_inputs);
                 }
-                let remote_players = state_ref.network.remote_players.clone();
                 state_ref
                     .game
-                    .update_remote_predictions(&remote_players, frame_count);
+                    .update_remote_predictions(remote_players, frame_count);
                 let predictions = state_ref.game.remote_predictions().clone();
                 state_ref.network.apply_predicted_states(&predictions);
             }
@@ -2659,12 +2666,14 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
             let mut step_input = input_snapshot.clone();
             for step in 0..sim_steps {
                 if in_multiplayer_room {
-                    // Clone remote players to avoid borrow conflict
-                    let remote_players = state_ref.network.remote_players.clone();
                     let is_host = state_ref.network.is_host;
-                    state_ref
-                        .game
-                        .update_multiplayer(&step_input, &remote_players, is_host);
+                    state_ref.game.update_multiplayer(
+                        &step_input,
+                        multiplayer_remote_players
+                            .as_ref()
+                            .expect("multiplayer snapshot must exist during gameplay"),
+                        is_host,
+                    );
                 } else {
                     state_ref.game.update(&step_input);
                 }
@@ -2779,9 +2788,9 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                 }
 
                 let stats_sync_stride = match state_ref.network.relay_congestion_level() {
-                    0 => 30,
-                    1 => 60,
-                    _ => 90,
+                    0 => 300,
+                    1 => 450,
+                    _ => 600,
                 };
                 if state_ref.game.frame_count % stats_sync_stride == 0 {
                     state_ref.network.send_player_stats_snapshot();
@@ -3193,7 +3202,11 @@ fn start_game_loop(window: web_sys::Window, state: Rc<RefCell<GameState>>) -> Re
                     1 => 6,
                     _ => 8,
                 };
-                let host_enemy_intro_stride: u32 = 30;
+                // Wave starts and explicit late-join snapshots introduce the
+                // complete enemy set. Keep only a low-rate healing snapshot;
+                // broadcasting the whole world twice a second dominates room
+                // bandwidth at scale.
+                let host_enemy_intro_stride: u32 = 600;
                 // Delta-based, never modulo: the wall-clock frame counter
                 // advances in fixed jumps on throttled tabs, which makes
                 // `% stride` lock onto a non-zero residue forever.
