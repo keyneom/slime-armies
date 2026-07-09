@@ -125,6 +125,7 @@ Notes:
 - **Signaling membership**: all clients remain attached so the room can repair membership and mint new sparse WebRTC links; Matchbox never carries gameplay data
 - **Rollback netcode**: lightweight input/state rollback (in progress)
 - **Hybrid P2P topology**: dynamic multi-supernode relay tree with area-aware routing, adaptive fanout, and parent failover (in progress)
+- **Large-room refactor**: [implementation handoff](LARGE_ROOM_SIMULATION_PLAN.md) for cell-local simulation and a deterministic native room simulator; the current tree bounds connection fanout, not global game-state work
 
 ## Roadmap
 

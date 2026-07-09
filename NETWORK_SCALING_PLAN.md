@@ -1,5 +1,10 @@
 # P2P Scaling Research + Execution Plan
 
+> **Active implementation handoff:** see
+> [`LARGE_ROOM_SIMULATION_PLAN.md`](LARGE_ROOM_SIMULATION_PLAN.md). This file
+> records the current relay-tree design and historical research; its older
+> future-looking sections are not the large-room build order.
+
 Last updated: 2026-06-09
 
 ## 2026-06-09 redesign: sticky-root topology map (CURRENT ARCHITECTURE)
