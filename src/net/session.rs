@@ -131,13 +131,16 @@ pub struct NetworkSession {
     /// Cached `{:?}` strings of roster uuids so per-frame lookup pruning keeps
     /// hash->id mappings alive for roster members we have not connected to yet.
     roster_peer_strs: HashSet<String>,
-    /// Link derivation is pure in the roster. Cache its structural checksum so
-    /// the root does not rebuild every identity/string index every frame.
+    /// Link derivation is pure in the roster. This is cleared at every roster
+    /// mutation so stable roots do not re-hash/sort the entire roster each frame.
     last_derived_roster_checksum: Option<u64>,
     /// Root only: last frame each member (by origin hash) showed signs of life.
     member_last_seen: HashMap<u64, u32>,
     /// Root only: membership/assignments changed since last broadcast.
     roster_dirty: bool,
+    /// Root only: a structural mutation still needs exactly one new topology
+    /// epoch, even if the corresponding broadcast is coalesced for many frames.
+    topology_epoch_dirty: bool,
     last_map_rx_frame: u32,
     last_join_request_frame: u32,
     /// Peers that asked to join through us; they get the next map directly.
@@ -203,6 +206,11 @@ pub struct NetworkSession {
     last_sync_trace_sig: u64,
     last_sync_warn_frame: u32,
     area_authorities: HashMap<u32, u64>,
+    /// Version of the current authority map within `relay_epoch`.
+    area_authority_revision: u32,
+    /// Area selection is intentionally lower-rate than the game tick. The
+    /// authority map is a lease/control-plane input, not frame-rate state.
+    last_area_authority_recompute_frame: u32,
     last_topology_broadcast_frame: u32,
     last_area_update_broadcast_frame: u32,
     local_last_pos: Option<Vec2>,
@@ -272,9 +280,12 @@ pub struct NetworkSession {
     /// Received input frames (future rollback netcode)
     pub pending_input_frames: Vec<(PeerId, InputFrame)>,
     relay_player_states: HashMap<u64, PlayerState>,
+    /// Rotates the subset sent while a state batch is over its wire budget so
+    /// one stable hash-map iteration order cannot starve the same players.
+    relay_state_cursor: u64,
     relay_input_frames: VecDeque<InputFrameEntry>,
-    downlink_player_batches: Vec<PlayerStateBatch>,
-    downlink_input_batches: Vec<InputFrameBatch>,
+    downlink_player_batches: VecDeque<PlayerStateBatch>,
+    downlink_input_batches: VecDeque<InputFrameBatch>,
     /// Latency samples to peers (ms)
     pub latency_ms: HashMap<matchbox_socket::PeerId, u32>,
     /// RTT sample counts per peer
@@ -362,6 +373,7 @@ impl NetworkSession {
     const LINK_NAG_THRESHOLD: u32 = 2;
     /// First auto-rejoin attempt happens this long after socket loss.
     const REJOIN_BASE_DELAY_FRAMES: u32 = 60;
+    const AREA_AUTHORITY_RECOMPUTE_PERIOD_FRAMES: u32 = 15;
 
     fn interest_radius_sq() -> f32 {
         let radius = 1800.0;
@@ -551,6 +563,8 @@ impl NetworkSession {
         });
         self.member_parent_since.insert(hash, current_frame);
         self.roster_dirty = true;
+        self.topology_epoch_dirty = true;
+        self.last_derived_roster_checksum = None;
     }
 
     /// Order-independent fingerprint of a roster's structure. Lets delta
@@ -597,6 +611,7 @@ impl NetworkSession {
             last_derived_roster_checksum: None,
             member_last_seen: HashMap::new(),
             roster_dirty: false,
+            topology_epoch_dirty: false,
             last_map_rx_frame: 0,
             last_join_request_frame: 0,
             pending_map_peers: Vec::new(),
@@ -638,6 +653,8 @@ impl NetworkSession {
             last_sync_trace_sig: 0,
             last_sync_warn_frame: 0,
             area_authorities: HashMap::new(),
+            area_authority_revision: 0,
+            last_area_authority_recompute_frame: u32::MAX,
             last_topology_broadcast_frame: 0,
             last_area_update_broadcast_frame: 0,
             local_last_pos: None,
@@ -679,9 +696,10 @@ impl NetworkSession {
             vote_mutes: HashMap::new(),
             pending_input_frames: Vec::new(),
             relay_player_states: HashMap::new(),
+            relay_state_cursor: 0,
             relay_input_frames: VecDeque::new(),
-            downlink_player_batches: Vec::new(),
-            downlink_input_batches: Vec::new(),
+            downlink_player_batches: VecDeque::new(),
+            downlink_input_batches: VecDeque::new(),
             latency_ms: HashMap::new(),
             latency_samples: HashMap::new(),
             supernode_scores: HashMap::new(),
@@ -822,6 +840,7 @@ impl NetworkSession {
         self.last_derived_roster_checksum = None;
         self.member_last_seen.clear();
         self.roster_dirty = false;
+        self.topology_epoch_dirty = false;
         self.last_map_rx_frame = 0;
         self.last_join_request_frame = 0;
         self.pending_map_peers.clear();
@@ -843,6 +862,8 @@ impl NetworkSession {
         self.relay_fanout = Self::MIN_FANOUT;
         self.relay_epoch = 0;
         self.area_authorities.clear();
+        self.area_authority_revision = 0;
+        self.last_area_authority_recompute_frame = u32::MAX;
         self.recent_relay_events.clear();
         self.incoming_relay_routes.clear();
         self.peer_link_backoff_until.clear();
@@ -894,6 +915,7 @@ impl NetworkSession {
         self.last_derived_roster_checksum = None;
         self.member_last_seen.clear();
         self.roster_dirty = false;
+        self.topology_epoch_dirty = false;
         self.last_map_rx_frame = 0;
         self.last_join_request_frame = 0;
         self.pending_map_peers.clear();
@@ -932,6 +954,8 @@ impl NetworkSession {
         self.last_sync_trace_sig = 0;
         self.last_sync_warn_frame = 0;
         self.area_authorities.clear();
+        self.area_authority_revision = 0;
+        self.last_area_authority_recompute_frame = u32::MAX;
         self.local_last_pos = None;
         self.pending_player_names.clear();
         self.peer_id_lookup.clear();
@@ -962,6 +986,7 @@ impl NetworkSession {
         self.muted_hashes.clear();
         self.vote_mutes.clear();
         self.relay_player_states.clear();
+        self.relay_state_cursor = 0;
         self.relay_input_frames.clear();
         self.downlink_player_batches.clear();
         self.downlink_input_batches.clear();
@@ -1064,8 +1089,12 @@ impl NetworkSession {
                         // Send join message with our name
                         let msg = NetMessage::PlayerJoined(local_name.clone()).to_bytes();
                         socket.send(msg.into_boxed_slice(), peer_id);
-                        // Track new peer so the elected supernode can send state
-                        self.new_peers_needing_state.push(peer_id);
+                        // Only the current root consumes this queue. Keeping it
+                        // local to the root prevents unbounded stale IDs on
+                        // every leaf during link churn.
+                        if self.is_host && !self.new_peers_needing_state.contains(&peer_id) {
+                            self.new_peers_needing_state.push(peer_id);
+                        }
                     }
                     PeerState::Disconnected => {
                         let last_seen_age = seen_message_frames
@@ -2147,6 +2176,8 @@ impl NetworkSession {
             self.member_parent_since.insert(orphan, current_frame);
         }
         self.roster_dirty = true;
+        self.topology_epoch_dirty = true;
+        self.last_derived_roster_checksum = None;
     }
 
     /// Root: keep the roster current (admit connected strangers, prune dead
@@ -2187,6 +2218,8 @@ impl NetworkSession {
                 },
             );
             self.roster_dirty = true;
+            self.topology_epoch_dirty = true;
+            self.last_derived_roster_checksum = None;
         }
 
         // Match fanout to room size before admitting (new members use it).
@@ -2197,6 +2230,7 @@ impl NetworkSession {
         if fanout != self.relay_fanout {
             self.relay_fanout = fanout;
             self.roster_dirty = true;
+            self.topology_epoch_dirty = true;
         }
 
         // A live connection is proof of life and an implicit join request.
@@ -2241,12 +2275,30 @@ impl NetworkSession {
         self.member_last_seen
             .retain(|hash, _| roster_hashes.contains(hash));
 
-        if self.roster_dirty {
+        // Coalesced large-room membership changes stay in one topology epoch.
+        // Previously this incremented on every frame until the delayed delta
+        // broadcast, producing phantom epochs and stale area-map races.
+        let epoch_advanced = self.topology_epoch_dirty;
+        if epoch_advanced {
             self.relay_epoch = self.relay_epoch.wrapping_add(1);
+            self.topology_epoch_dirty = false;
+            self.area_authorities.clear();
+            self.area_authority_revision = 0;
         }
 
-        self.derive_links_from_roster(current_frame);
-        self.recompute_area_authorities(current_frame);
+        let links_changed = self.last_derived_roster_checksum.is_none();
+        if links_changed {
+            self.derive_links_from_roster(current_frame);
+        }
+        if links_changed
+            || epoch_advanced
+            || self.last_area_authority_recompute_frame == u32::MAX
+            || current_frame.saturating_sub(self.last_area_authority_recompute_frame)
+                >= Self::AREA_AUTHORITY_RECOMPUTE_PERIOD_FRAMES
+        {
+            self.last_area_authority_recompute_frame = current_frame;
+            self.recompute_area_authorities(current_frame);
+        }
 
         // Heartbeats get cheaper-but-rarer in big rooms; in delta mode the
         // heartbeat is an empty delta (~30 bytes), not a full map. Membership
@@ -2567,6 +2619,15 @@ impl NetworkSession {
         }
         let from_authority = self.is_parent_sender(sender) || self.is_supernode_sender(sender);
 
+        // Deltas are never routed laterally or upstream. Accepting a
+        // well-formed checksum from an arbitrary direct peer lets that peer
+        // rewrite our tree without ever being the root or our parent.
+        if !from_authority {
+            self.relay_telemetry.dropped_messages =
+                self.relay_telemetry.dropped_messages.saturating_add(1);
+            return false;
+        }
+
         // Empty heartbeat: proves root liveness and doubles as a divergence
         // detector (checksum must match what we hold).
         if delta.epoch_to == self.relay_epoch && delta.epoch_from == delta.epoch_to {
@@ -2574,12 +2635,9 @@ impl NetworkSession {
                 self.needs_full_map = true;
                 return false;
             }
-            if from_authority {
-                self.last_map_rx_frame = current_frame;
-                self.root_departure_frame = None;
-                return true;
-            }
-            return false;
+            self.last_map_rx_frame = current_frame;
+            self.root_departure_frame = None;
+            return true;
         }
 
         if delta.epoch_to <= self.relay_epoch {
@@ -2606,10 +2664,24 @@ impl NetworkSession {
             self.needs_full_map = true;
             return false;
         }
+        if !Self::topology_map_is_well_formed(&TopologyUpdate {
+            epoch: delta.epoch_to,
+            root_hash: delta.root_hash,
+            fanout: delta.fanout,
+            entries: next.clone(),
+        }) {
+            self.needs_full_map = true;
+            self.relay_telemetry.dropped_messages =
+                self.relay_telemetry.dropped_messages.saturating_add(1);
+            return false;
+        }
 
         self.topology_roster = next;
         self.relay_epoch = delta.epoch_to;
         self.relay_fanout = (delta.fanout as usize).clamp(Self::MIN_FANOUT, Self::MAX_FANOUT);
+        self.last_derived_roster_checksum = None;
+        self.area_authorities.clear();
+        self.area_authority_revision = 0;
         // A delta always carries a new epoch: genuinely fresh root output.
         self.last_map_rx_frame = current_frame;
         self.root_departure_frame = None;
@@ -2826,16 +2898,27 @@ impl NetworkSession {
             }
         }
 
+        let next_fanout = (update.fanout as usize).clamp(Self::MIN_FANOUT, Self::MAX_FANOUT);
+        let topology_changed = self.topology_roster != update.entries
+            || self.relay_epoch != update.epoch
+            || self.relay_fanout != next_fanout;
         self.topology_roster = update.entries.clone();
         self.relay_epoch = update.epoch;
-        self.relay_fanout = (update.fanout as usize).clamp(Self::MIN_FANOUT, Self::MAX_FANOUT);
+        self.relay_fanout = next_fanout;
+        if topology_changed {
+            self.last_derived_roster_checksum = None;
+            self.area_authorities.clear();
+            self.area_authority_revision = 0;
+        }
         let fresh_information = update.epoch > prev_epoch || from_authority;
         if fresh_information {
             self.last_map_rx_frame = current_frame;
             // A genuinely live map supersedes any death evidence about its root.
             self.root_departure_frame = None;
         }
-        self.derive_links_from_roster(current_frame);
+        if topology_changed {
+            self.derive_links_from_roster(current_frame);
+        }
         fresh_information
     }
 
@@ -2905,6 +2988,8 @@ impl NetworkSession {
         self.member_parent_since.insert(member_hash, current_frame);
         self.member_link_nags.remove(&member_hash);
         self.roster_dirty = true;
+        self.topology_epoch_dirty = true;
+        self.last_derived_roster_checksum = None;
         Self::log_warn(&format!(
             "Reassigned member {member_hash:#x} from unreachable parent {current_parent:#x} to {new_parent:#x}"
         ));
@@ -3206,8 +3291,12 @@ impl NetworkSession {
         self.member_parent_since.insert(local_hash, current_frame);
         self.member_parent_since.insert(successor, current_frame);
         self.relay_epoch = self.relay_epoch.wrapping_add(1);
+        self.area_authorities.clear();
+        self.area_authority_revision = 0;
+        self.last_derived_roster_checksum = None;
         self.last_topology_broadcast_frame = current_frame;
         self.roster_dirty = false;
+        self.topology_epoch_dirty = false;
         // Broadcast while we still hold the role, then derive (which drops
         // our host status since our entry now has a parent).
         self.last_broadcast_roster.clear();
@@ -3271,6 +3360,10 @@ impl NetworkSession {
         self.relay_active_parent = None;
         self.relay_epoch = self.relay_epoch.wrapping_add(1);
         self.roster_dirty = true;
+        self.topology_epoch_dirty = false;
+        self.last_derived_roster_checksum = None;
+        self.area_authorities.clear();
+        self.area_authority_revision = 0;
         self.last_map_rx_frame = current_frame;
         self.root_departure_frame = None;
     }
@@ -3362,6 +3455,9 @@ impl NetworkSession {
 
         let changed = authorities != self.area_authorities;
         self.area_authorities = authorities;
+        if changed {
+            self.area_authority_revision = self.area_authority_revision.wrapping_add(1);
+        }
         // Stale copies of this map are what open split-brain windows: senders
         // claim areas and receivers filter corrections against their own
         // copy, so a slow-propagating handoff silently drops legitimate
@@ -3758,7 +3854,10 @@ impl NetworkSession {
     }
 
     fn apply_area_authority_update(&mut self, sender: &str, update: AreaAuthorityUpdate) {
-        if self.relay_epoch > update.epoch {
+        // Area leases are meaningful only for the exact topology they were
+        // issued under. A map from an older (or not-yet-adopted) epoch can
+        // otherwise overwrite current ownership during reconnect/handoff.
+        if self.relay_epoch != update.epoch {
             return;
         }
         // The map is root-originated but arrives via the tree: depth >= 2
@@ -3766,11 +3865,31 @@ impl NetworkSession {
         if !(self.is_supernode_sender(sender) || self.is_parent_sender(sender)) {
             return;
         }
-        self.area_authorities = update
+        if update.revision < self.area_authority_revision {
+            return;
+        }
+        let authorities: HashMap<u32, u64> = update
             .entries
             .into_iter()
             .map(|entry| (entry.area_id, entry.authority_hash))
             .collect();
+        // An authority must be a live member of this topology. This is not a
+        // substitute for signed control messages, but rejects stale/invalid
+        // maps before they influence enemy correction admission.
+        if authorities
+            .values()
+            .any(|authority_hash| !self.roster_contains(*authority_hash))
+        {
+            return;
+        }
+        if update.revision == self.area_authority_revision
+            && !self.area_authorities.is_empty()
+            && authorities != self.area_authorities
+        {
+            return;
+        }
+        self.area_authorities = authorities;
+        self.area_authority_revision = update.revision;
     }
 
     /// Current area-authority map as a wire message, stamped with our current
@@ -3787,6 +3906,7 @@ impl NetworkSession {
             .collect();
         let update = AreaAuthorityUpdate {
             epoch: self.relay_epoch,
+            revision: self.area_authority_revision,
             entries,
         };
         NetMessage::AreaAuthorityUpdateEvent(update).to_bytes()
@@ -5432,6 +5552,27 @@ impl NetworkSession {
         self.relay_player_states.insert(peer_hash, state);
     }
 
+    /// Retain a rotating, deterministic slice when a snapshot exceeds one
+    /// packet. The old `HashMap::drain().truncate()` path could repeatedly
+    /// choose the same hashes, leaving the rest permanently stale in larger
+    /// rooms.
+    fn take_fair_player_state_slice(
+        entries: &mut Vec<PlayerStateEntry>,
+        cap: usize,
+        cursor: &mut u64,
+    ) -> usize {
+        if entries.len() <= cap {
+            return 0;
+        }
+        entries.sort_unstable_by_key(|entry| entry.peer_hash);
+        let start = (*cursor as usize) % entries.len();
+        entries.rotate_left(start);
+        *cursor = (*cursor).wrapping_add(cap as u64);
+        let dropped = entries.len() - cap;
+        entries.truncate(cap);
+        dropped
+    }
+
     fn queue_relay_input_frame(&mut self, peer_hash: u64, frame: InputFrame) {
         let area_id = self.area_id_for_hash(peer_hash);
         if self.relay_input_frames.len() >= Self::MAX_RELAY_INPUT_QUEUE {
@@ -5450,36 +5591,32 @@ impl NetworkSession {
         if self.downlink_player_batches.len() >= Self::MAX_DOWNLINK_QUEUE {
             let dropped = self
                 .downlink_player_batches
-                .first()
+                .front()
                 .map(|b| b.entries.len() as u32)
                 .unwrap_or(0);
-            if !self.downlink_player_batches.is_empty() {
-                self.downlink_player_batches.remove(0);
-            }
+            self.downlink_player_batches.pop_front();
             self.relay_telemetry.dropped_queue_entries = self
                 .relay_telemetry
                 .dropped_queue_entries
                 .saturating_add(dropped.max(1));
         }
-        self.downlink_player_batches.push(batch);
+        self.downlink_player_batches.push_back(batch);
     }
 
     fn queue_downlink_input_batch(&mut self, batch: InputFrameBatch) {
         if self.downlink_input_batches.len() >= Self::MAX_DOWNLINK_QUEUE {
             let dropped = self
                 .downlink_input_batches
-                .first()
+                .front()
                 .map(|b| b.entries.len() as u32)
                 .unwrap_or(0);
-            if !self.downlink_input_batches.is_empty() {
-                self.downlink_input_batches.remove(0);
-            }
+            self.downlink_input_batches.pop_front();
             self.relay_telemetry.dropped_queue_entries = self
                 .relay_telemetry
                 .dropped_queue_entries
                 .saturating_add(dropped.max(1));
         }
-        self.downlink_input_batches.push(batch);
+        self.downlink_input_batches.push_back(batch);
     }
 
     pub fn flush_relay_batches(&mut self) {
@@ -5503,6 +5640,15 @@ impl NetworkSession {
         if let (Some(local_hash), Some(local_pos)) = (self.local_peer_hash, self.local_last_pos) {
             positions_by_hash.insert(local_hash, local_pos);
         }
+        // Only a leaf has enough information to filter by its own interest.
+        // Interior relays must receive complete batches so a nearby grandchild
+        // is not starved merely because its parent is farther away.
+        let interior_hashes: HashSet<u64> = self
+            .topology_roster
+            .iter()
+            .filter(|entry| entry.parent_hash != 0)
+            .map(|entry| entry.parent_hash)
+            .collect();
 
         let queue_depth = self.relay_player_states.len()
             + self.relay_input_frames.len()
@@ -5543,13 +5689,16 @@ impl NetworkSession {
                     }
                 })
                 .collect();
-            if entries.len() > batch_cap {
-                let dropped = (entries.len() - batch_cap) as u32;
-                entries.truncate(batch_cap);
+            let dropped = Self::take_fair_player_state_slice(
+                &mut entries,
+                batch_cap,
+                &mut self.relay_state_cursor,
+            );
+            if dropped > 0 {
                 self.relay_telemetry.dropped_queue_entries = self
                     .relay_telemetry
                     .dropped_queue_entries
-                    .saturating_add(dropped);
+                    .saturating_add(dropped as u32);
             }
             let radius_sq = Self::interest_radius_sq();
             if let Some(parent_peer) = parent {
@@ -5561,28 +5710,33 @@ impl NetworkSession {
                     let target_hash = Self::peer_hash_for_matchbox(*child);
                     let target_pos = positions_by_hash.get(&target_hash).copied();
                     let target_area = target_pos.map(Self::area_id_from_pos);
-                    let mut filtered: Vec<PlayerStateEntry> = entries
-                        .iter()
-                        .filter(|entry| {
-                            if entry.peer_hash == target_hash
-                                || entry.peer_hash % far_slice_stride == far_slice
-                            {
-                                return true;
-                            }
-                            if let Some(area) = target_area {
-                                if entry.area_id == area {
-                                    return true;
-                                }
-                            }
-                            if let Some(pos) = target_pos {
-                                let dx = entry.state.x - pos.x;
-                                let dy = entry.state.y - pos.y;
-                                return dx * dx + dy * dy <= radius_sq;
-                            }
-                            true
-                        })
-                        .cloned()
-                        .collect();
+                    let mut filtered: Vec<PlayerStateEntry> =
+                        if interior_hashes.contains(&target_hash) {
+                            entries.clone()
+                        } else {
+                            entries
+                                .iter()
+                                .filter(|entry| {
+                                    if entry.peer_hash == target_hash
+                                        || entry.peer_hash % far_slice_stride == far_slice
+                                    {
+                                        return true;
+                                    }
+                                    if let Some(area) = target_area {
+                                        if entry.area_id == area {
+                                            return true;
+                                        }
+                                    }
+                                    if let Some(pos) = target_pos {
+                                        let dx = entry.state.x - pos.x;
+                                        let dy = entry.state.y - pos.y;
+                                        return dx * dx + dy * dy <= radius_sq;
+                                    }
+                                    true
+                                })
+                                .cloned()
+                                .collect()
+                        };
                     if filtered.len() > batch_cap {
                         let dropped = (filtered.len() - batch_cap) as u32;
                         filtered.truncate(batch_cap);
@@ -5610,29 +5764,34 @@ impl NetworkSession {
                     let target_hash = Self::peer_hash_for_matchbox(*child);
                     let target_pos = positions_by_hash.get(&target_hash).copied();
                     let target_area = target_pos.map(Self::area_id_from_pos);
-                    let mut filtered: Vec<PlayerStateEntry> = batch
-                        .entries
-                        .iter()
-                        .filter(|entry| {
-                            if entry.peer_hash == target_hash
-                                || entry.peer_hash % far_slice_stride == far_slice
-                            {
-                                return true;
-                            }
-                            if let Some(area) = target_area {
-                                if entry.area_id == area {
-                                    return true;
-                                }
-                            }
-                            if let Some(pos) = target_pos {
-                                let dx = entry.state.x - pos.x;
-                                let dy = entry.state.y - pos.y;
-                                return dx * dx + dy * dy <= radius_sq;
-                            }
-                            true
-                        })
-                        .cloned()
-                        .collect();
+                    let mut filtered: Vec<PlayerStateEntry> =
+                        if interior_hashes.contains(&target_hash) {
+                            batch.entries.clone()
+                        } else {
+                            batch
+                                .entries
+                                .iter()
+                                .filter(|entry| {
+                                    if entry.peer_hash == target_hash
+                                        || entry.peer_hash % far_slice_stride == far_slice
+                                    {
+                                        return true;
+                                    }
+                                    if let Some(area) = target_area {
+                                        if entry.area_id == area {
+                                            return true;
+                                        }
+                                    }
+                                    if let Some(pos) = target_pos {
+                                        let dx = entry.state.x - pos.x;
+                                        let dy = entry.state.y - pos.y;
+                                        return dx * dx + dy * dy <= radius_sq;
+                                    }
+                                    true
+                                })
+                                .cloned()
+                                .collect()
+                        };
                     if filtered.len() > batch_cap {
                         let dropped = (filtered.len() - batch_cap) as u32;
                         filtered.truncate(batch_cap);
@@ -5673,32 +5832,37 @@ impl NetworkSession {
                     let target_hash = Self::peer_hash_for_matchbox(*child);
                     let target_pos = positions_by_hash.get(&target_hash).copied();
                     let target_area = target_pos.map(Self::area_id_from_pos);
-                    let mut filtered: Vec<InputFrameEntry> = entries
-                        .iter()
-                        .filter(|entry| {
-                            if entry.peer_hash == target_hash {
-                                return true;
-                            }
-                            if let Some(area) = target_area {
-                                if entry.area_id == area {
-                                    return true;
-                                }
-                            }
-                            match positions_by_hash.get(&entry.peer_hash) {
-                                Some(pos) => {
-                                    if let Some(target) = target_pos {
-                                        let dx = pos.x - target.x;
-                                        let dy = pos.y - target.y;
-                                        dx * dx + dy * dy <= radius_sq
-                                    } else {
-                                        true
+                    let mut filtered: Vec<InputFrameEntry> =
+                        if interior_hashes.contains(&target_hash) {
+                            entries.clone()
+                        } else {
+                            entries
+                                .iter()
+                                .filter(|entry| {
+                                    if entry.peer_hash == target_hash {
+                                        return true;
                                     }
-                                }
-                                None => true,
-                            }
-                        })
-                        .cloned()
-                        .collect();
+                                    if let Some(area) = target_area {
+                                        if entry.area_id == area {
+                                            return true;
+                                        }
+                                    }
+                                    match positions_by_hash.get(&entry.peer_hash) {
+                                        Some(pos) => {
+                                            if let Some(target) = target_pos {
+                                                let dx = pos.x - target.x;
+                                                let dy = pos.y - target.y;
+                                                dx * dx + dy * dy <= radius_sq
+                                            } else {
+                                                true
+                                            }
+                                        }
+                                        None => true,
+                                    }
+                                })
+                                .cloned()
+                                .collect()
+                        };
                     if filtered.len() > batch_cap {
                         let dropped = (filtered.len() - batch_cap) as u32;
                         filtered.truncate(batch_cap);
@@ -5726,33 +5890,38 @@ impl NetworkSession {
                     let target_hash = Self::peer_hash_for_matchbox(*child);
                     let target_pos = positions_by_hash.get(&target_hash).copied();
                     let target_area = target_pos.map(Self::area_id_from_pos);
-                    let mut filtered: Vec<InputFrameEntry> = batch
-                        .entries
-                        .iter()
-                        .filter(|entry| {
-                            if entry.peer_hash == target_hash {
-                                return true;
-                            }
-                            if let Some(area) = target_area {
-                                if entry.area_id == area {
-                                    return true;
-                                }
-                            }
-                            match positions_by_hash.get(&entry.peer_hash) {
-                                Some(pos) => {
-                                    if let Some(target) = target_pos {
-                                        let dx = pos.x - target.x;
-                                        let dy = pos.y - target.y;
-                                        dx * dx + dy * dy <= radius_sq
-                                    } else {
-                                        true
+                    let mut filtered: Vec<InputFrameEntry> =
+                        if interior_hashes.contains(&target_hash) {
+                            batch.entries.clone()
+                        } else {
+                            batch
+                                .entries
+                                .iter()
+                                .filter(|entry| {
+                                    if entry.peer_hash == target_hash {
+                                        return true;
                                     }
-                                }
-                                None => true,
-                            }
-                        })
-                        .cloned()
-                        .collect();
+                                    if let Some(area) = target_area {
+                                        if entry.area_id == area {
+                                            return true;
+                                        }
+                                    }
+                                    match positions_by_hash.get(&entry.peer_hash) {
+                                        Some(pos) => {
+                                            if let Some(target) = target_pos {
+                                                let dx = pos.x - target.x;
+                                                let dy = pos.y - target.y;
+                                                dx * dx + dy * dy <= radius_sq
+                                            } else {
+                                                true
+                                            }
+                                        }
+                                        None => true,
+                                    }
+                                })
+                                .cloned()
+                                .collect()
+                        };
                     if filtered.len() > batch_cap {
                         let dropped = (filtered.len() - batch_cap) as u32;
                         filtered.truncate(batch_cap);
@@ -7191,10 +7360,17 @@ mod tests {
         let a = peer_from(1);
         let b = peer_from(2);
         let c = peer_from(3);
+        let stranger = peer_from(99);
 
         let mut session = NetworkSession::new();
         session.local_peer_id = Some(a);
         session.local_peer_hash = Some(hash_for(a));
+        let sender = format!("{:?}", root);
+        session.peer_id_lookup.insert(sender.clone(), root);
+        let stranger_sender = format!("{:?}", stranger);
+        session
+            .peer_id_lookup
+            .insert(stranger_sender.clone(), stranger);
         let base = TopologyUpdate {
             epoch: 5,
             root_hash: hash_for(root),
@@ -7205,7 +7381,7 @@ mod tests {
                 entry_for(b, hash_for(root)),
             ],
         };
-        assert!(session.apply_topology_map("sender", &base, 10));
+        assert!(session.apply_topology_map(&sender, &base, 10));
         assert_eq!(session.relay_epoch, 5);
 
         // Valid delta: c joins under a.
@@ -7220,14 +7396,44 @@ mod tests {
             removed: vec![],
             upserts: vec![entry_for(c, hash_for(a))],
         };
-        assert!(session.apply_topology_delta("sender", &delta, 20));
+        // A lateral link cannot advance the control-plane stream even if it
+        // supplies a matching checksum.
+        assert!(!session.apply_topology_delta(&stranger_sender, &delta, 19));
+        assert_eq!(session.relay_epoch, 5);
+        assert!(!session.roster_contains(hash_for(c)));
+        assert!(session.apply_topology_delta(&sender, &delta, 20));
         assert_eq!(session.relay_epoch, 6);
         assert!(session.roster_contains(hash_for(c)));
         assert_eq!(session.relay_children, vec![c]);
         assert!(!session.needs_full_map);
 
+        // A matching checksum is not enough: the resulting tree must remain
+        // connected and acyclic before we adopt it.
+        let mut malformed_entries = session.topology_roster.clone();
+        malformed_entries
+            .iter_mut()
+            .find(|entry| entry.peer_hash == hash_for(a))
+            .expect("a entry")
+            .parent_hash = hash_for(c);
+        let malformed = TopologyDelta {
+            epoch_from: 6,
+            epoch_to: 7,
+            root_hash: hash_for(root),
+            fanout: 4,
+            checksum: NetworkSession::roster_checksum(&malformed_entries),
+            removed: vec![],
+            upserts: vec![TopologyEntry {
+                parent_hash: hash_for(c),
+                ..entry_for(a, hash_for(root))
+            }],
+        };
+        assert!(!session.apply_topology_delta(&sender, &malformed, 20));
+        assert!(session.needs_full_map);
+        assert_eq!(session.relay_epoch, 6);
+        session.needs_full_map = false;
+
         // Replay of the same delta: stale, ignored, no desync flag.
-        assert!(!session.apply_topology_delta("sender", &delta, 21));
+        assert!(!session.apply_topology_delta(&sender, &delta, 21));
         assert!(!session.needs_full_map);
 
         // Gap in the epoch stream: must request a full map.
@@ -7240,7 +7446,7 @@ mod tests {
             removed: vec![],
             upserts: vec![],
         };
-        assert!(!session.apply_topology_delta("sender", &gap, 22));
+        assert!(!session.apply_topology_delta(&sender, &gap, 22));
         assert!(session.needs_full_map);
         session.needs_full_map = false;
 
@@ -7254,10 +7460,54 @@ mod tests {
             removed: vec![hash_for(b)],
             upserts: vec![],
         };
-        assert!(!session.apply_topology_delta("sender", &bad, 23));
+        assert!(!session.apply_topology_delta(&sender, &bad, 23));
         assert!(session.needs_full_map);
         assert!(session.roster_contains(hash_for(b)));
         assert_eq!(session.relay_epoch, 6);
+    }
+
+    #[test]
+    fn overloaded_player_state_batches_rotate_fairly() {
+        let state = PlayerState::new(
+            1,
+            Vec2::ZERO,
+            Vec2::RIGHT,
+            Vec2::RIGHT,
+            true,
+            false,
+            false,
+            false,
+            false,
+        );
+        let all_entries = || {
+            (0..1024u64)
+                .map(|peer_hash| PlayerStateEntry {
+                    peer_hash,
+                    area_id: 0,
+                    state,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut cursor = 0;
+        let mut first = all_entries();
+        assert_eq!(
+            NetworkSession::take_fair_player_state_slice(&mut first, 512, &mut cursor),
+            512
+        );
+        let first_hashes: HashSet<u64> = first.iter().map(|entry| entry.peer_hash).collect();
+
+        let mut second = all_entries();
+        assert_eq!(
+            NetworkSession::take_fair_player_state_slice(&mut second, 512, &mut cursor),
+            512
+        );
+        let second_hashes: HashSet<u64> = second.iter().map(|entry| entry.peer_hash).collect();
+
+        assert!(
+            first_hashes.is_disjoint(&second_hashes),
+            "the next overflowed packet must serve the hashes omitted by the previous one"
+        );
     }
 
     #[test]
@@ -7307,6 +7557,78 @@ mod tests {
         };
         assert!(!session.apply_topology_delta(&root_str, &bad_heartbeat, 700));
         assert!(session.needs_full_map);
+    }
+
+    #[test]
+    fn area_authority_revision_rejects_stale_and_cross_epoch_maps() {
+        let root = peer_from(0);
+        let local = peer_from(1);
+        let alternate = peer_from(2);
+        let mut session = NetworkSession::new();
+        session.local_peer_id = Some(local);
+        session.local_peer_hash = Some(hash_for(local));
+        let root_sender = format!("{:?}", root);
+        session.peer_id_lookup.insert(root_sender.clone(), root);
+        let map = TopologyUpdate {
+            epoch: 7,
+            root_hash: hash_for(root),
+            fanout: 4,
+            entries: vec![
+                entry_for(root, 0),
+                entry_for(local, hash_for(root)),
+                entry_for(alternate, hash_for(root)),
+            ],
+        };
+        assert!(session.apply_topology_map(&root_sender, &map, 10));
+
+        let area_id = NetworkSession::area_id_for_pos(Vec2::new(0.0, 0.0));
+        session.apply_area_authority_update(
+            &root_sender,
+            AreaAuthorityUpdate {
+                epoch: 7,
+                revision: 2,
+                entries: vec![AreaAuthorityEntry {
+                    area_id,
+                    authority_hash: hash_for(root),
+                }],
+            },
+        );
+        assert_eq!(
+            session.area_authorities.get(&area_id),
+            Some(&hash_for(root))
+        );
+
+        session.apply_area_authority_update(
+            &root_sender,
+            AreaAuthorityUpdate {
+                epoch: 7,
+                revision: 1,
+                entries: vec![AreaAuthorityEntry {
+                    area_id,
+                    authority_hash: hash_for(alternate),
+                }],
+            },
+        );
+        assert_eq!(
+            session.area_authorities.get(&area_id),
+            Some(&hash_for(root))
+        );
+
+        session.apply_area_authority_update(
+            &root_sender,
+            AreaAuthorityUpdate {
+                epoch: 8,
+                revision: 99,
+                entries: vec![AreaAuthorityEntry {
+                    area_id,
+                    authority_hash: hash_for(alternate),
+                }],
+            },
+        );
+        assert_eq!(
+            session.area_authorities.get(&area_id),
+            Some(&hash_for(root))
+        );
     }
 
     #[test]

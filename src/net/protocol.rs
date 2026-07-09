@@ -1,5 +1,15 @@
 use crate::math::Vec2;
 
+/// Counted wire records must match their declared size exactly. Apart from
+/// rejecting malformed packets, checking before `Vec::with_capacity` keeps a
+/// tiny packet from asking a browser client to reserve a huge vector.
+fn has_exact_counted_len(bytes: &[u8], header_len: usize, count: usize, item_len: usize) -> bool {
+    header_len
+        .checked_add(count.checked_mul(item_len).unwrap_or(usize::MAX))
+        .map(|expected| expected == bytes.len())
+        .unwrap_or(false)
+}
+
 // ============ Enemy Types for Network Sync ============
 
 /// Enemy type identifier (1 byte)
@@ -166,11 +176,12 @@ pub struct EnemySync {
 
 impl EnemySync {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
+        let count = self.enemies.len().min(u16::MAX as usize);
+        let mut bytes = Vec::with_capacity(10 + count * 21);
         bytes.extend_from_slice(&self.tick.to_le_bytes());
         bytes.extend_from_slice(&self.wave.to_le_bytes());
-        bytes.extend_from_slice(&(self.enemies.len() as u16).to_le_bytes());
-        for enemy in &self.enemies {
+        bytes.extend_from_slice(&(count as u16).to_le_bytes());
+        for enemy in self.enemies.iter().take(count) {
             bytes.extend_from_slice(&enemy.to_bytes());
         }
         bytes
@@ -183,13 +194,13 @@ impl EnemySync {
         let tick = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let wave = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         let count = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+        if !has_exact_counted_len(bytes, 10, count, 21) {
+            return None;
+        }
 
         let mut enemies = Vec::with_capacity(count);
         let mut offset = 10;
         for _ in 0..count {
-            if offset + 21 > bytes.len() {
-                break;
-            }
             if let Some(enemy) = EnemyState::from_bytes(&bytes[offset..]) {
                 enemies.push(enemy);
             }
@@ -602,9 +613,10 @@ pub struct PaidNameSync {
 
 impl PaidNameSync {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&(self.reservations.len() as u16).to_le_bytes());
-        for reservation in &self.reservations {
+        let count = self.reservations.len().min(u16::MAX as usize);
+        let mut bytes = Vec::with_capacity(2 + count * 64);
+        bytes.extend_from_slice(&(count as u16).to_le_bytes());
+        for reservation in self.reservations.iter().take(count) {
             bytes.extend_from_slice(&reservation.to_bytes());
         }
         bytes
@@ -615,12 +627,12 @@ impl PaidNameSync {
             return None;
         }
         let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        if !has_exact_counted_len(bytes, 2, count, 64) {
+            return None;
+        }
         let mut reservations = Vec::with_capacity(count);
         let mut offset = 2;
         for _ in 0..count {
-            if offset + 64 > bytes.len() {
-                break;
-            }
             if let Some(reservation) = PaidNameReservation::from_bytes(&bytes[offset..offset + 64])
             {
                 reservations.push(reservation);
@@ -658,9 +670,10 @@ pub struct PaidObstacleSync {
 
 impl PaidObstacleSync {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&(self.obstacles.len() as u16).to_le_bytes());
-        for obstacle in &self.obstacles {
+        let count = self.obstacles.len().min(u16::MAX as usize);
+        let mut bytes = Vec::with_capacity(2 + count * 45);
+        bytes.extend_from_slice(&(count as u16).to_le_bytes());
+        for obstacle in self.obstacles.iter().take(count) {
             bytes.extend_from_slice(&obstacle.to_bytes());
         }
         bytes
@@ -671,12 +684,12 @@ impl PaidObstacleSync {
             return None;
         }
         let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        if !has_exact_counted_len(bytes, 2, count, 45) {
+            return None;
+        }
         let mut obstacles = Vec::with_capacity(count);
         let mut offset = 2;
         for _ in 0..count {
-            if offset + 45 > bytes.len() {
-                break;
-            }
             if let Some(obstacle) = PaidObstacle::from_bytes(&bytes[offset..offset + 45]) {
                 obstacles.push(obstacle);
             }
@@ -787,12 +800,12 @@ impl EnemyKillBatch {
             return None;
         }
         let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        if !has_exact_counted_len(bytes, 2, count, 27) {
+            return None;
+        }
         let mut kills = Vec::with_capacity(count);
         let mut offset = 2;
         for _ in 0..count {
-            if offset + 27 > bytes.len() {
-                break;
-            }
             if let Some(kill) = EnemyKill::from_bytes(&bytes[offset..offset + 27]) {
                 kills.push(kill);
             }
@@ -1123,9 +1136,10 @@ pub struct PlayerStateBatch {
 
 impl PlayerStateBatch {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&(self.entries.len() as u16).to_le_bytes());
-        for entry in &self.entries {
+        let count = self.entries.len().min(u16::MAX as usize);
+        let mut bytes = Vec::with_capacity(2 + count * 41);
+        bytes.extend_from_slice(&(count as u16).to_le_bytes());
+        for entry in self.entries.iter().take(count) {
             bytes.extend_from_slice(&entry.peer_hash.to_le_bytes());
             bytes.extend_from_slice(&entry.area_id.to_le_bytes());
             bytes.extend_from_slice(&entry.state.to_bytes());
@@ -1138,12 +1152,12 @@ impl PlayerStateBatch {
             return None;
         }
         let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        if !has_exact_counted_len(bytes, 2, count, 41) {
+            return None;
+        }
         let mut entries = Vec::with_capacity(count);
         let mut offset = 2;
         for _ in 0..count {
-            if offset + 8 + 4 + 29 > bytes.len() {
-                break;
-            }
             let peer_hash = u64::from_le_bytes([
                 bytes[offset],
                 bytes[offset + 1],
@@ -1188,9 +1202,10 @@ pub struct InputFrameBatch {
 
 impl InputFrameBatch {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&(self.entries.len() as u16).to_le_bytes());
-        for entry in &self.entries {
+        let count = self.entries.len().min(u16::MAX as usize);
+        let mut bytes = Vec::with_capacity(2 + count * 18);
+        bytes.extend_from_slice(&(count as u16).to_le_bytes());
+        for entry in self.entries.iter().take(count) {
             bytes.extend_from_slice(&entry.peer_hash.to_le_bytes());
             bytes.extend_from_slice(&entry.area_id.to_le_bytes());
             bytes.extend_from_slice(&entry.frame.to_bytes());
@@ -1203,12 +1218,12 @@ impl InputFrameBatch {
             return None;
         }
         let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        if !has_exact_counted_len(bytes, 2, count, 18) {
+            return None;
+        }
         let mut entries = Vec::with_capacity(count);
         let mut offset = 2;
         for _ in 0..count {
-            if offset + 8 + 4 + 6 > bytes.len() {
-                break;
-            }
             let peer_hash = u64::from_le_bytes([
                 bytes[offset],
                 bytes[offset + 1],
@@ -1264,12 +1279,13 @@ pub struct TopologyUpdate {
 
 impl TopologyUpdate {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(4 + 8 + 1 + 2 + self.entries.len() * 32);
+        let count = self.entries.len().min(u16::MAX as usize);
+        let mut bytes = Vec::with_capacity(4 + 8 + 1 + 2 + count * 32);
         bytes.extend_from_slice(&self.epoch.to_le_bytes());
         bytes.extend_from_slice(&self.root_hash.to_le_bytes());
         bytes.push(self.fanout);
-        bytes.extend_from_slice(&(self.entries.len() as u16).to_le_bytes());
-        for entry in &self.entries {
+        bytes.extend_from_slice(&(count as u16).to_le_bytes());
+        for entry in self.entries.iter().take(count) {
             bytes.extend_from_slice(&entry.peer_hash.to_le_bytes());
             bytes.extend_from_slice(&entry.uuid);
             bytes.extend_from_slice(&entry.parent_hash.to_le_bytes());
@@ -1285,12 +1301,12 @@ impl TopologyUpdate {
         let root_hash = u64::from_le_bytes(bytes[4..12].try_into().ok()?);
         let fanout = bytes[12];
         let count = u16::from_le_bytes(bytes[13..15].try_into().ok()?) as usize;
+        if !has_exact_counted_len(bytes, 15, count, 32) {
+            return None;
+        }
         let mut offset = 15;
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
-            if offset + 32 > bytes.len() {
-                return None;
-            }
             let peer_hash = u64::from_le_bytes(bytes[offset..offset + 8].try_into().ok()?);
             let uuid: [u8; 16] = bytes[offset + 8..offset + 24].try_into().ok()?;
             let parent_hash = u64::from_le_bytes(bytes[offset + 24..offset + 32].try_into().ok()?);
@@ -1330,20 +1346,21 @@ pub struct TopologyDelta {
 
 impl TopologyDelta {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(
-            4 + 4 + 8 + 1 + 8 + 2 + self.removed.len() * 8 + 2 + self.upserts.len() * 32,
-        );
+        let removed_count = self.removed.len().min(u16::MAX as usize);
+        let upsert_count = self.upserts.len().min(u16::MAX as usize);
+        let mut bytes =
+            Vec::with_capacity(4 + 4 + 8 + 1 + 8 + 2 + removed_count * 8 + 2 + upsert_count * 32);
         bytes.extend_from_slice(&self.epoch_from.to_le_bytes());
         bytes.extend_from_slice(&self.epoch_to.to_le_bytes());
         bytes.extend_from_slice(&self.root_hash.to_le_bytes());
         bytes.push(self.fanout);
         bytes.extend_from_slice(&self.checksum.to_le_bytes());
-        bytes.extend_from_slice(&(self.removed.len() as u16).to_le_bytes());
-        for hash in &self.removed {
+        bytes.extend_from_slice(&(removed_count as u16).to_le_bytes());
+        for hash in self.removed.iter().take(removed_count) {
             bytes.extend_from_slice(&hash.to_le_bytes());
         }
-        bytes.extend_from_slice(&(self.upserts.len() as u16).to_le_bytes());
-        for entry in &self.upserts {
+        bytes.extend_from_slice(&(upsert_count as u16).to_le_bytes());
+        for entry in self.upserts.iter().take(upsert_count) {
             bytes.extend_from_slice(&entry.peer_hash.to_le_bytes());
             bytes.extend_from_slice(&entry.uuid);
             bytes.extend_from_slice(&entry.parent_hash.to_le_bytes());
@@ -1363,26 +1380,32 @@ impl TopologyDelta {
         let mut offset = 25;
         let removed_count = u16::from_le_bytes(bytes[offset..offset + 2].try_into().ok()?) as usize;
         offset += 2;
+        let removed_bytes = removed_count.checked_mul(8)?;
+        let upsert_count_offset = offset.checked_add(removed_bytes)?;
+        if upsert_count_offset.checked_add(2)? > bytes.len() {
+            return None;
+        }
+        let upsert_count = u16::from_le_bytes(
+            bytes[upsert_count_offset..upsert_count_offset + 2]
+                .try_into()
+                .ok()?,
+        ) as usize;
+        let expected_len = upsert_count_offset
+            .checked_add(2)?
+            .checked_add(upsert_count.checked_mul(32)?)?;
+        if expected_len != bytes.len() {
+            return None;
+        }
         let mut removed = Vec::with_capacity(removed_count);
         for _ in 0..removed_count {
-            if offset + 8 > bytes.len() {
-                return None;
-            }
             removed.push(u64::from_le_bytes(
                 bytes[offset..offset + 8].try_into().ok()?,
             ));
             offset += 8;
         }
-        if offset + 2 > bytes.len() {
-            return None;
-        }
-        let upsert_count = u16::from_le_bytes(bytes[offset..offset + 2].try_into().ok()?) as usize;
         offset += 2;
         let mut upserts = Vec::with_capacity(upsert_count);
         for _ in 0..upsert_count {
-            if offset + 32 > bytes.len() {
-                return None;
-            }
             let peer_hash = u64::from_le_bytes(bytes[offset..offset + 8].try_into().ok()?);
             let uuid: [u8; 16] = bytes[offset + 8..offset + 24].try_into().ok()?;
             let parent_hash = u64::from_le_bytes(bytes[offset + 24..offset + 32].try_into().ok()?);
@@ -1440,18 +1463,25 @@ pub struct AreaAuthorityEntry {
 #[derive(Debug, Clone)]
 pub struct AreaAuthorityUpdate {
     pub epoch: u32,
+    /// Monotonic within a topology epoch. It prevents delayed same-epoch
+    /// maps from restoring an authority assignment that was already replaced.
+    pub revision: u32,
     pub entries: Vec<AreaAuthorityEntry>,
 }
 
 impl AreaAuthorityUpdate {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
+        let count = self.entries.len().min(u16::MAX as usize);
+        let mut bytes = Vec::with_capacity(6 + count * 12 + 4);
         bytes.extend_from_slice(&self.epoch.to_le_bytes());
-        bytes.extend_from_slice(&(self.entries.len() as u16).to_le_bytes());
-        for entry in &self.entries {
+        bytes.extend_from_slice(&(count as u16).to_le_bytes());
+        for entry in self.entries.iter().take(count) {
             bytes.extend_from_slice(&entry.area_id.to_le_bytes());
             bytes.extend_from_slice(&entry.authority_hash.to_le_bytes());
         }
+        // Appending the revision preserves decoding compatibility with older
+        // clients, which stop after the declared entries.
+        bytes.extend_from_slice(&self.revision.to_le_bytes());
         bytes
     }
 
@@ -1461,12 +1491,17 @@ impl AreaAuthorityUpdate {
         }
         let epoch = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+        let legacy_len = 6usize.checked_add(count.checked_mul(12)?)?;
+        let revision = match bytes.len() {
+            len if len == legacy_len => 0,
+            len if len == legacy_len.checked_add(4)? => {
+                u32::from_le_bytes(bytes[legacy_len..legacy_len + 4].try_into().ok()?)
+            }
+            _ => return None,
+        };
         let mut offset = 6;
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
-            if offset + 12 > bytes.len() {
-                return None;
-            }
             let area_id = u32::from_le_bytes([
                 bytes[offset],
                 bytes[offset + 1],
@@ -1489,7 +1524,11 @@ impl AreaAuthorityUpdate {
             });
             offset += 12;
         }
-        Some(Self { epoch, entries })
+        Some(Self {
+            epoch,
+            revision,
+            entries,
+        })
     }
 }
 
@@ -1845,6 +1884,44 @@ mod tests {
             NetMessage::TopologyDeltaEvent(decoded) => assert_eq!(decoded, delta),
             other => panic!("wrong message type: {other:?}"),
         }
+    }
+
+    #[test]
+    fn counted_messages_reject_declared_length_mismatches() {
+        // A count must not cause allocation or partial application when the
+        // wire payload does not actually contain that many records.
+        let mut enemy_sync = vec![0u8; 10];
+        enemy_sync[8..10].copy_from_slice(&1u16.to_le_bytes());
+        assert!(EnemySync::from_bytes(&enemy_sync).is_none());
+
+        let player_batch = [1u8, 0];
+        assert!(PlayerStateBatch::from_bytes(&player_batch).is_none());
+
+        let mut topology = vec![0u8; 15];
+        topology[13..15].copy_from_slice(&1u16.to_le_bytes());
+        assert!(TopologyUpdate::from_bytes(&topology).is_none());
+    }
+
+    #[test]
+    fn area_authority_revision_roundtrips_and_accepts_legacy_wire_shape() {
+        let update = AreaAuthorityUpdate {
+            epoch: 4,
+            revision: 9,
+            entries: vec![AreaAuthorityEntry {
+                area_id: 12,
+                authority_hash: 0xCAFE,
+            }],
+        };
+        let bytes = update.to_bytes();
+        let decoded = AreaAuthorityUpdate::from_bytes(&bytes).expect("decode revisioned update");
+        assert_eq!(decoded.epoch, update.epoch);
+        assert_eq!(decoded.revision, update.revision);
+        assert_eq!(decoded.entries.len(), 1);
+        assert_eq!(decoded.entries[0].authority_hash, 0xCAFE);
+
+        let legacy = &bytes[..bytes.len() - 4];
+        let decoded_legacy = AreaAuthorityUpdate::from_bytes(legacy).expect("decode legacy update");
+        assert_eq!(decoded_legacy.revision, 0);
     }
 
     #[test]

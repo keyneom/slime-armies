@@ -108,7 +108,7 @@ window.slimeTest.logs();
 ```
 8. Healthy behavior: all windows agree on player count/names and continue receiving traffic (`rx` rises, `remote_players` matches expected peers).
 9. Split-room regression signature: one window shows a connected peer with a growing stale age or rising silence warnings, while other windows form a separate subgraph and do not list the creator.
-10. Freeze regression signature: one window logs `Discovery detached: using gameplay overlay links only`, then becomes unresponsive or drops; the other windows eventually report fewer peers.
+10. Freeze regression signature: one window stops receiving gameplay traffic or reports a growing stale/silence age, then becomes unresponsive or drops; the other windows eventually report fewer peers.
 
 Notes:
 - Use `window.slimeTest` for automation. `window.slime` exposes low-level wasm exports and is not safe for direct string-argument automation calls.
@@ -121,8 +121,8 @@ Notes:
 - **Canvas 2D**: Rendering
 - **Matchbox**: P2P networking
 - **Socket fork (compatible)**: local `matchbox_socket` fork keeps Matchbox signaling protocol compatibility while enabling selective peer links
-- **Two-layer P2P**: temporary discovery layer (matchbox signaling) + long-lived gameplay overlay (tree relay)
-- **Discovery detach**: regular nodes can detach from signaling after overlay bootstrap; supernodes/root stay attached for discovery continuity
+- **Two-layer P2P**: persistent Matchbox membership/signaling control plane + long-lived WebRTC gameplay overlay (tree relay)
+- **Signaling membership**: all clients remain attached so the room can repair membership and mint new sparse WebRTC links; Matchbox never carries gameplay data
 - **Rollback netcode**: lightweight input/state rollback (in progress)
 - **Hybrid P2P topology**: dynamic multi-supernode relay tree with area-aware routing, adaptive fanout, and parent failover (in progress)
 

@@ -420,7 +420,7 @@ trunk serve  # Dev server on http://localhost:8080
 3. In each additional window: set `localStorage.setItem("slime_room_code", "<ROOM>")`, reload, then call `window.slimeTest.joinCurrentRoom()`.
 4. Start movement keepalive in all windows (`window.slimeTest.keepAliveStart(360, 0.72)`) so slimes stay alive.
 5. Poll each window with `window.slimeTest.net()` + `window.slimeTest.state()` + `window.slimeTest.logs()` every 1s.
-6. Regression signature: one window keeps a silent/stale connected peer while other windows form a separate subgraph, or a window logs `Discovery detached: using gameplay overlay links only` then drops/freeze behavior and falls back toward solo (`remote_players=0`).
+6. Regression signature: one window keeps a silent/stale connected peer while other windows form a separate subgraph, or it stops receiving gameplay traffic and eventually falls back toward solo (`remote_players=0`).
 
 ## Requested Features
 - [x] Team scoring system that accounts for kills, deaths, and time played.

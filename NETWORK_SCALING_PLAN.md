@@ -48,10 +48,10 @@ and split rooms. The current implementation replaces the control plane:
   (no re-attach existed) and was the main source of split rooms; the socket
   fork keeps `detach_signaling` for a future overlay-relayed-signaling mode.
 
-## Dependency stance: matchbox for discovery, pure P2P after — and STUN
+## Dependency stance: Matchbox control plane, P2P gameplay — and STUN
 
-Goal: the public matchbox server is the only third-party dependency; after
-discovery, everything is peer-to-peer. Where that stands:
+Goal: the public Matchbox server is the only third-party control-plane
+dependency; gameplay data is peer-to-peer. Where that stands:
 
 - `Gameplay data`: already pure P2P, before and after this redesign. No server
   ever carries game traffic; the relay tree is made of direct WebRTC links
